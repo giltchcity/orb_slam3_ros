@@ -33,6 +33,8 @@
 #include <mutex>
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
 
+
+
 namespace ORB_SLAM3
 {
 
@@ -239,6 +241,32 @@ protected:
 
     // To (de)activate LC
     bool mbActiveLC = true;
+
+    // 用于保存回环检测数据的成员变量
+    bool mSaveLoopData;                 // 控制是否保存数据的标志
+    int mLoopClosureCount;              // 回环计数器
+    std::string mSaveDirectory;         // 数据保存目录
+    
+    // 辅助函数用于保存各种数据
+    void SaveTrajectoryData(const std::string& filename, const KeyFrameAndPose& kfPoses);
+    void SaveMapPointData(const std::string& filename, const std::vector<MapPoint*>& mapPoints);
+    void SaveOptimizationMetadata(const std::string& filename);
+    void SaveConnectionsData(const std::string& filename, 
+                             const map<KeyFrame*, set<KeyFrame*>>& loopConnections);
+    
+    // Sim3优化数据保存辅助函数
+    void SaveSim3Data(const std::string& filename, 
+                     const KeyFrameAndPose& CorrectedSim3, 
+                     const KeyFrameAndPose& NonCorrectedSim3);
+    
+    // 获取当前回环检测使用的约束数据
+    void GetLoopConstraints(std::vector<std::tuple<KeyFrame*, KeyFrame*, g2o::Sim3>>& constraints);
+    
+    // 用于将关键帧位姿保存为标准SE3格式的函数
+    void SaveKeyFrameTrajectory(const std::string& filename, const std::vector<KeyFrame*>& vpKFs);
+    
+    // 设置数据保存选项
+    void SetSaveLoopData(bool flag, const std::string& directory = "./loop_closure_data/");
 
 #ifdef REGISTER_LOOP
     string mstrFolderLoop;
