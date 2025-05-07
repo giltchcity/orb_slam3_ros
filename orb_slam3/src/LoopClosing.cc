@@ -27,7 +27,11 @@
 
 #include<mutex>
 #include<thread>
-
+#include <fstream>
+#include <iomanip>
+#include <string>
+#include <sstream>
+#include <Eigen/Dense>
 
 namespace ORB_SLAM3
 {
