@@ -118,6 +118,27 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mnCorrectionGBA = 0;
 }
 
+void LoopClosing::SetSaveLoopData(bool flag, const std::string& directory)
+{
+    mSaveLoopData = flag;
+    if (!directory.empty()) {
+        mSaveDirectory = directory;
+        if (mSaveDirectory.back() != '/')
+            mSaveDirectory += "/";
+            
+        // 确保目录存在
+        struct stat st = {0};
+        if (stat(mSaveDirectory.c_str(), &st) == -1) {
+            #ifdef _WIN32
+                _mkdir(mSaveDirectory.c_str());
+            #else
+                mkdir(mSaveDirectory.c_str(), 0700);
+            #endif
+        }
+    }
+}
+
+
 void LoopClosing::SetTracker(Tracking *pTracker)
 {
     mpTracker=pTracker;
