@@ -32,6 +32,9 @@
 #include <chrono>
 #include <ctime>
 #include <sys/stat.h>  // 用于创建目录
+#ifdef _WIN32
+#include <direct.h>  // 用于Windows平台的目录操作
+#endif
 
 namespace ORB_SLAM3
 {
@@ -409,7 +412,26 @@ void LoopClosing::GetLoopConstraints(std::vector<std::tuple<KeyFrame*, KeyFrame*
     }
 }
 
+// 确保目录存在
+static void EnsureDirectoryExists(const std::string& dir)
+{
+    struct stat st = {0};
+    if (stat(dir.c_str(), &st) == -1) {
+        #ifdef _WIN32
+            _mkdir(dir.c_str());
+        #else
+            mkdir(dir.c_str(), 0700);
+        #endif
+    }
+}
 
+// 标准化路径（确保以/结尾）
+static std::string NormalizePath(const std::string& path)
+{
+    if(!path.empty() && path.back() != '/' && path.back() != '\\')
+        return path + "/";
+    return path;
+}
 
 
 void LoopClosing::SetTracker(Tracking *pTracker)
@@ -1304,7 +1326,49 @@ int LoopClosing::FindMatchesByProjection(KeyFrame* pCurrentKF, KeyFrame* pMatche
 
 void LoopClosing::CorrectLoop()
 {
-    //cout << "Loop detected!" << endl;
+    cout << "Loop detected!" << endl;
+    
+    // 添加在这里 - 记录回环检测ID和创建目录
+    mLoopClosureCount++;
+    double timestamp = mpCurrentKF->mTimeStamp;
+    
+    // 创建本次回环检测的专用目录
+    std::stringstream ssLoopDir;
+    ssLoopDir << mSaveDirectory << "loop_" << mLoopClosureCount << "_" 
+              << std::fixed << std::setprecision(6) << timestamp << "/";
+    std::string loopDir = ssLoopDir.str();
+    
+    // 确保目录存在
+    if(mSaveLoopData) {
+        struct stat st = {0};
+        if (stat(loopDir.c_str(), &st) == -1) {
+            #ifdef _WIN32
+                _mkdir(loopDir.c_str());
+            #else
+                mkdir(loopDir.c_str(), 0700);
+            #endif
+        }
+        
+        // 创建pre和post子目录
+        std::string preDir = loopDir + "pre/";
+        std::string postDir = loopDir + "post/";
+        
+        if (stat(preDir.c_str(), &st) == -1) {
+            #ifdef _WIN32
+                _mkdir(preDir.c_str());
+            #else
+                mkdir(preDir.c_str(), 0700);
+            #endif
+        }
+        
+        if (stat(postDir.c_str(), &st) == -1) {
+            #ifdef _WIN32
+                _mkdir(postDir.c_str());
+            #else
+                mkdir(postDir.c_str(), 0700);
+            #endif
+        }
+    }
 
     // Send a stop signal to Local Mapping
     // Avoid new keyframes are inserted while correcting the loop
@@ -1358,7 +1422,63 @@ void LoopClosing::CorrectLoop()
     mpCurrentKF->SetPose(correctedTcw.cast<float>());
 
     Map* pLoopMap = mpCurrentKF->GetMap();
-
+    
+    // 添加在这里 - 保存优化前的数据
+    if(mSaveLoopData)
+    {
+        std::string preDir = loopDir + "pre/";
+        
+        // 保存优化前的关键帧轨迹
+        SaveTrajectoryData(preDir + "trajectory_sim3.txt", NonCorrectedSim3);
+        
+        // 保存当前所有关键帧的原始SE3轨迹
+        SaveKeyFrameTrajectory(preDir + "keyframes.txt", mvpCurrentConnectedKFs);
+        
+        // 保存优化前的地图点数据
+        std::vector<MapPoint*> allMPs;
+        for(auto& kfp : mvpCurrentConnectedKFs)
+        {
+            vector<MapPoint*> vpMPs = kfp->GetMapPointMatches();
+            for(auto& mp : vpMPs)
+            {
+                if(mp && !mp->isBad())
+                    allMPs.push_back(mp);
+            }
+        }
+        SaveMapPointData(preDir + "mappoints.txt", allMPs);
+        
+        // 保存匹配的地图点
+        SaveMapPointData(preDir + "loop_mappoints.txt", mvpLoopMapPoints);
+        
+        // 保存优化元数据
+        SaveOptimizationMetadata(loopDir + "metadata.txt");
+        
+        // 保存Sim3数据
+        SaveSim3Data(preDir + "sim3_transforms.txt", CorrectedSim3, NonCorrectedSim3);
+        
+        // 保存匹配点数据
+        std::ofstream fileMatches(preDir + "matches.txt");
+        if(fileMatches.is_open())
+        {
+            fileMatches << "# CurrentKF_ID MatchedKF_ID NumMatches" << std::endl;
+            fileMatches << mpCurrentKF->mnId << " " << mpLoopMatchedKF->mnId << " " << mvpLoopMatchedMPs.size() << std::endl;
+            
+            fileMatches << "# Index CurrentMP_ID MatchedMP_ID" << std::endl;
+            for(size_t i=0; i<mvpLoopMatchedMPs.size(); i++)
+            {
+                MapPoint* pMatchMP = mvpLoopMatchedMPs[i];
+                MapPoint* pCurMP = mpCurrentKF->GetMapPoint(i);
+                
+                if(pMatchMP)
+                {
+                    long unsigned int curId = pCurMP ? pCurMP->mnId : 0;
+                    fileMatches << i << " " << curId << " " << pMatchMP->mnId << std::endl;
+                }
+            }
+            fileMatches.close();
+        }
+    }
+        
 #ifdef REGISTER_TIMES
     /*KeyFrame* pKF = mpCurrentKF;
     int numKFinLoop = 0;
@@ -1501,21 +1621,38 @@ void LoopClosing::CorrectLoop()
     // TODO CHECK; Solo para el monocular inertial
     if(mpTracker->mSensor==System::IMU_MONOCULAR && !mpCurrentKF->GetMap()->GetIniertialBA2())
         bFixedScale=false;
-
+    
+    // 添加在这里 - 保存连接数据
+    if(mSaveLoopData)
+    {
+        SaveConnectionsData(loopDir + "connections.txt", LoopConnections);
+        
+        // 保存优化参数信息
+        std::ofstream fileOptParams(loopDir + "optimizer_params.txt");
+        if(fileOptParams.is_open())
+        {
+            fileOptParams << "OPTIMIZER: " << (pLoopMap->IsInertial() && pLoopMap->isImuInitialized() ? "OptimizeEssentialGraph4DoF" : "OptimizeEssentialGraph") << std::endl;
+            fileOptParams << "FIXED_SCALE: " << (bFixedScale ? "true" : "false") << std::endl;
+            fileOptParams << "IS_INERTIAL: " << (pLoopMap->IsInertial() ? "true" : "false") << std::endl;
+            fileOptParams << "IMU_INITIALIZED: " << (pLoopMap->isImuInitialized() ? "true" : "false") << std::endl;
+            fileOptParams << "SENSOR_TYPE: " << mpTracker->mSensor << std::endl;
+            fileOptParams.close();
+        }
+    }
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_EndFusion = std::chrono::steady_clock::now();
 
         double timeFusion = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndFusion - time_StartFusion).count();
         vdLoopFusion_ms.push_back(timeFusion);
 #endif
-    //cout << "Optimize essential graph" << endl;
+    cout << "Optimize essential graph" << endl;
     if(pLoopMap->IsInertial() && pLoopMap->isImuInitialized())
     {
         Optimizer::OptimizeEssentialGraph4DoF(pLoopMap, mpLoopMatchedKF, mpCurrentKF, NonCorrectedSim3, CorrectedSim3, LoopConnections);
     }
     else
     {
-        //cout << "Loop -> Scale correction: " << mg2oLoopScw.scale() << endl;
+        cout << "Loop -> Scale correction: " << mg2oLoopScw.scale() << endl;
         Optimizer::OptimizeEssentialGraph(pLoopMap, mpLoopMatchedKF, mpCurrentKF, NonCorrectedSim3, CorrectedSim3, LoopConnections, bFixedScale);
     }
 #ifdef REGISTER_TIMES
@@ -1524,7 +1661,78 @@ void LoopClosing::CorrectLoop()
     double timeOptEss = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndOpt - time_EndFusion).count();
     vdLoopOptEss_ms.push_back(timeOptEss);
 #endif
-
+    
+    // 添加在这里 - 优化后保存数据
+    if(mSaveLoopData)
+    {
+        std::string postDir = loopDir + "post/";
+        
+        // 优化后，收集优化后的关键帧位姿
+        KeyFrameAndPose OptimizedPoses;
+        for(auto& kfPair : NonCorrectedSim3)
+        {
+            KeyFrame* pKF = kfPair.first;
+            Sophus::SE3f Tiw = pKF->GetPose();
+            g2o::Sim3 g2oSiw(Tiw.unit_quaternion().cast<double>(), Tiw.translation().cast<double>(), 1.0);
+            OptimizedPoses[pKF] = g2oSiw;
+        }
+        
+        // 保存优化后的轨迹
+        SaveTrajectoryData(postDir + "trajectory_sim3.txt", OptimizedPoses);
+        
+        // 保存优化后的关键帧SE3轨迹
+        SaveKeyFrameTrajectory(postDir + "keyframes.txt", mvpCurrentConnectedKFs);
+        
+        // 保存优化后的地图点
+        std::vector<MapPoint*> optimizedMPs;
+        for(auto& kfp : mvpCurrentConnectedKFs)
+        {
+            vector<MapPoint*> vpMPs = kfp->GetMapPointMatches();
+            for(auto& mp : vpMPs)
+            {
+                if(mp && !mp->isBad())
+                    optimizedMPs.push_back(mp);
+            }
+        }
+        SaveMapPointData(postDir + "mappoints.txt", optimizedMPs);
+        
+        // 保存约束数据
+        std::vector<std::tuple<KeyFrame*, KeyFrame*, g2o::Sim3>> constraints;
+        GetLoopConstraints(constraints);
+        
+        std::ofstream fileConstraints(postDir + "constraints.txt");
+        if(fileConstraints.is_open())
+        {
+            fileConstraints << "# Source_KF_ID Target_KF_ID r00 r01 r02 r10 r11 r12 r20 r21 r22 t0 t1 t2 scale" << std::endl;
+            
+            for(const auto& constraint : constraints)
+            {
+                KeyFrame* pKF1 = std::get<0>(constraint);
+                KeyFrame* pKF2 = std::get<1>(constraint);
+                g2o::Sim3 Sim3 = std::get<2>(constraint);
+                
+                Eigen::Matrix3d R = Sim3.rotation().toRotationMatrix();
+                Eigen::Vector3d t = Sim3.translation();
+                double s = Sim3.scale();
+                
+                fileConstraints << pKF1->mnId << " " << pKF2->mnId << " "
+                               << R(0,0) << " " << R(0,1) << " " << R(0,2) << " "
+                               << R(1,0) << " " << R(1,1) << " " << R(1,2) << " "
+                               << R(2,0) << " " << R(2,1) << " " << R(2,2) << " "
+                               << t(0) << " " << t(1) << " " << t(2) << " "
+                               << s << std::endl;
+            }
+            fileConstraints.close();
+        }
+        
+        // 保存回环边信息
+        std::ofstream fileLoopEdges(postDir + "loop_edges.txt");
+        if(fileLoopEdges.is_open())
+        {
+            fileLoopEdges << "# KF1_ID KF2_ID" << std::endl;
+            fileLoopEdges << mpCurrentKF->mnId << " " << mpLoopMatchedKF->mnId << std::endl;
+        }
+    }
     mpAtlas->InformNewBigChange();
 
     // Add loop edge
