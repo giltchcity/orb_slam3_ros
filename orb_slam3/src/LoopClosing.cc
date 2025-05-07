@@ -138,6 +138,279 @@ void LoopClosing::SetSaveLoopData(bool flag, const std::string& directory)
     }
 }
 
+void LoopClosing::SaveTrajectoryData(const std::string& filename, const KeyFrameAndPose& kfPoses)
+{
+    std::ofstream file(filename);
+    if(!file.is_open())
+    {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# KF_ID timestamp tx ty tz qx qy qz qw scale" << std::endl;
+    
+    for(const auto& kfPose : kfPoses)
+    {
+        KeyFrame* pKF = kfPose.first;
+        g2o::Sim3 Siw = kfPose.second;
+        
+        Eigen::Quaterniond q = Siw.rotation();
+        Eigen::Vector3d t = Siw.translation();
+        double scale = Siw.scale();
+        
+        file << pKF->mnId << " " 
+             << std::fixed << std::setprecision(9) << pKF->mTimeStamp << " "
+             << t.x() << " " << t.y() << " " << t.z() << " "
+             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << " "
+             << scale << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveKeyFrameTrajectory(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
+{
+    std::ofstream file(filename);
+    if(!file.is_open())
+    {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# KF_ID timestamp tx ty tz qx qy qz qw parent_KF_ID ref_KF_ID" << std::endl;
+    
+    for(const auto& pKF : vpKFs)
+    {
+        if(!pKF || pKF->isBad())
+            continue;
+            
+        Sophus::SE3f Twc = pKF->GetPoseInverse();
+        Eigen::Quaternionf q = Twc.unit_quaternion();
+        Eigen::Vector3f t = Twc.translation();
+        
+        KeyFrame* pParent = pKF->GetParent();
+        KeyFrame* pRef = pKF->GetReferenceKeyFrame();
+        
+        long unsigned int parentId = pParent ? pParent->mnId : 0;
+        long unsigned int refId = pRef ? pRef->mnId : 0;
+        
+        file << pKF->mnId << " " 
+             << std::fixed << std::setprecision(9) << pKF->mTimeStamp << " "
+             << t.x() << " " << t.y() << " " << t.z() << " "
+             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << " "
+             << parentId << " " << refId << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveMapPointData(const std::string& filename, const std::vector<MapPoint*>& mapPoints)
+{
+    std::ofstream file(filename);
+    if(!file.is_open())
+    {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# MP_ID x y z first_KF_ID ref_KF_ID num_observations visible_ratio descriptor corrected_by corrected_ref" << std::endl;
+    
+    // 使用集合去除重复的地图点
+    std::set<MapPoint*> uniqueMapPoints(mapPoints.begin(), mapPoints.end());
+    
+    for(MapPoint* pMP : uniqueMapPoints)
+    {
+        if(!pMP || pMP->isBad())
+            continue;
+            
+        Eigen::Vector3f pos = pMP->GetWorldPos();
+        KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
+        
+        // 保存描述子
+        cv::Mat descriptor = pMP->GetDescriptor();
+        std::stringstream ss;
+        if(!descriptor.empty())
+        {
+            for(int i = 0; i < descriptor.cols; i++)
+                ss << descriptor.at<unsigned char>(0, i) << " ";
+        }
+        
+        file << pMP->mnId << " " 
+             << pos.x() << " " << pos.y() << " " << pos.z() << " "
+             << pMP->mnFirstKFid << " " 
+             << (pRefKF ? pRefKF->mnId : 0) << " "
+             << pMP->Observations() << " "
+             << pMP->GetVisible() << " "
+             << ss.str() << " "
+             << pMP->mnCorrectedByKF << " "
+             << pMP->mnCorrectedReference << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveOptimizationMetadata(const std::string& filename)
+{
+    std::ofstream file(filename);
+    if(!file.is_open())
+    {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    Map* pLoopMap = mpCurrentKF->GetMap();
+    
+    file << "LOOP_CLOSURE_ID: " << mLoopClosureCount << std::endl;
+    file << "TIMESTAMP: " << std::fixed << std::setprecision(9) << mpCurrentKF->mTimeStamp << std::endl;
+    file << "CURRENT_KF_ID: " << mpCurrentKF->mnId << std::endl;
+    file << "LOOP_MATCHED_KF_ID: " << mpLoopMatchedKF->mnId << std::endl;
+    file << "NUM_CONNECTED_KFS: " << mvpCurrentConnectedKFs.size() << std::endl;
+    file << "NUM_LOOP_MATCHED_MPS: " << mvpLoopMatchedMPs.size() << std::endl;
+    file << "NUM_LOOP_MPS: " << mvpLoopMPs.size() << std::endl;
+    
+    // 检测信息
+    file << "LOOP_NUM_COINCIDENCES: " << mnLoopNumCoincidences << std::endl;
+    file << "LOOP_NUM_NOT_FOUND: " << mnLoopNumNotFound << std::endl;
+    
+    // 获取回环变换参数
+    file << "LOOP_TRANSFORMATION_SCW:" << std::endl;
+    Eigen::Quaterniond q = mg2oLoopScw.rotation();
+    Eigen::Vector3d t = mg2oLoopScw.translation();
+    double scale = mg2oLoopScw.scale();
+    file << "  ROTATION: " << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+    file << "  TRANSLATION: " << t.x() << " " << t.y() << " " << t.z() << std::endl;
+    file << "  SCALE: " << scale << std::endl;
+    
+    // IMU相关信息
+    file << "IMU_INITIALIZED: " << (pLoopMap->isImuInitialized() ? "true" : "false") << std::endl;
+    file << "IS_INERTIAL: " << (pLoopMap->IsInertial() ? "true" : "false") << std::endl;
+    file << "IMU_BA2: " << (pLoopMap->GetIniertialBA2() ? "true" : "false") << std::endl;
+    
+    // 传感器类型
+    file << "SENSOR_TYPE: " << mpTracker->mSensor << std::endl;
+    
+    // 固定尺度信息
+    file << "FIXED_SCALE: " << (mbFixScale ? "true" : "false") << std::endl;
+    
+    file << "CORRECTION_NUMBER: " << mnNumCorrection << std::endl;
+    file << "MAP_ID: " << pLoopMap->GetId() << std::endl;
+    file << "MAP_KEYFRAMES: " << pLoopMap->KeyFramesInMap() << std::endl;
+    file << "MAP_MAPPOINTS: " << pLoopMap->MapPointsInMap() << std::endl;
+    
+    file.close();
+}
+
+void LoopClosing::SaveConnectionsData(const std::string& filename, 
+                                     const map<KeyFrame*, set<KeyFrame*>>& loopConnections)
+{
+    std::ofstream file(filename);
+    if(!file.is_open())
+    {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# Source_KF_ID Target_KF_ID Weight CovisibilityWeight LoopEdge" << std::endl;
+    
+    for(const auto& connection : loopConnections)
+    {
+        KeyFrame* pKFSource = connection.first;
+        for(KeyFrame* pKFTarget : connection.second)
+        {
+            float weight = pKFSource->GetWeight(pKFTarget);
+            int covisWeight = pKFSource->GetCovisibilityWeight(pKFTarget);
+            bool isLoopEdge = pKFSource->HasLoopEdges() && pKFSource->CheckLoopEdge(pKFTarget);
+            
+            file << pKFSource->mnId << " " 
+                 << pKFTarget->mnId << " " 
+                 << weight << " "
+                 << covisWeight << " "
+                 << (isLoopEdge ? "1" : "0") << std::endl;
+        }
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveSim3Data(const std::string& filename, 
+                               const KeyFrameAndPose& CorrectedSim3, 
+                               const KeyFrameAndPose& NonCorrectedSim3)
+{
+    std::ofstream file(filename);
+    if(!file.is_open())
+    {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# TYPE KF_ID r00 r01 r02 r10 r11 r12 r20 r21 r22 t0 t1 t2 scale" << std::endl;
+    
+    // 保存校正前的Sim3数据
+    for(const auto& kfPose : NonCorrectedSim3)
+    {
+        KeyFrame* pKF = kfPose.first;
+        g2o::Sim3 Sim3 = kfPose.second;
+        
+        Eigen::Matrix3d R = Sim3.rotation().toRotationMatrix();
+        Eigen::Vector3d t = Sim3.translation();
+        double s = Sim3.scale();
+        
+        file << "NON_CORRECTED " << pKF->mnId << " "
+             << R(0,0) << " " << R(0,1) << " " << R(0,2) << " "
+             << R(1,0) << " " << R(1,1) << " " << R(1,2) << " "
+             << R(2,0) << " " << R(2,1) << " " << R(2,2) << " "
+             << t(0) << " " << t(1) << " " << t(2) << " "
+             << s << std::endl;
+    }
+    
+    // 保存校正后的Sim3数据
+    for(const auto& kfPose : CorrectedSim3)
+    {
+        KeyFrame* pKF = kfPose.first;
+        g2o::Sim3 Sim3 = kfPose.second;
+        
+        Eigen::Matrix3d R = Sim3.rotation().toRotationMatrix();
+        Eigen::Vector3d t = Sim3.translation();
+        double s = Sim3.scale();
+        
+        file << "CORRECTED " << pKF->mnId << " "
+             << R(0,0) << " " << R(0,1) << " " << R(0,2) << " "
+             << R(1,0) << " " << R(1,1) << " " << R(1,2) << " "
+             << R(2,0) << " " << R(2,1) << " " << R(2,2) << " "
+             << t(0) << " " << t(1) << " " << t(2) << " "
+             << s << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::GetLoopConstraints(std::vector<std::tuple<KeyFrame*, KeyFrame*, g2o::Sim3>>& constraints)
+{
+    // 添加主要的回环边
+    g2o::Sim3 Swc = mg2oLoopScw.inverse();
+    constraints.push_back(std::make_tuple(mpCurrentKF, mpLoopMatchedKF, Swc));
+    
+    // 添加所有协视关键帧之间的约束
+    for(KeyFrame* pKFi : mvpCurrentConnectedKFs)
+    {
+        if(pKFi->isBad() || pKFi == mpCurrentKF)
+            continue;
+            
+        // 获取相对于主回环关键帧的相对位姿
+        Sophus::SE3f Tiw = pKFi->GetPose();
+        Sophus::SE3f Twc = mpCurrentKF->GetPoseInverse();
+        Sophus::SE3d Tic = (Tiw * Twc).cast<double>();
+        g2o::Sim3 g2oSic(Tic.unit_quaternion(), Tic.translation(), 1.0);
+        g2o::Sim3 g2oCi = g2oSic.inverse();
+        
+        // 获取相对于匹配关键帧的约束
+        g2o::Sim3 g2oSiw = g2oSic * mg2oLoopScw;
+        constraints.push_back(std::make_tuple(pKFi, mpLoopMatchedKF, g2oSiw.inverse()));
+    }
+}
+
+
+
 
 void LoopClosing::SetTracker(Tracking *pTracker)
 {
