@@ -32,6 +32,7 @@
 #include <chrono>
 #include <ctime>
 #include <sys/stat.h>  // 用于创建目录
+
 namespace ORB_SLAM3
 {
 
@@ -44,6 +45,44 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mnCovisibilityConsistencyTh = 3;
     mpLastCurrentKF = static_cast<KeyFrame*>(NULL);
 
+    
+    // 数据保存相关初始化代码
+    mSaveLoopData = true;  // 默认启用数据保存
+    mLoopClosureCount = 0;
+    mSaveDirectory = "./loop_closure_data/";
+    
+    // 创建保存目录
+    struct stat st = {0};
+    if (stat(mSaveDirectory.c_str(), &st) == -1) {
+        #ifdef _WIN32
+            _mkdir(mSaveDirectory.c_str());
+        #else
+            mkdir(mSaveDirectory.c_str(), 0700);
+        #endif
+    }
+    
+    // 为数据目录添加时间戳子目录
+    #ifdef COMPILEDWITHC11
+        std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
+        time_t tt = std::chrono::system_clock::to_time_t(now);
+        struct tm *timeinfo = localtime(&tt);
+        char buffer[80];
+        strftime(buffer, sizeof(buffer), "%Y%m%d_%H%M%S", timeinfo);
+        std::string timestamp(buffer);
+        
+        mSaveDirectory += timestamp + "/";
+        
+        // 创建带时间戳的子目录
+        if (stat(mSaveDirectory.c_str(), &st) == -1) {
+            #ifdef _WIN32
+                _mkdir(mSaveDirectory.c_str());
+            #else
+                mkdir(mSaveDirectory.c_str(), 0700);
+            #endif
+        }
+    #endif
+
+    
 #ifdef REGISTER_TIMES
 
     vdDataQuery_ms.clear();
