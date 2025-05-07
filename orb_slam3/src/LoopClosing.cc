@@ -1731,6 +1731,7 @@ void LoopClosing::CorrectLoop()
         {
             fileLoopEdges << "# KF1_ID KF2_ID" << std::endl;
             fileLoopEdges << mpCurrentKF->mnId << " " << mpLoopMatchedKF->mnId << std::endl;
+            fileLoopEdges.close()
         }
     }
     mpAtlas->InformNewBigChange();
