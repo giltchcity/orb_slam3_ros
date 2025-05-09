@@ -171,44 +171,7 @@ void LoopClosing::SaveTrajectoryData(const std::string& filename, const KeyFrame
     file.close();
 }
 
-// void LoopClosing::SaveKeyFrameTrajectory(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
-// {
-//     std::ofstream file(filename);
-//     if(!file.is_open())
-//     {
-//         std::cerr << "Cannot open file: " << filename << std::endl;
-//         return;
-//     }
-    
-//     file << "# KF_ID timestamp tx ty tz qx qy qz qw parent_KF_ID ref_KF_ID" << std::endl;
-    
-//     for(const auto& pKF : vpKFs)
-//     {
-//         if(!pKF || pKF->isBad())
-//             continue;
-            
-//         Sophus::SE3f Twc = pKF->GetPoseInverse();
-//         Eigen::Quaternionf q = Twc.unit_quaternion();
-//         Eigen::Vector3f t = Twc.translation();
-        
-//         KeyFrame* pParent = pKF->GetParent();
-//         // KeyFrame* pRef = pKF->GetReferenceKeyFrame();
-//         KeyFrame* pRef = pKF->mpRefKF;  
-        
-//         KeyFrame* pRef = nullptr;
-        
-//         long unsigned int parentId = pParent ? pParent->mnId : 0;
-//         long unsigned int refId = pRef ? pRef->mnId : 0;
-        
-//         file << pKF->mnId << " " 
-//              << std::fixed << std::setprecision(9) << pKF->mTimeStamp << " "
-//              << t.x() << " " << t.y() << " " << t.z() << " "
-//              << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << " "
-//              << parentId << " " << refId << std::endl;
-//     }
-    
-//     file.close();
-// }
+
 void LoopClosing::SaveKeyFrameTrajectory(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
 {
     std::ofstream file(filename);
@@ -243,52 +206,6 @@ void LoopClosing::SaveKeyFrameTrajectory(const std::string& filename, const std:
     file.close();
 }
 
-
-// void LoopClosing::SaveMapPointData(const std::string& filename, const std::vector<MapPoint*>& mapPoints)
-// {
-//     std::ofstream file(filename);
-//     if(!file.is_open())
-//     {
-//         std::cerr << "Cannot open file: " << filename << std::endl;
-//         return;
-//     }
-    
-//     file << "# MP_ID x y z first_KF_ID ref_KF_ID num_observations visible_ratio descriptor corrected_by corrected_ref" << std::endl;
-    
-//     // 使用集合去除重复的地图点
-//     std::set<MapPoint*> uniqueMapPoints(mapPoints.begin(), mapPoints.end());
-    
-//     for(MapPoint* pMP : uniqueMapPoints)
-//     {
-//         if(!pMP || pMP->isBad())
-//             continue;
-            
-//         Eigen::Vector3f pos = pMP->GetWorldPos();
-//         KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
-        
-//         // 保存描述子
-//         cv::Mat descriptor = pMP->GetDescriptor();
-//         std::stringstream ss;
-//         if(!descriptor.empty())
-//         {
-//             for(int i = 0; i < descriptor.cols; i++)
-//                 ss << descriptor.at<unsigned char>(0, i) << " ";
-//         }
-        
-//         file << pMP->mnId << " " 
-//              << pos.x() << " " << pos.y() << " " << pos.z() << " "
-//              << pMP->mnFirstKFid << " " 
-//              << (pRefKF ? pRefKF->mnId : 0) << " "
-//              << pMP->Observations() << " "
-//              // << pMP->GetVisible() << " "
-//              << pMP->Observations() << " "
-//              << ss.str() << " "
-//              << pMP->mnCorrectedByKF << " "
-//              << pMP->mnCorrectedReference << std::endl;
-//     }
-    
-//     file.close();
-// }
 
 void LoopClosing::SaveMapPointData(const std::string& filename, const std::vector<MapPoint*>& mapPoints)
 {
@@ -386,50 +303,7 @@ void LoopClosing::SaveOptimizationMetadata(const std::string& filename)
     file.close();
 }
 
-// void LoopClosing::SaveConnectionsData(const std::string& filename, 
-//                                      const map<KeyFrame*, set<KeyFrame*>>& loopConnections)
-// {
-//     std::ofstream file(filename);
-//     if(!file.is_open())
-//     {
-//         std::cerr << "Cannot open file: " << filename << std::endl;
-//         return;
-//     }
-    
-//     file << "# Source_KF_ID Target_KF_ID Weight CovisibilityWeight LoopEdge" << std::endl;
-    
-//     for(const auto& connection : loopConnections)
-//     {
-//         KeyFrame* pKFSource = connection.first;
-//         for(KeyFrame* pKFTarget : connection.second)
-//         {
-//             float weight = pKFSource->GetWeight(pKFTarget);
-            
-//             // 修改为
-//             float weight = 0;
-//             if(pKFSource->GetWeight(pKFTarget) > 0)
-//                 weight = pKFSource->GetWeight(pKFTarget);
-//             int covisWeight = static_cast<int>(weight);
-            
-//             // 检查是否为回环边
-//             bool isLoopEdge = false;
-//             std::set<KeyFrame*> sLoopEdges;
-//             if(pKFSource->GetLoopEdges().size() > 0)
-//                 sLoopEdges = pKFSource->GetLoopEdges();
-                
-//             if(sLoopEdges.find(pKFTarget) != sLoopEdges.end())
-//                 isLoopEdge = true;
-            
-//             file << pKFSource->mnId << " " 
-//                  << pKFTarget->mnId << " " 
-//                  << weight << " "
-//                  << covisWeight << " "
-//                  << (isLoopEdge ? "1" : "0") << std::endl;
-//         }
-//     }
-    
-//     file.close();
-// }
+
 void LoopClosing::SaveConnectionsData(const std::string& filename, 
                                      const map<KeyFrame*, set<KeyFrame*>>& loopConnections)
 {
