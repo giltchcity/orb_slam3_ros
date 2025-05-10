@@ -620,22 +620,7 @@ void LoopClosing::SaveGBAInfo(const std::string& filename, Map* pMap, unsigned l
     
     file.close();
 }
-// void LoopClosing::SaveTimingInfo(const std::string& filename)
-// {
-//     std::ofstream file(filename);
-//     if(!file.is_open()) {
-//         std::cerr << "Cannot open file: " << filename << std::endl;
-//         return;
-//     }
-    
-//     file << "DETECTION_TIME_MS: " << mTimingInfo.detectionTimeMs << std::endl;
-//     file << "SIM3_COMPUTATION_TIME_MS: " << mTimingInfo.sim3ComputationTimeMs << std::endl;
-//     file << "FUSION_TIME_MS: " << mTimingInfo.fusionTimeMs << std::endl;
-//     file << "OPTIMIZATION_TIME_MS: " << mTimingInfo.optimizationTimeMs << std::endl;
-//     file << "TOTAL_LOOP_CLOSING_TIME_MS: " << mTimingInfo.totalTimeMs << std::endl;
-    
-//     file.close();
-// }
+
 
 void LoopClosing::SetSaveLoopData(bool flag, const std::string& directory)
 {
@@ -699,58 +684,6 @@ void LoopClosing::SaveConnectionsData(const std::string& filename,
     file.close();
 }
 
-
-// void LoopClosing::SaveSim3Data(const std::string& filename, 
-//                                const KeyFrameAndPose& CorrectedSim3, 
-//                                const KeyFrameAndPose& NonCorrectedSim3)
-// {
-//     std::ofstream file(filename);
-//     if(!file.is_open())
-//     {
-//         std::cerr << "Cannot open file: " << filename << std::endl;
-//         return;
-//     }
-    
-//     file << "# TYPE KF_ID r00 r01 r02 r10 r11 r12 r20 r21 r22 t0 t1 t2 scale" << std::endl;
-    
-//     // 保存校正前的Sim3数据
-//     for(const auto& kfPose : NonCorrectedSim3)
-//     {
-//         KeyFrame* pKF = kfPose.first;
-//         g2o::Sim3 Sim3 = kfPose.second;
-        
-//         Eigen::Matrix3d R = Sim3.rotation().toRotationMatrix();
-//         Eigen::Vector3d t = Sim3.translation();
-//         double s = Sim3.scale();
-        
-//         file << "NON_CORRECTED " << pKF->mnId << " "
-//              << R(0,0) << " " << R(0,1) << " " << R(0,2) << " "
-//              << R(1,0) << " " << R(1,1) << " " << R(1,2) << " "
-//              << R(2,0) << " " << R(2,1) << " " << R(2,2) << " "
-//              << t(0) << " " << t(1) << " " << t(2) << " "
-//              << s << std::endl;
-//     }
-    
-//     // 保存校正后的Sim3数据
-//     for(const auto& kfPose : CorrectedSim3)
-//     {
-//         KeyFrame* pKF = kfPose.first;
-//         g2o::Sim3 Sim3 = kfPose.second;
-        
-//         Eigen::Matrix3d R = Sim3.rotation().toRotationMatrix();
-//         Eigen::Vector3d t = Sim3.translation();
-//         double s = Sim3.scale();
-        
-//         file << "CORRECTED " << pKF->mnId << " "
-//              << R(0,0) << " " << R(0,1) << " " << R(0,2) << " "
-//              << R(1,0) << " " << R(1,1) << " " << R(1,2) << " "
-//              << R(2,0) << " " << R(2,1) << " " << R(2,2) << " "
-//              << t(0) << " " << t(1) << " " << t(2) << " "
-//              << s << std::endl;
-//     }
-    
-//     file.close();
-// }
 
 void LoopClosing::GetLoopConstraints(std::vector<std::tuple<KeyFrame*, KeyFrame*, g2o::Sim3>>& constraints)
 {
