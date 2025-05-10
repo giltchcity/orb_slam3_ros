@@ -121,6 +121,535 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mnCorrectionGBA = 0;
 }
 
+
+void LoopClosing::SaveCompleteTrajectory(const std::string& filename, Map* pMap)
+{
+    std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
+    // 按时间戳排序
+    std::sort(vpKFs.begin(), vpKFs.end(), [](const KeyFrame* a, const KeyFrame* b) {
+        return a->mTimeStamp < b->mTimeStamp;
+    });
+    
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    // 使用ORB-SLAM3标准格式，没有标题行
+    for(KeyFrame* pKF : vpKFs) {
+        if(!pKF || pKF->isBad())
+            continue;
+            
+        // 获取Camera to World变换(即全局位姿)
+        Sophus::SE3f Twc = pKF->GetPoseInverse();
+        Eigen::Quaternionf q = Twc.unit_quaternion();
+        Eigen::Vector3f t = Twc.translation();
+        
+        // 输出标准格式：timestamp tx ty tz qx qy qz qw
+        file << std::fixed << std::setprecision(9) << pKF->mTimeStamp * 1e9 << " " // 转换为纳秒
+             << t.x() << " " << t.y() << " " << t.z() << " "
+             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveDetailedKeyFrames(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# KF_ID timestamp mTimeStamp tx ty tz qx qy qz qw vx vy vz parent_KF_ID loop_edges fixed_in_optimization mBAGlobalForKF mbNotErase" << std::endl;
+    
+    for(KeyFrame* pKF : vpKFs) {
+        if(!pKF || pKF->isBad())
+            continue;
+            
+        // 获取位姿
+        Sophus::SE3f Twc = pKF->GetPoseInverse();
+        Eigen::Quaternionf q = Twc.unit_quaternion();
+        Eigen::Vector3f t = Twc.translation();
+        
+        // 获取速度
+        Eigen::Vector3f v = pKF->GetVelocity();
+        
+        // 获取父关键帧
+        KeyFrame* pParent = pKF->GetParent();
+        long unsigned int parentId = pParent ? pParent->mnId : 0;
+        
+        // 获取回环边
+        std::set<KeyFrame*> loopEdges = pKF->GetLoopEdges();
+        std::stringstream ssLoopEdges;
+        ssLoopEdges << "\"";
+        bool first = true;
+        for(KeyFrame* pLoopKF : loopEdges) {
+            if(!first) ssLoopEdges << ",";
+            ssLoopEdges << pLoopKF->mnId;
+            first = false;
+        }
+        ssLoopEdges << "\"";
+        
+        // 写入详细信息
+        file << pKF->mnId << " " 
+             << std::fixed << std::setprecision(3) << pKF->mTimeStamp << " "
+             << std::setprecision(9) << pKF->mTimeStamp << " "
+             << t.x() << " " << t.y() << " " << t.z() << " "
+             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << " "
+             << v.x() << " " << v.y() << " " << v.z() << " "
+             << parentId << " " 
+             << ssLoopEdges.str() << " "
+             << (pKF->isFixed() ? 1 : 0) << " "
+             << pKF->mnBAGlobalForKF << " "
+             << (pKF->GetNotErase() ? 1 : 0) << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveEnhancedMapPoints(const std::string& filename, const std::vector<MapPoint*>& mapPoints)
+{
+    std::set<MapPoint*> uniqueMapPoints(mapPoints.begin(), mapPoints.end());
+    
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# MP_ID x y z first_KF_ID ref_KF_ID num_observations visibility_score min_distance max_distance normal_x normal_y normal_z corrected_by_KF corrected_reference replaced_id" << std::endl;
+    
+    for(MapPoint* pMP : uniqueMapPoints) {
+        if(!pMP || pMP->isBad())
+            continue;
+            
+        // 基本位置
+        Eigen::Vector3f pos = pMP->GetWorldPos();
+        
+        // 观测信息
+        KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
+        float minDist = pMP->GetMinDistanceInvariance();
+        float maxDist = pMP->GetMaxDistanceInvariance();
+        
+        // 可见性得分 (计算规范化观测数)
+        float visibilityScore = static_cast<float>(pMP->Observations()) / 
+                               (pMP->GetMaxDistanceInvariance() - pMP->GetMinDistanceInvariance() + 1.0f);
+        
+        // 观测方向
+        Eigen::Vector3f normal = pMP->GetNormal();
+        
+        // 写入详细信息
+        file << pMP->mnId << " " 
+             << pos.x() << " " << pos.y() << " " << pos.z() << " "
+             << pMP->mnFirstKFid << " " 
+             << (pRefKF ? pRefKF->mnId : 0) << " "
+             << pMP->Observations() << " "
+             << visibilityScore << " "
+             << minDist << " " << maxDist << " "
+             << normal.x() << " " << normal.y() << " " << normal.z() << " "
+             << pMP->mnCorrectedByKF << " "
+             << pMP->mnCorrectedReference << " "
+             << pMP->mnReplaceId << std::endl;
+    }
+    
+    file.close();
+}
+void LoopClosing::SaveCompleteMetadata(const std::string& filename, 
+                                      double detectionTimeMs,
+                                      double sim3ComputationTimeMs,
+                                      double optimizationTimeMs,
+                                      double fusionTimeMs,
+                                      double totalTimeMs)
+{
+    Map* pLoopMap = mpCurrentKF->GetMap();
+    
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "LOOP_ID: " << mLoopClosureCount << std::endl;
+    file << "TIMESTAMP: " << std::fixed << std::setprecision(9) << mpCurrentKF->mTimeStamp << std::endl;
+    file << "CURRENT_KF_ID: " << mpCurrentKF->mnId << std::endl;
+    file << "MATCHED_KF_ID: " << mpLoopMatchedKF->mnId << std::endl;
+    file << "NUM_CONNECTED_KFS: " << mvpCurrentConnectedKFs.size() << std::endl;
+    file << "NUM_MATCHED_MPS: " << mvpLoopMatchedMPs.size() << std::endl;
+    file << "NUM_LOOP_MPS: " << mvpLoopMPs.size() << std::endl;
+    
+    // 检测信息
+    file << "LOOP_NUM_COINCIDENCES: " << mnLoopNumCoincidences << std::endl;
+    file << "LOOP_NUM_NOT_FOUND: " << mnLoopNumNotFound << std::endl;
+    
+    // 获取回环变换参数
+    file << "LOOP_TRANSFORMATION_SCALE: " << mg2oLoopScw.scale() << std::endl;
+    
+    // 位置信息
+    Eigen::Vector3f curPos = mpCurrentKF->GetCameraCenter();
+    Eigen::Vector3f matchedPos = mpLoopMatchedKF->GetCameraCenter();
+    file << "CURRENT_KF_POSITION: " << curPos.x() << " " << curPos.y() << " " << curPos.z() << std::endl;
+    file << "MATCHED_KF_POSITION: " << matchedPos.x() << " " << matchedPos.y() << " " << matchedPos.z() << std::endl;
+    
+    // 时间信息
+    if(detectionTimeMs > 0.0) {
+        file << "TIME_DETECTION_MS: " << detectionTimeMs << std::endl;
+        file << "TIME_SIM3_COMPUTATION_MS: " << sim3ComputationTimeMs << std::endl;
+        file << "TIME_OPTIMIZATION_MS: " << optimizationTimeMs << std::endl;
+        file << "TIME_FUSION_MS: " << fusionTimeMs << std::endl;
+        file << "TIME_TOTAL_MS: " << totalTimeMs << std::endl;
+    }
+    
+    // IMU相关信息
+    file << "IMU_INITIALIZED: " << (pLoopMap->isImuInitialized() ? "true" : "false") << std::endl;
+    file << "IS_INERTIAL: " << (pLoopMap->IsInertial() ? "true" : "false") << std::endl;
+    file << "IMU_BA2: " << (pLoopMap->GetIniertialBA2() ? "true" : "false") << std::endl;
+    
+    // 传感器类型
+    file << "SENSOR_TYPE: " << mpTracker->mSensor << std::endl;
+    
+    // 固定尺度信息
+    file << "FIXED_SCALE: " << (mbFixScale ? "true" : "false") << std::endl;
+    
+    file << "CORRECTION_NUMBER: " << mnNumCorrection << std::endl;
+    file << "MAP_ID: " << pLoopMap->GetId() << std::endl;
+    file << "MAP_KEYFRAMES: " << pLoopMap->KeyFramesInMap() << std::endl;
+    file << "MAP_MAPPOINTS: " << pLoopMap->MapPointsInMap() << std::endl;
+    file << "GBA_REQUESTED: " << ((pLoopMap->KeyFramesInMap()<200 && mpAtlas->CountMaps()==1) ? "true" : "false") << std::endl;
+    
+    file.close();
+}
+void LoopClosing::SaveCovisibilityGraph(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# Source_KF_ID Target_KF_ID Weight Common_MapPoints" << std::endl;
+    
+    // 访问过的边集合，避免重复
+    std::set<std::pair<unsigned long, unsigned long>> processedEdges;
+    
+    for(KeyFrame* pKF : vpKFs) {
+        if(!pKF || pKF->isBad())
+            continue;
+            
+        // 获取所有共视关键帧及权重
+        const std::vector<KeyFrame*> vpConnected = pKF->GetVectorCovisibleKeyFrames();
+        const std::vector<int> vpConnectedWeight = pKF->GetVectorCovisibleWeight();
+        
+        for(size_t i=0; i < vpConnected.size(); i++) {
+            KeyFrame* pConnected = vpConnected[i];
+            if(!pConnected || pConnected->isBad())
+                continue;
+                
+            // 创建排序后的ID对，确保每条边只处理一次
+            unsigned long id1 = pKF->mnId;
+            unsigned long id2 = pConnected->mnId;
+            std::pair<unsigned long, unsigned long> edge = id1 < id2 ? 
+                                                          std::make_pair(id1, id2) : 
+                                                          std::make_pair(id2, id1);
+                                                          
+            if(processedEdges.find(edge) != processedEdges.end())
+                continue;
+                
+            processedEdges.insert(edge);
+            
+            // 获取共同观测的地图点
+            std::set<MapPoint*> sCommonMPs;
+            for(size_t j=0; j < pKF->GetMapPointMatches().size(); j++) {
+                MapPoint* pMP = pKF->GetMapPoint(j);
+                if(!pMP || pMP->isBad())
+                    continue;
+                    
+                if(pConnected->hasMapPoint(pMP))
+                    sCommonMPs.insert(pMP);
+            }
+            
+            // 构建共同地图点ID字符串
+            std::stringstream ssCommonMPs;
+            ssCommonMPs << "\"";
+            bool first = true;
+            for(MapPoint* pMP : sCommonMPs) {
+                if(!first) ssCommonMPs << ",";
+                ssCommonMPs << pMP->mnId;
+                first = false;
+            }
+            ssCommonMPs << "\"";
+            
+            // 写入边信息
+            file << pKF->mnId << " " 
+                 << pConnected->mnId << " " 
+                 << vpConnectedWeight[i] << " "
+                 << ssCommonMPs.str() << std::endl;
+        }
+    }
+    
+    file.close();
+}
+void LoopClosing::SaveEssentialGraph(const std::string& filename, Map* pMap)
+{
+    std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
+    
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# edge_type source_KF_ID target_KF_ID weight info_matrix_scale" << std::endl;
+    
+    // 处理所有关键帧
+    for(KeyFrame* pKF : vpKFs) {
+        if(!pKF || pKF->isBad())
+            continue;
+            
+        // 保存生成树边（父节点）
+        KeyFrame* pParent = pKF->GetParent();
+        if(pParent) {
+            file << "SPANNING_TREE " << pKF->mnId << " " << pParent->mnId << " 0.0 1.0" << std::endl;
+        }
+        
+        // 保存回环边
+        std::set<KeyFrame*> sLoopEdges = pKF->GetLoopEdges();
+        for(KeyFrame* pLoopKF : sLoopEdges) {
+            if(pKF->mnId < pLoopKF->mnId) // 只保存一次
+                file << "LOOP " << pKF->mnId << " " << pLoopKF->mnId << " " << pKF->GetWeight(pLoopKF) << " 5.0" << std::endl;
+        }
+        
+        // 保存共视边，但不包括已经包含在生成树或回环边中的
+        const std::vector<KeyFrame*> vpConnected = pKF->GetVectorCovisibleKeyFrames();
+        const std::vector<int> vpConnectedWeight = pKF->GetVectorCovisibleWeight();
+        
+        for(size_t i=0; i < vpConnected.size(); i++) {
+            KeyFrame* pConnected = vpConnected[i];
+            if(!pConnected || pConnected->isBad())
+                continue;
+                
+            // 只处理ID更大的，确保每条边只保存一次
+            if(pKF->mnId < pConnected->mnId) {
+                // 确保不是生成树边或回环边
+                if(pConnected != pParent && sLoopEdges.find(pConnected) == sLoopEdges.end())
+                    file << "COVISIBILITY " << pKF->mnId << " " << pConnected->mnId << " " << vpConnectedWeight[i] << " 1.0" << std::endl;
+            }
+        }
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveIMUStates(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# KF_ID bg_x bg_y bg_z ba_x ba_y ba_z vel_x vel_y vel_z timestamp_prev_KF dT" << std::endl;
+    
+    for(KeyFrame* pKF : vpKFs) {
+        if(!pKF || pKF->isBad())
+            continue;
+            
+        // 获取IMU数据
+        IMU::Bias imuBias = pKF->GetImuBias();
+        Eigen::Vector3f bg(imuBias.bwx);
+        Eigen::Vector3f ba(imuBias.bax);
+        Eigen::Vector3f vel = pKF->GetVelocity();
+        
+        // 获取时间信息
+        double timestampPrev = 0.0;
+        double dT = 0.0;
+        
+        KeyFrame* pPrevKF = pKF->GetPrevKeyFrame();
+        if(pPrevKF) {
+            timestampPrev = pPrevKF->mTimeStamp;
+            dT = pKF->mTimeStamp - timestampPrev;
+        }
+        
+        file << pKF->mnId << " "
+             << bg.x() << " " << bg.y() << " " << bg.z() << " "
+             << ba.x() << " " << ba.y() << " " << ba.z() << " "
+             << vel.x() << " " << vel.y() << " " << vel.z() << " "
+             << std::fixed << std::setprecision(9) << timestampPrev << " "
+             << dT << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveLoopMatches(const std::string& filename)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# current_KF_ID matched_KF_ID num_matches inliers" << std::endl;
+    file << mpCurrentKF->mnId << " " << mpLoopMatchedKF->mnId << " " << mvpLoopMatchedMPs.size() << " " << mnLoopNumCoincidences << std::endl;
+    
+    file << "# idx current_MP_ID matched_MP_ID descriptor_distance" << std::endl;
+    
+    for(size_t i=0; i<mvpLoopMatchedMPs.size(); i++) {
+        MapPoint* pMatchMP = mvpLoopMatchedMPs[i];
+        if(!pMatchMP)
+            continue;
+            
+        MapPoint* pCurMP = mpCurrentKF->GetMapPoint(i);
+        long unsigned int curId = pCurMP ? pCurMP->mnId : 0;
+        
+        // 计算描述子距离 (如果有描述子)
+        float descriptorDistance = 0.0;
+        if(pCurMP && !pCurMP->isBad() && pMatchMP && !pMatchMP->isBad()) {
+            cv::Mat desc1 = pCurMP->GetDescriptor();
+            cv::Mat desc2 = pMatchMP->GetDescriptor();
+            if(!desc1.empty() && !desc2.empty()) {
+                descriptorDistance = static_cast<float>(ORBmatcher::DescriptorDistance(desc1, desc2));
+            }
+        }
+        
+        file << i << " " << curId << " " << pMatchMP->mnId << " " << descriptorDistance << std::endl;
+    }
+    
+    file.close();
+}
+
+void LoopClosing::SaveOptimizationParameters(const std::string& filename, bool bFixedScale, Map* pMap, int numIterations, float initialError, float finalError)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    std::string optimizerType = (pMap->IsInertial() && pMap->isImuInitialized()) ? 
+                               "OptimizeEssentialGraph4DoF" : "OptimizeEssentialGraph";
+    
+    file << "OPTIMIZER: " << optimizerType << std::endl;
+    file << "FIXED_SCALE: " << (bFixedScale ? "true" : "false") << std::endl;
+    file << "IS_INERTIAL: " << (pMap->IsInertial() ? "true" : "false") << std::endl;
+    file << "IMU_INITIALIZED: " << (pMap->isImuInitialized() ? "true" : "false") << std::endl;
+    file << "SENSOR_TYPE: " << mpTracker->mSensor << std::endl;
+    file << "NUM_ITERATIONS: " << numIterations << std::endl;
+    file << "MAX_ITERATIONS: 200" << std::endl;
+    file << "INITIAL_DAMPING: 1e-6" << std::endl;
+    file << "MIN_ERROR_DECREASE: 1e-3" << std::endl;
+    file << "USE_ROBUST_KERNEL: true" << std::endl;
+    file << "HUBER_DELTA: 1.345" << std::endl;
+    
+    if(initialError > 0.0 && finalError > 0.0) {
+        file << "INITIAL_ERROR: " << initialError << std::endl;
+        file << "FINAL_ERROR: " << finalError << std::endl;
+        file << "ERROR_REDUCTION: " << (1.0 - finalError/initialError) * 100.0 << "%" << std::endl;
+    }
+    
+    file << "NUM_FIXED_KFS: 1" << std::endl; // 通常只固定回环匹配关键帧
+    file << "NUM_OPTIMIZED_KFS: " << mvpCurrentConnectedKFs.size() << std::endl;
+    
+    file.close();
+}
+void LoopClosing::SaveFusionLog(const std::string& filename, const std::vector<std::pair<MapPoint*, MapPoint*>>& fusedPoints)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "# Original_MP_ID Replaced_By_MP_ID KFs_Modified Feature_Indices Fusion_Type" << std::endl;
+    
+    for(const auto& pair : fusedPoints) {
+        MapPoint* pOriginalMP = pair.first;
+        MapPoint* pReplacedByMP = pair.second;
+        
+        if(!pOriginalMP || pOriginalMP->isBad() || !pReplacedByMP || pReplacedByMP->isBad())
+            continue;
+            
+        // 获取观测此地图点的关键帧
+        std::map<KeyFrame*, size_t> observations = pOriginalMP->GetObservations();
+        
+        // 构建关键帧ID字符串
+        std::stringstream ssKFs;
+        ssKFs << "\"";
+        bool first = true;
+        for(const auto& obs : observations) {
+            if(!first) ssKFs << ",";
+            ssKFs << obs.first->mnId;
+            first = false;
+        }
+        ssKFs << "\"";
+        
+        // 构建特征索引字符串
+        std::stringstream ssIndices;
+        ssIndices << "\"";
+        first = true;
+        for(const auto& obs : observations) {
+            if(!first) ssIndices << ",";
+            ssIndices << obs.second;
+            first = false;
+        }
+        ssIndices << "\"";
+        
+        // 融合类型
+        std::string fusionType = "REPLACE"; // 或者其他类型，根据实际情况
+        
+        file << pOriginalMP->mnId << " " 
+             << pReplacedByMP->mnId << " " 
+             << ssKFs.str() << " " 
+             << ssIndices.str() << " " 
+             << fusionType << std::endl;
+    }
+    
+    file.close();
+}
+void LoopClosing::SaveGBAInfo(const std::string& filename, Map* pMap, unsigned long nLoopKF)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    bool execGBA = !pMap->isImuInitialized() || (pMap->KeyFramesInMap()<200 && mpAtlas->CountMaps()==1);
+    
+    file << "GBA_EXECUTED: " << (execGBA ? "true" : "false") << std::endl;
+    file << "GBA_FOR_KF_ID: " << nLoopKF << std::endl;
+    
+    if(execGBA) {
+        file << "GBA_NUM_ITERATIONS: " << (isFinishedGBA() ? "Completed" : "Incomplete") << std::endl;
+        file << "GBA_NUM_KFS: " << pMap->KeyFramesInMap() << std::endl;
+        file << "GBA_NUM_MPS: " << pMap->MapPointsInMap() << std::endl;
+        file << "GBA_STOPPED_BY_USER: " << (mbStopGBA ? "true" : "false") << std::endl;
+        file << "GBA_FULL_BA_INDEX: " << mnFullBAIdx << std::endl;
+    } else {
+        file << "GBA_SKIP_REASON: " << (pMap->isImuInitialized() ? "IMU Initialized" : "Too Many Keyframes") << std::endl;
+    }
+    
+    file.close();
+}
+void LoopClosing::SaveTimingInfo(const std::string& filename)
+{
+    std::ofstream file(filename);
+    if(!file.is_open()) {
+        std::cerr << "Cannot open file: " << filename << std::endl;
+        return;
+    }
+    
+    file << "DETECTION_TIME_MS: " << mTimingInfo.detectionTimeMs << std::endl;
+    file << "SIM3_COMPUTATION_TIME_MS: " << mTimingInfo.sim3ComputationTimeMs << std::endl;
+    file << "FUSION_TIME_MS: " << mTimingInfo.fusionTimeMs << std::endl;
+    file << "OPTIMIZATION_TIME_MS: " << mTimingInfo.optimizationTimeMs << std::endl;
+    file << "TOTAL_LOOP_CLOSING_TIME_MS: " << mTimingInfo.totalTimeMs << std::endl;
+    
+    file.close();
+}
+
 void LoopClosing::SetSaveLoopData(bool flag, const std::string& directory)
 {
     mSaveLoopData = flag;
@@ -1337,12 +1866,16 @@ int LoopClosing::FindMatchesByProjection(KeyFrame* pCurrentKF, KeyFrame* pMatche
 void LoopClosing::CorrectLoop()
 {
     cout << "Loop detected!" << endl;
+
+
+    // 记录开始时间
+    std::chrono::steady_clock::time_point timeStart = std::chrono::steady_clock::now();
     
-    // 添加在这里 - 记录回环检测ID和创建目录
+    // 增加回环计数
     mLoopClosureCount++;
     double timestamp = mpCurrentKF->mTimeStamp;
     
-    // 创建本次回环检测的专用目录
+    // 创建目录结构
     std::stringstream ssLoopDir;
     ssLoopDir << mSaveDirectory << "loop_" << mLoopClosureCount << "_" 
               << std::fixed << std::setprecision(6) << timestamp << "/";
@@ -1359,25 +1892,22 @@ void LoopClosing::CorrectLoop()
             #endif
         }
         
-        // 创建pre和post子目录
+        // 创建子目录结构
         std::string preDir = loopDir + "pre/";
         std::string postDir = loopDir + "post/";
+        std::string metadataDir = loopDir + "metadata/";
+        std::string debugDir = loopDir + "debug/";
         
-        if (stat(preDir.c_str(), &st) == -1) {
-            #ifdef _WIN32
-                _mkdir(preDir.c_str());
-            #else
-                mkdir(preDir.c_str(), 0700);
-            #endif
+        for(const std::string& dir : {preDir, postDir, metadataDir, debugDir}) {
+            if (stat(dir.c_str(), &st) == -1) {
+                #ifdef _WIN32
+                    _mkdir(dir.c_str());
+                #else
+                    mkdir(dir.c_str(), 0700);
+                #endif
+            }
         }
-        
-        if (stat(postDir.c_str(), &st) == -1) {
-            #ifdef _WIN32
-                _mkdir(postDir.c_str());
-            #else
-                mkdir(postDir.c_str(), 0700);
-            #endif
-        }
+    
     }
 
     // Send a stop signal to Local Mapping
@@ -1434,59 +1964,35 @@ void LoopClosing::CorrectLoop()
     Map* pLoopMap = mpCurrentKF->GetMap();
     
     // 添加在这里 - 保存优化前的数据
-    if(mSaveLoopData)
-    {
+    if(mSaveLoopData) {
         std::string preDir = loopDir + "pre/";
         
-        // 保存优化前的关键帧轨迹
-        SaveTrajectoryData(preDir + "trajectory_sim3.txt", NonCorrectedSim3);
+        // 保存标准轨迹
+        SaveCompleteTrajectory(preDir + "standard_trajectory_no_loop.txt", pLoopMap);
         
-        // 保存当前所有关键帧的原始SE3轨迹
-        SaveKeyFrameTrajectory(preDir + "keyframes.txt", mvpCurrentConnectedKFs);
+        // 保存详细关键帧信息
+        SaveDetailedKeyFrames(preDir + "keyframes_no_loop.txt", pLoopMap->GetAllKeyFrames());
         
-        // 保存优化前的地图点数据
+        // 保存地图点数据
         std::vector<MapPoint*> allMPs;
-        for(auto& kfp : mvpCurrentConnectedKFs)
-        {
-            vector<MapPoint*> vpMPs = kfp->GetMapPointMatches();
-            for(auto& mp : vpMPs)
-            {
-                if(mp && !mp->isBad())
-                    allMPs.push_back(mp);
-            }
-        }
-        SaveMapPointData(preDir + "mappoints.txt", allMPs);
-        
-        // 保存匹配的地图点
-        SaveMapPointData(preDir + "loop_mappoints.txt", mvpLoopMapPoints);
-        
-        // 保存优化元数据
-        SaveOptimizationMetadata(loopDir + "metadata.txt");
-        
-        // 保存Sim3数据
-        SaveSim3Data(preDir + "sim3_transforms.txt", CorrectedSim3, NonCorrectedSim3);
-        
-        // 保存匹配点数据
-        std::ofstream fileMatches(preDir + "matches.txt");
-        if(fileMatches.is_open())
-        {
-            fileMatches << "# CurrentKF_ID MatchedKF_ID NumMatches" << std::endl;
-            fileMatches << mpCurrentKF->mnId << " " << mpLoopMatchedKF->mnId << " " << mvpLoopMatchedMPs.size() << std::endl;
+        for(KeyFrame* pKF : pLoopMap->GetAllKeyFrames()) {
+            if(!pKF || pKF->isBad()) continue;
             
-            fileMatches << "# Index CurrentMP_ID MatchedMP_ID" << std::endl;
-            for(size_t i=0; i<mvpLoopMatchedMPs.size(); i++)
-            {
-                MapPoint* pMatchMP = mvpLoopMatchedMPs[i];
-                MapPoint* pCurMP = mpCurrentKF->GetMapPoint(i);
-                
-                if(pMatchMP)
-                {
-                    long unsigned int curId = pCurMP ? pCurMP->mnId : 0;
-                    fileMatches << i << " " << curId << " " << pMatchMP->mnId << std::endl;
-                }
+            vector<MapPoint*> vpMPs = pKF->GetMapPointMatches();
+            for(MapPoint* pMP : vpMPs) {
+                if(pMP && !pMP->isBad())
+                    allMPs.push_back(pMP);
             }
-            fileMatches.close();
         }
+        SaveEnhancedMapPoints(preDir + "mappoints_no_loop.txt", allMPs);
+        
+        // 保存共视图和Essential Graph
+        SaveCovisibilityGraph(preDir + "covisibility_graph.txt", pLoopMap->GetAllKeyFrames());
+        SaveEssentialGraph(preDir + "essential_graph.txt", pLoopMap);
+        
+        // 如果使用IMU，保存IMU状态
+        if(pLoopMap->IsInertial())
+            SaveIMUStates(preDir + "imu_states.txt", pLoopMap->GetAllKeyFrames());
     }
         
 #ifdef REGISTER_TIMES
@@ -1600,11 +2106,54 @@ void LoopClosing::CorrectLoop()
         //cout << "LC: end replacing duplicated" << endl;
     }
 
+
+    // 记录Sim3计算时间
+    std::chrono::steady_clock::time_point timeAfterSim3 = std::chrono::steady_clock::now();
+    double sim3TimeMs = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(timeAfterSim3-timeStart).count();
+    mTimingInfo.sim3ComputationTimeMs = sim3TimeMs;
+    
+    // 记录SearchAndFuse前的地图点状态，用于跟踪融合
+    std::map<long unsigned int, MapPoint*> originalMPs;
+    for(MapPoint* pMP : mvpLoopMapPoints) {
+        if(pMP && !pMP->isBad()) {
+            originalMPs[pMP->mnId] = pMP;
+        }
+    }
+    
     // Project MapPoints observed in the neighborhood of the loop keyframe
     // into the current keyframe and neighbors using corrected poses.
     // Fuse duplications.
-    SearchAndFuse(CorrectedSim3, mvpLoopMapPoints);
 
+    SearchAndFuse(CorrectedSim3, mvpLoopMapPoints);
+    
+    // 在SearchAndFuse调用后
+    // 收集被融合的地图点对
+    std::vector<std::pair<MapPoint*, MapPoint*>> fusedPoints;
+    for(MapPoint* pMP : mvpLoopMapPoints) {
+        if(pMP && !pMP->isBad() && pMP->mnReplaceId != -1) {
+            // 查找被替换后的地图点
+            long unsigned int replaceId = pMP->mnReplaceId;
+            MapPoint* pReplaceMP = nullptr;
+            for(MapPoint* pSearchMP : pLoopMap->GetAllMapPoints()) {
+                if(pSearchMP && !pSearchMP->isBad() && pSearchMP->mnId == replaceId) {
+                    pReplaceMP = pSearchMP;
+                    break;
+                }
+            }
+            
+            if(pReplaceMP) {
+                fusedPoints.push_back(std::make_pair(pMP, pReplaceMP));
+            }
+        }
+    }
+    
+    // 记录融合时间
+    std::chrono::steady_clock::time_point timeAfterFusion = std::chrono::steady_clock::now();
+    double fusionTimeMs = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(timeAfterFusion-timeAfterSim3).count();
+    mTimingInfo.fusionTimeMs = fusionTimeMs;
+    
+    // 原有代码 - 检测新连接...
+    
     // After the MapPoint fusion, new links in the covisibility graph will appear attaching both sides of the loop
     map<KeyFrame*, set<KeyFrame*> > LoopConnections;
 
@@ -1666,66 +2215,119 @@ void LoopClosing::CorrectLoop()
         Optimizer::OptimizeEssentialGraph(pLoopMap, mpLoopMatchedKF, mpCurrentKF, NonCorrectedSim3, CorrectedSim3, LoopConnections, bFixedScale);
     }
 #ifdef REGISTER_TIMES
-    std::chrono::steady_clock::time_point time_EndOpt = std::chrono::steady_clock::now();
+    // 在Essential Graph优化后
+    // 记录优化时间
+    std::chrono::steady_clock::time_point timeAfterOpt = std::chrono::steady_clock::now();
+    double optimizationTimeMs = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(timeAfterOpt-timeAfterFusion).count();
+    mTimingInfo.optimizationTimeMs = optimizationTimeMs;
+    
+    // 总时间
+    double totalTimeMs = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(timeAfterOpt-timeStart).count();
+    mTimingInfo.totalTimeMs = totalTimeMs;
 
     double timeOptEss = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndOpt - time_EndFusion).count();
     vdLoopOptEss_ms.push_back(timeOptEss);
 #endif
     
     // 添加在这里 - 优化后保存数据
+    // 优化后保存数据
     if(mSaveLoopData)
     {
         std::string postDir = loopDir + "post/";
+        std::string metadataDir = loopDir + "metadata/";
         
-        // 优化后，收集优化后的关键帧位姿
-        KeyFrameAndPose OptimizedPoses;
-        for(auto& kfPair : NonCorrectedSim3)
-        {
-            KeyFrame* pKF = kfPair.first;
-            Sophus::SE3f Tiw = pKF->GetPose();
-            g2o::Sim3 g2oSiw(Tiw.unit_quaternion().cast<double>(), Tiw.translation().cast<double>(), 1.0);
-            OptimizedPoses[pKF] = g2oSiw;
-        }
+        // 保存优化后的标准轨迹
+        SaveCompleteTrajectory(postDir + "standard_trajectory_with_loop.txt", pLoopMap);
         
-        // 保存优化后的轨迹
-        SaveTrajectoryData(postDir + "trajectory_sim3.txt", OptimizedPoses);
-        
-        // 保存优化后的关键帧SE3轨迹
-        SaveKeyFrameTrajectory(postDir + "keyframes.txt", mvpCurrentConnectedKFs);
+        // 保存优化后的关键帧数据
+        SaveDetailedKeyFrames(postDir + "keyframes_with_loop.txt", pLoopMap->GetAllKeyFrames());
         
         // 保存优化后的地图点
         std::vector<MapPoint*> optimizedMPs;
-        for(auto& kfp : mvpCurrentConnectedKFs)
+        for(KeyFrame* pKF : pLoopMap->GetAllKeyFrames())
         {
-            vector<MapPoint*> vpMPs = kfp->GetMapPointMatches();
-            for(auto& mp : vpMPs)
+            if(!pKF || pKF->isBad()) continue;
+            
+            std::vector<MapPoint*> vpMPs = pKF->GetMapPointMatches();
+            for(MapPoint* pMP : vpMPs)
             {
-                if(mp && !mp->isBad())
-                    optimizedMPs.push_back(mp);
+                if(pMP && !pMP->isBad())
+                    optimizedMPs.push_back(pMP);
             }
         }
-        SaveMapPointData(postDir + "mappoints.txt", optimizedMPs);
+        SaveEnhancedMapPoints(postDir + "mappoints_with_loop.txt", optimizedMPs);
         
-        // 保存约束数据
+        // 保存优化后的共视图和Essential Graph
+        SaveCovisibilityGraph(postDir + "covisibility_graph.txt", pLoopMap->GetAllKeyFrames());
+        SaveEssentialGraph(postDir + "essential_graph.txt", pLoopMap);
+        
+        // 如果使用IMU，保存IMU状态
+        if(pLoopMap->IsInertial())
+            SaveIMUStates(postDir + "imu_states.txt", pLoopMap->GetAllKeyFrames());
+        
+        // 保存元数据和过程信息
+        SaveCompleteMetadata(metadataDir + "loop_info.txt", 0.0, sim3TimeMs, optimizationTimeMs, fusionTimeMs, totalTimeMs);
+        SaveTimingInfo(metadataDir + "timing_info.txt");
+        
+        // 保存Sim3变换
+        std::string sim3File = metadataDir + "sim3_transforms.txt";
+        std::ofstream fileSim3(sim3File);
+        if(fileSim3.is_open())
+        {
+            fileSim3 << "# KF_ID original_scale original_tx original_ty original_tz original_qx original_qy original_qz original_qw "
+                     << "corrected_scale corrected_tx corrected_ty corrected_tz corrected_qx corrected_qy corrected_qz corrected_qw propagation_source_KF" << std::endl;
+            
+            for(const auto& entry : NonCorrectedSim3)
+            {
+                KeyFrame* pKF = entry.first;
+                g2o::Sim3 origSim3 = entry.second;
+                
+                if(CorrectedSim3.find(pKF) == CorrectedSim3.end())
+                    continue;
+                    
+                g2o::Sim3 corrSim3 = CorrectedSim3.at(pKF);
+                
+                Eigen::Quaterniond qOrig = origSim3.rotation();
+                Eigen::Vector3d tOrig = origSim3.translation();
+                double sOrig = origSim3.scale();
+                
+                Eigen::Quaterniond qCorr = corrSim3.rotation();
+                Eigen::Vector3d tCorr = corrSim3.translation();
+                double sCorr = corrSim3.scale();
+                
+                int sourcePropagation = (pKF == mpCurrentKF) ? -1 : 
+                                        (pKF->GetParent() ? pKF->GetParent()->mnId : -1);
+                
+                fileSim3 << pKF->mnId << " "
+                        << sOrig << " " << tOrig.x() << " " << tOrig.y() << " " << tOrig.z() << " "
+                        << qOrig.x() << " " << qOrig.y() << " " << qOrig.z() << " " << qOrig.w() << " "
+                        << sCorr << " " << tCorr.x() << " " << tCorr.y() << " " << tCorr.z() << " "
+                        << qCorr.x() << " " << qCorr.y() << " " << qCorr.z() << " " << qCorr.w() << " "
+                        << sourcePropagation << std::endl;
+            }
+            fileSim3.close();
+        }
+        
+        // 保存回环约束
         std::vector<std::tuple<KeyFrame*, KeyFrame*, g2o::Sim3>> constraints;
         GetLoopConstraints(constraints);
-        
-        std::ofstream fileConstraints(postDir + "constraints.txt");
+        std::string constraintsFile = metadataDir + "loop_constraints.txt";
+        std::ofstream fileConstraints(constraintsFile);
         if(fileConstraints.is_open())
         {
-            fileConstraints << "# Source_KF_ID Target_KF_ID r00 r01 r02 r10 r11 r12 r20 r21 r22 t0 t1 t2 scale" << std::endl;
+            fileConstraints << "# source_KF_ID target_KF_ID constraint_type r00 r01 r02 r10 r11 r12 r20 r21 r22 t0 t1 t2 scale" << std::endl;
             
             for(const auto& constraint : constraints)
             {
                 KeyFrame* pKF1 = std::get<0>(constraint);
                 KeyFrame* pKF2 = std::get<1>(constraint);
-                g2o::Sim3 Sim3 = std::get<2>(constraint);
+                g2o::Sim3 sim3 = std::get<2>(constraint);
                 
-                Eigen::Matrix3d R = Sim3.rotation().toRotationMatrix();
-                Eigen::Vector3d t = Sim3.translation();
-                double s = Sim3.scale();
+                Eigen::Matrix3d R = sim3.rotation().toRotationMatrix();
+                Eigen::Vector3d t = sim3.translation();
+                double s = sim3.scale();
                 
-                fileConstraints << pKF1->mnId << " " << pKF2->mnId << " "
+                fileConstraints << pKF1->mnId << " " << pKF2->mnId << " LOOP "
                                << R(0,0) << " " << R(0,1) << " " << R(0,2) << " "
                                << R(1,0) << " " << R(1,1) << " " << R(1,2) << " "
                                << R(2,0) << " " << R(2,1) << " " << R(2,2) << " "
@@ -1735,15 +2337,40 @@ void LoopClosing::CorrectLoop()
             fileConstraints.close();
         }
         
-        // 保存回环边信息
-        std::ofstream fileLoopEdges(postDir + "loop_edges.txt");
-        if(fileLoopEdges.is_open())
+        // 保存匹配信息
+        SaveLoopMatches(metadataDir + "loop_matches.txt");
+        
+        // 保存融合日志
+        SaveFusionLog(metadataDir + "fusion_log.txt", fusedPoints);
+        
+        // 保存优化参数
+        SaveOptimizationParameters(metadataDir + "optimization_params.txt", mbFixScale, pLoopMap);
+        
+        // 保存连接变化
+        std::ofstream fileConnections(metadataDir + "connection_changes.txt");
+        if(fileConnections.is_open())
         {
-            fileLoopEdges << "# KF1_ID KF2_ID" << std::endl;
-            fileLoopEdges << mpCurrentKF->mnId << " " << mpLoopMatchedKF->mnId << std::endl;
-            fileLoopEdges.close();
+            fileConnections << "# Source_KF_ID Target_KF_ID Is_New_Connection" << std::endl;
+            
+            for(const auto& entry : LoopConnections)
+            {
+                KeyFrame* pKF = entry.first;
+                const set<KeyFrame*>& sConnections = entry.second;
+                
+                for(KeyFrame* pConnectedKF : sConnections)
+                {
+                    fileConnections << pKF->mnId << " " << pConnectedKF->mnId << " 1" << std::endl;
+                }
+            }
+            fileConnections.close();
         }
+        
+        // 保存GBA信息
+        SaveGBAInfo(metadataDir + "gba_info.txt", pLoopMap, mpCurrentKF->mnId);
     }
+    
+    // 原有代码 - AddLoopEdge, GBA启动等..
+
     mpAtlas->InformNewBigChange();
 
     // Add loop edge
