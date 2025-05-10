@@ -33,6 +33,12 @@
 #include <mutex>
 #include "Thirdparty/g2o/g2o/types/types_seven_dof_expmap.h"
 
+// 添加这些头文件到已有的包含列表中
+#include <chrono>   // 用于时间测量
+#include <set>      // 用于集合操作
+#include <sstream>  // 用于字符串流
+#include <algorithm>// 用于排序
+
 
 
 namespace ORB_SLAM3
