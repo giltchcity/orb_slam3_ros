@@ -104,6 +104,12 @@ class MapPoint
 
 
 public:
+    // 添加到MapPoint.h中的public部分：
+    MapPoint* GetReplaced() {
+        unique_lock<mutex> lock(mMutexFeatures);
+        return mpReplaced;
+    }
+
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     MapPoint();
 
