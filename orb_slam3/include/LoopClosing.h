@@ -118,6 +118,34 @@ public:
 
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
+    // 在LoopClosing类的protected或public部分添加以下函数声明：
+    
+    // 数据保存函数
+    void SaveCompleteTrajectory(const std::string& filename, Map* pMap);
+    void SaveDetailedKeyFrames(const std::string& filename, const std::vector<KeyFrame*>& vpKFs);
+    void SaveEnhancedMapPoints(const std::string& filename, const std::vector<MapPoint*>& mapPoints);
+    void SaveCompleteMetadata(const std::string& filename, double detectionTimeMs = 0.0,
+                             double sim3ComputationTimeMs = 0.0, double optimizationTimeMs = 0.0,
+                             double fusionTimeMs = 0.0, double totalTimeMs = 0.0);
+    void SaveCovisibilityGraph(const std::string& filename, const std::vector<KeyFrame*>& vpKFs);
+    void SaveEssentialGraph(const std::string& filename, Map* pMap);
+    void SaveIMUStates(const std::string& filename, const std::vector<KeyFrame*>& vpKFs);
+    void SaveLoopMatches(const std::string& filename);
+    void SaveOptimizationParameters(const std::string& filename, bool bFixedScale, Map* pMap, 
+                                   int numIterations = 20, float initialError = 0.0, float finalError = 0.0);
+    void SaveFusionLog(const std::string& filename, const std::vector<std::pair<MapPoint*, MapPoint*>>& fusedPoints);
+    void SaveGBAInfo(const std::string& filename, Map* pMap, unsigned long nLoopKF);
+    void SaveTimingInfo(const std::string& filename);
+    
+    // 添加计时成员结构
+    struct TimingInfo {
+        double detectionTimeMs = 0.0;
+        double sim3ComputationTimeMs = 0.0;
+        double fusionTimeMs = 0.0;
+        double optimizationTimeMs = 0.0;
+        double totalTimeMs = 0.0;
+    };
+    TimingInfo mTimingInfo;
 protected:
 
     bool CheckNewKeyFrames();
