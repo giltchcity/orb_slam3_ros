@@ -2041,18 +2041,8 @@ void LoopClosing::CorrectLoop()
         Optimizer::OptimizeEssentialGraph(pLoopMap, mpLoopMatchedKF, mpCurrentKF, NonCorrectedSim3, CorrectedSim3, LoopConnections, bFixedScale);
     }
 #ifdef REGISTER_TIMES
-    // 在Essential Graph优化后
-    // 记录优化时间
-    std::chrono::steady_clock::time_point timeAfterOpt = std::chrono::steady_clock::now();
-    double optimizationTimeMs = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(timeAfterOpt-timeAfterFusion).count();
-    mTimingInfo.optimizationTimeMs = optimizationTimeMs;
-    
-    // 总时间
-    double totalTimeMs = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(timeAfterOpt-timeStart).count();
-    mTimingInfo.totalTimeMs = totalTimeMs;
 
-    double timeOptEss = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(time_EndOpt - time_EndFusion).count();
-    vdLoopOptEss_ms.push_back(timeOptEss);
+    
 #endif
     
     // 添加在这里 - 优化后保存数据
