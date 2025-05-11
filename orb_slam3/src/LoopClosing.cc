@@ -60,7 +60,7 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
         #ifdef _WIN32
             _mkdir(mSaveDirectory.c_str());
         #else
-            mkdir(mSaveDirectory.c_str(), 0700);
+            mkdir(mSaveDirectory.c_str(), 0755);
         #endif
     }
     
@@ -80,7 +80,7 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
             #ifdef _WIN32
                 _mkdir(mSaveDirectory.c_str());
             #else
-                mkdir(mSaveDirectory.c_str(), 0700);
+                mkdir(mSaveDirectory.c_str(), 0755);
             #endif
         }
     #endif
@@ -694,7 +694,7 @@ void LoopClosing::SetSaveLoopData(bool flag, const std::string& directory)
             #ifdef _WIN32
                 _mkdir(mSaveDirectory.c_str());
             #else
-                mkdir(mSaveDirectory.c_str(), 0700);
+                mkdir(mSaveDirectory.c_str(), 0755);
             #endif
         }
     }
