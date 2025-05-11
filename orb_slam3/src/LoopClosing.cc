@@ -206,7 +206,7 @@ void LoopClosing::SaveDetailedKeyFrames(const std::string& filename, const std::
              << ssLoopEdges.str() << " "
              << (isFixed ? 1 : 0) << " " // 替代 isFixed()
              << pKF->mnBAGlobalForKF << " "
-             << (pKF->mbNotErase ? 1 : 0) << std::endl; // 直接访问成员变量
+             << (pKF->GetNotErase() ? 1 : 0) << std::endl; // 使用 GetNotErase() 方法
     }
     
     file.close();
