@@ -52,7 +52,7 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     // 数据保存相关初始化代码
     mSaveLoopData = true;  // 默认启用数据保存
     mLoopClosureCount = 0;
-    mSaveDirectory = "./loop_closure_data/";
+    mSaveDirectory = "/Datasets/LoopData/";
     
     // 创建保存目录
     struct stat st = {0};
