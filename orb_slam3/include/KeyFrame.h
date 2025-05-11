@@ -272,6 +272,12 @@ public:
     void SetBadFlag();
     bool isBad();
 
+    // 在 KeyFrame.h 的 public 部分添加
+    bool GetNotErase() const {
+        // 不需要锁，因为这是在 SaveDetailedKeyFrames 中调用的，不涉及并发修改
+        return mbNotErase;
+    }
+
     // Compute Scene Depth (q=2 median). Used in monocular.
     float ComputeSceneMedianDepth(const int q);
 
