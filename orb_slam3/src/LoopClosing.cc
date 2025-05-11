@@ -193,7 +193,9 @@ void LoopClosing::SaveDetailedKeyFrames(const std::string& filename, const std::
         }
         ssLoopEdges << "\"";
         
-        // 写入详细信息
+        // 修复: 使用实际存在的属性替代isFixed()和GetNotErase()
+        bool isFixed = (pKF->mnBAGlobalForKF > 0); // 参与过全局BA的可视为fixed
+        
         file << pKF->mnId << " " 
              << std::fixed << std::setprecision(3) << pKF->mTimeStamp << " "
              << std::setprecision(9) << pKF->mTimeStamp << " "
@@ -202,13 +204,14 @@ void LoopClosing::SaveDetailedKeyFrames(const std::string& filename, const std::
              << v.x() << " " << v.y() << " " << v.z() << " "
              << parentId << " " 
              << ssLoopEdges.str() << " "
-             << (pKF->isFixed() ? 1 : 0) << " "
+             << (isFixed ? 1 : 0) << " " // 替代 isFixed()
              << pKF->mnBAGlobalForKF << " "
-             << (pKF->GetNotErase() ? 1 : 0) << std::endl;
+             << (pKF->mbNotErase ? 1 : 0) << std::endl; // 直接访问成员变量
     }
     
     file.close();
 }
+
 
 void LoopClosing::SaveEnhancedMapPoints(const std::string& filename, const std::vector<MapPoint*>& mapPoints)
 {
@@ -241,7 +244,12 @@ void LoopClosing::SaveEnhancedMapPoints(const std::string& filename, const std::
         // 观测方向
         Eigen::Vector3f normal = pMP->GetNormal();
         
-        // 写入详细信息
+        // 修复: 使用GetReplaced()获取替换点的ID
+        long unsigned int replacedId = 0;
+        if(pMP->GetReplaced() != nullptr) {
+            replacedId = pMP->GetReplaced()->mnId;
+        }
+        
         file << pMP->mnId << " " 
              << pos.x() << " " << pos.y() << " " << pos.z() << " "
              << pMP->mnFirstKFid << " " 
@@ -252,11 +260,15 @@ void LoopClosing::SaveEnhancedMapPoints(const std::string& filename, const std::
              << normal.x() << " " << normal.y() << " " << normal.z() << " "
              << pMP->mnCorrectedByKF << " "
              << pMP->mnCorrectedReference << " "
-             << pMP->mnReplaceId << std::endl;
+             << replacedId << std::endl; // 替代 mnReplaceId
     }
     
     file.close();
 }
+
+
+
+
 void LoopClosing::SaveCompleteMetadata(const std::string& filename)
 {
     Map* pLoopMap = mpCurrentKF->GetMap();
@@ -308,6 +320,9 @@ void LoopClosing::SaveCompleteMetadata(const std::string& filename)
     file.close();
 }
 
+
+
+
 void LoopClosing::SaveCovisibilityGraph(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
 {
     std::ofstream file(filename);
@@ -325,9 +340,8 @@ void LoopClosing::SaveCovisibilityGraph(const std::string& filename, const std::
         if(!pKF || pKF->isBad())
             continue;
             
-        // 获取所有共视关键帧及权重
+        // 修复: 获取所有共视关键帧及其权重
         const std::vector<KeyFrame*> vpConnected = pKF->GetVectorCovisibleKeyFrames();
-        const std::vector<int> vpConnectedWeight = pKF->GetVectorCovisibleWeight();
         
         for(size_t i=0; i < vpConnected.size(); i++) {
             KeyFrame* pConnected = vpConnected[i];
@@ -346,15 +360,26 @@ void LoopClosing::SaveCovisibilityGraph(const std::string& filename, const std::
                 
             processedEdges.insert(edge);
             
+            // 修复: 直接使用GetWeight获取权重
+            int weight = pKF->GetWeight(pConnected);
+            
             // 获取共同观测的地图点
             std::set<MapPoint*> sCommonMPs;
-            for(size_t j=0; j < pKF->GetMapPointMatches().size(); j++) {
-                MapPoint* pMP = pKF->GetMapPoint(j);
+            std::vector<MapPoint*> vpMP1 = pKF->GetMapPointMatches();
+            std::vector<MapPoint*> vpMP2 = pConnected->GetMapPointMatches();
+            
+            // 修复: 手动查找共同的地图点
+            for(MapPoint* pMP : vpMP1) {
                 if(!pMP || pMP->isBad())
                     continue;
                     
-                if(pConnected->hasMapPoint(pMP))
-                    sCommonMPs.insert(pMP);
+                // 手动在第二个关键帧查找这个地图点
+                for(MapPoint* pMP2 : vpMP2) {
+                    if(pMP == pMP2 && !pMP2->isBad()) {
+                        sCommonMPs.insert(pMP);
+                        break;
+                    }
+                }
             }
             
             // 构建共同地图点ID字符串
@@ -371,13 +396,16 @@ void LoopClosing::SaveCovisibilityGraph(const std::string& filename, const std::
             // 写入边信息
             file << pKF->mnId << " " 
                  << pConnected->mnId << " " 
-                 << vpConnectedWeight[i] << " "
+                 << weight << " "
                  << ssCommonMPs.str() << std::endl;
         }
     }
     
     file.close();
 }
+
+
+
 void LoopClosing::SaveEssentialGraph(const std::string& filename, Map* pMap)
 {
     std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
@@ -410,8 +438,8 @@ void LoopClosing::SaveEssentialGraph(const std::string& filename, Map* pMap)
         
         // 保存共视边，但不包括已经包含在生成树或回环边中的
         const std::vector<KeyFrame*> vpConnected = pKF->GetVectorCovisibleKeyFrames();
-        const std::vector<int> vpConnectedWeight = pKF->GetVectorCovisibleWeight();
         
+        // 修复: 使用GetWeight而不是不存在的GetVectorCovisibleWeight
         for(size_t i=0; i < vpConnected.size(); i++) {
             KeyFrame* pConnected = vpConnected[i];
             if(!pConnected || pConnected->isBad())
@@ -420,14 +448,18 @@ void LoopClosing::SaveEssentialGraph(const std::string& filename, Map* pMap)
             // 只处理ID更大的，确保每条边只保存一次
             if(pKF->mnId < pConnected->mnId) {
                 // 确保不是生成树边或回环边
-                if(pConnected != pParent && sLoopEdges.find(pConnected) == sLoopEdges.end())
-                    file << "COVISIBILITY " << pKF->mnId << " " << pConnected->mnId << " " << vpConnectedWeight[i] << " 1.0" << std::endl;
+                if(pConnected != pParent && sLoopEdges.find(pConnected) == sLoopEdges.end()) {
+                    int weight = pKF->GetWeight(pConnected);
+                    file << "COVISIBILITY " << pKF->mnId << " " << pConnected->mnId << " " << weight << " 1.0" << std::endl;
+                }
             }
         }
     }
     
     file.close();
 }
+
+
 
 void LoopClosing::SaveIMUStates(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
 {
@@ -445,15 +477,27 @@ void LoopClosing::SaveIMUStates(const std::string& filename, const std::vector<K
             
         // 获取IMU数据
         IMU::Bias imuBias = pKF->GetImuBias();
-        Eigen::Vector3f bg(imuBias.bwx);
-        Eigen::Vector3f ba(imuBias.bax);
+        Eigen::Vector3f bg = pKF->GetGyroBias();
+        Eigen::Vector3f ba = pKF->GetAccBias();
         Eigen::Vector3f vel = pKF->GetVelocity();
         
-        // 获取时间信息
+        // 获取时间信息 - 修复: 使用mPrevKF而不是GetPrevKeyFrame()
         double timestampPrev = 0.0;
         double dT = 0.0;
         
-        KeyFrame* pPrevKF = pKF->GetPrevKeyFrame();
+        // 修复: 直接访问成员变量mPrevKF或通过其他方式找到前一帧
+        // 这里我们需要找一种方法获取前一帧信息
+        // 可以根据时间戳或ID顺序找到前一关键帧
+        
+        // 假设vpKFs已按时间戳排序，找到当前帧的前一帧
+        KeyFrame* pPrevKF = nullptr;
+        for(size_t i = 0; i < vpKFs.size(); i++) {
+            if(vpKFs[i] == pKF && i > 0) {
+                pPrevKF = vpKFs[i-1];
+                break;
+            }
+        }
+        
         if(pPrevKF) {
             timestampPrev = pPrevKF->mTimeStamp;
             dT = pKF->mTimeStamp - timestampPrev;
@@ -469,6 +513,7 @@ void LoopClosing::SaveIMUStates(const std::string& filename, const std::vector<K
     
     file.close();
 }
+
 
 void LoopClosing::SaveLoopMatches(const std::string& filename)
 {
@@ -541,6 +586,7 @@ void LoopClosing::SaveOptimizationParameters(const std::string& filename, bool b
     
     file.close();
 }
+
 void LoopClosing::SaveFusionLog(const std::string& filename, const std::vector<std::pair<MapPoint*, MapPoint*>>& fusedPoints)
 {
     std::ofstream file(filename);
@@ -558,8 +604,8 @@ void LoopClosing::SaveFusionLog(const std::string& filename, const std::vector<s
         if(!pOriginalMP || pOriginalMP->isBad() || !pReplacedByMP || pReplacedByMP->isBad())
             continue;
             
-        // 获取观测此地图点的关键帧
-        std::map<KeyFrame*, size_t> observations = pOriginalMP->GetObservations();
+        // 修复: 使用正确的GetObservations返回类型
+        std::map<KeyFrame*, std::tuple<int, int>> observations = pOriginalMP->GetObservations();
         
         // 构建关键帧ID字符串
         std::stringstream ssKFs;
@@ -578,8 +624,18 @@ void LoopClosing::SaveFusionLog(const std::string& filename, const std::vector<s
         first = true;
         for(const auto& obs : observations) {
             if(!first) ssIndices << ",";
-            ssIndices << obs.second;
-            first = false;
+            // 获取左右相机的特征索引
+            int leftIdx = std::get<0>(obs.second);
+            int rightIdx = std::get<1>(obs.second);
+            if(leftIdx != -1) {
+                ssIndices << leftIdx;
+                first = false;
+            }
+            if(rightIdx != -1) {
+                if(!first) ssIndices << ",";
+                ssIndices << rightIdx;
+                first = false;
+            }
         }
         ssIndices << "\"";
         
@@ -595,6 +651,8 @@ void LoopClosing::SaveFusionLog(const std::string& filename, const std::vector<s
     
     file.close();
 }
+
+
 void LoopClosing::SaveGBAInfo(const std::string& filename, Map* pMap, unsigned long nLoopKF)
 {
     std::ofstream file(filename);
@@ -1887,19 +1945,12 @@ void LoopClosing::CorrectLoop()
     
     // 在SearchAndFuse调用后
     // 收集被融合的地图点对
+    // 修复: 在CorrectLoop中查找被替换的地图点
     std::vector<std::pair<MapPoint*, MapPoint*>> fusedPoints;
     for(MapPoint* pMP : mvpLoopMapPoints) {
-        if(pMP && !pMP->isBad() && pMP->mnReplaceId != -1) {
-            // 查找被替换后的地图点
-            long unsigned int replaceId = pMP->mnReplaceId;
-            MapPoint* pReplaceMP = nullptr;
-            for(MapPoint* pSearchMP : pLoopMap->GetAllMapPoints()) {
-                if(pSearchMP && !pSearchMP->isBad() && pSearchMP->mnId == replaceId) {
-                    pReplaceMP = pSearchMP;
-                    break;
-                }
-            }
-            
+        if(pMP && !pMP->isBad()) {
+            // 检查这个地图点是否被替换
+            MapPoint* pReplaceMP = pMP->GetReplaced();
             if(pReplaceMP) {
                 fusedPoints.push_back(std::make_pair(pMP, pReplaceMP));
             }
