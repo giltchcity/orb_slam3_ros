@@ -776,7 +776,7 @@ static void EnsureDirectoryExists(const std::string& dir)
         #ifdef _WIN32
             _mkdir(dir.c_str());
         #else
-            mkdir(dir.c_str(), 0700);
+            mkdir(dir.c_str(), 0755);
         #endif
     }
 }
@@ -1705,7 +1705,7 @@ void LoopClosing::CorrectLoop()
             #ifdef _WIN32
                 _mkdir(loopDir.c_str());
             #else
-                mkdir(loopDir.c_str(), 0700);
+                mkdir(loopDir.c_str(), 0755);
             #endif
         }
         
@@ -1720,7 +1720,7 @@ void LoopClosing::CorrectLoop()
                 #ifdef _WIN32
                     _mkdir(dir.c_str());
                 #else
-                    mkdir(dir.c_str(), 0700);
+                    mkdir(dir.c_str(), 0755);
                 #endif
             }
         }
