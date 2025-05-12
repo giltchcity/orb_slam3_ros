@@ -95,18 +95,18 @@ struct Edge {
     double rel_scale;
 };
 
-// 适用于 Ceres 2.2+ 的 Sim3 参数化
+// 修改Sim3Parameterization类，使用现代Ceres 2.2 API
 class Sim3Parameterization : public ceres::Manifold {
 public:
     Sim3Parameterization(bool fix_scale = false) : fix_scale_(fix_scale) {}
 
-    // Sim3 有 8 个环境参数：[s, qw, qx, qy, qz, tx, ty, tz]
+    // Sim3有8个环境参数：[s, qw, qx, qy, qz, tx, ty, tz]
     virtual int AmbientSize() const override { return 8; }
     
-    // 如果 scale 固定，则有 6 个自由度，否则有 7 个
+    // 如果scale固定，则有6个自由度，否则有7个
     virtual int TangentSize() const override { return fix_scale_ ? 6 : 7; }
 
-    // Plus 操作：将更新量 delta 应用到当前参数 x
+    // Plus操作：将更新量delta应用到当前参数x
     virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const override {
         // 提取当前参数
         double scale = x[0];
@@ -157,10 +157,13 @@ public:
         return true;
     }
 
-    // Ceres 2.x 中不再需要 ComputeJacobian，因为它现在使用自动微分来计算雅可比矩阵
+    // Manifold接口需要实现VerifyJacobian，但我们可以不实现
+    // Ceres将使用数值微分来计算雅可比矩阵
+
+    // Ceres 2.x不再需要ComputeJacobian方法
 
 private:
-    bool fix_scale_;  // 如果为 true，则缩放固定（6DoF），否则为 7DoF
+    bool fix_scale_;  // 如果为true，则缩放固定（6DoF），否则为7DoF
 };
 
 // Sim3 error class for Ceres that matches the g2o::EdgeSim3 approach
@@ -593,7 +596,7 @@ public:
         // Add keyframe vertices - following ORBSLAM3's approach
         for(auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
-            const KeyFrame& kf = kf_pair.second;
+            const KeyFrame kf = kf_pair.second; 
             
             if (kf.is_bad) continue;
             
@@ -634,7 +637,8 @@ public:
             sim3_blocks[id] = sim3_block;
             
             // Add parameter block to problem
-            ceres::LocalParameterization* sim3_parameterization = new Sim3Parameterization(fix_scale);
+            // 替换为:
+            ceres::Manifold* sim3_parameterization = new Sim3Parameterization(fix_scale);
             problem.AddParameterBlock(sim3_block, 8, sim3_parameterization);
             
             // Fix the initial KF (similar to ORBSLAM3)
@@ -695,7 +699,7 @@ public:
         std::cout << "Adding spanning tree edges..." << std::endl;
         for(const auto& kf_pair : keyframes_) {
             int target_id = kf_pair.first;
-            KeyFrame& kf = kf_pair.second;
+            KeyFrame kf = kf_pair.second; 
             
             if(kf.is_bad || kf.parent_id < 0)
                 continue;
@@ -759,7 +763,7 @@ public:
         // Add loop edges (from previous loop detections)
         for(const auto& kf_pair : keyframes_) {
             int source_id = kf_pair.first;
-            KeyFrame& kf = kf_pair.second;
+            KeyFrame kf = kf_pair.second; 
             
             if(kf.is_bad) continue;
             
@@ -821,7 +825,7 @@ public:
         std::cout << "Adding covisibility edges..." << std::endl;
         for(const auto& kf_pair : keyframes_) {
             int source_id = kf_pair.first;
-            KeyFrame& kf = kf_pair.second;
+            KeyFrame kf = kf_pair.second; 
             
             if(kf.is_bad) continue;
             
@@ -936,7 +940,7 @@ public:
         // Sim3:[s,R,t] -> SE3:[R,t/s]
         for(auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
-            KeyFrame& kf = kf_pair.second;
+            KeyFrame kf = kf_pair.second; 
             
             if(sim3_blocks.find(id) == sim3_blocks.end())
                 continue;
