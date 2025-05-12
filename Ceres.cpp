@@ -106,11 +106,12 @@ public:
         q.normalize();
         double s = x[7];
         
-        // Create delta components
-        Eigen::Map<const Eigen::Vector<double, Eigen::Dynamic>> delta_vec(delta, TangentSize());
+        // For tangent space vectors: [rotation, translation, scale]
+        Eigen::Vector3d omega(delta[0], delta[1], delta[2]);
+        Eigen::Vector3d dt(delta[3], delta[4], delta[5]);
+        double ds = fix_scale_ ? 0.0 : (TangentSize() > 6 ? delta[6] : 0.0);
         
-        // Extract delta rotation (first 3 elements) and create quaternion
-        Eigen::Vector3d omega = delta_vec.head<3>();
+        // Rotation delta as quaternion
         double theta = omega.norm();
         Eigen::Quaterniond dq;
         
@@ -123,12 +124,6 @@ public:
         } else {
             dq = Eigen::Quaterniond(1.0, 0.0, 0.0, 0.0);
         }
-        
-        // Extract delta translation (next 3 elements)
-        Eigen::Vector3d dt = delta_vec.segment<3>(3);
-        
-        // Extract delta scale (last element) or use 0 if scale is fixed
-        double ds = fix_scale_ ? 0.0 : delta_vec(6);
         
         // Apply right multiplication update - this is CRITICAL for matching g2o
         // Rotation update: q' = q * dq
@@ -179,7 +174,7 @@ public:
         J.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity(); // dt/ddt
         
         // Scale Jacobian (last row)
-        if (!fix_scale_) {
+        if (!fix_scale_ && TangentSize() > 6) {
             J(7, 6) = x[7]; // ds/ds = s
         }
         
@@ -230,7 +225,7 @@ public:
         delta[4] = dt.y();
         delta[5] = dt.z();
         
-        if (!fix_scale_) {
+        if (!fix_scale_ && TangentSize() > 6) {
             delta[6] = ds;
         }
         
@@ -255,7 +250,7 @@ public:
         J.block<3, 3>(3, 0) = Eigen::Matrix3d::Identity();
         
         // Last row: scale (if unfixed)
-        if (!fix_scale_) {
+        if (!fix_scale_ && TangentSize() > 6) {
             J(6, 7) = 1.0 / x[7]; // dds/ds = 1/s
         }
         
