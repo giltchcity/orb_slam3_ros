@@ -96,12 +96,12 @@ struct Edge {
     double rel_scale;
 };
 
-// Sim3 Plus function operator for AutoDiffManifold
-struct Sim3PlusFunctor {
-    Sim3PlusFunctor(bool fix_scale) : fix_scale_(fix_scale) {}
+// Sim3 Manifold functor for AutoDiffManifold
+struct Sim3Manifold {
+    Sim3Manifold(bool fix_scale) : fix_scale_(fix_scale) {}
     
     template <typename T>
-    bool operator()(const T* x, const T* delta, T* x_plus_delta) const {
+    bool Plus(const T* x, const T* delta, T* x_plus_delta) const {
         // Each parameter block is: [s, qw, qx, qy, qz, tx, ty, tz]
         
         // Extract current parameters
@@ -158,15 +158,8 @@ struct Sim3PlusFunctor {
         return true;
     }
     
-    bool fix_scale_;
-};
-
-// Sim3 Minus function operator for AutoDiffManifold
-struct Sim3MinusFunctor {
-    Sim3MinusFunctor(bool fix_scale) : fix_scale_(fix_scale) {}
-    
     template <typename T>
-    bool operator()(const T* y, const T* x, T* delta) const {
+    bool Minus(const T* y, const T* x, T* delta) const {
         // Extract parameters
         const T scale_x = x[0];
         const Eigen::Quaternion<T> q_x(x[1], x[2], x[3], x[4]);  // w, x, y, z
@@ -646,12 +639,10 @@ public:
         
         const int minFeat = 100;  // Minimum features for covisibility, same as ORBSLAM3
         
-        // Create the AutoDiffManifold for Sim3
+        // Define the ambient size and tangent size for Sim3
         const int ambient_size = 8;  // [s, qw, qx, qy, qz, tx, ty, tz]
         const int tangent_size = fix_scale ? 6 : 7;  // 6 or 7 DoF
 
-        typedef ceres::AutoDiffManifold<Sim3PlusFunctor, Sim3MinusFunctor, ambient_size, Eigen::Dynamic> Sim3Manifold;
-        
         // Add keyframe vertices - following ORBSLAM3's approach
         for(auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
@@ -695,11 +686,17 @@ public:
             
             sim3_blocks[id] = sim3_block;
             
-            // Create a new Sim3Manifold for each parameter block
-            ceres::Manifold* manifold = new Sim3Manifold(
-                Sim3PlusFunctor(fix_scale), 
-                Sim3MinusFunctor(fix_scale),
-                ambient_size, tangent_size);
+            // Create the manifold for this parameter block
+            ceres::Manifold* manifold = NULL;
+            if (fix_scale) {
+                // Use the auto diff manifold with 6 DoF (fixed scale)
+                manifold = new ceres::AutoDiffManifold<Sim3Manifold, 8, 6>(
+                    new Sim3Manifold(fix_scale));
+            } else {
+                // Use the auto diff manifold with 7 DoF (variable scale)
+                manifold = new ceres::AutoDiffManifold<Sim3Manifold, 8, 7>(
+                    new Sim3Manifold(fix_scale));
+            }
             
             // Add parameter block to problem
             problem.AddParameterBlock(sim3_block, 8, manifold);
