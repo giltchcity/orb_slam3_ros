@@ -104,18 +104,18 @@ struct MapPoint {
     int corrected_reference = -1;  // Corrected reference
 };
 
-// Custom Sim3 local parameterization for Ceres - This is critical for matching g2o
-class Sim3Parameterization : public ceres::LocalParameterization {
+// Custom Sim3 manifold for Ceres 2.2 - This is critical for matching g2o
+class Sim3Manifold : public ceres::Manifold {
 public:
-    Sim3Parameterization(bool fix_scale = false) : fix_scale_(fix_scale) {}
+    Sim3Manifold(bool fix_scale = false) : fix_scale_(fix_scale) {}
     
-    virtual ~Sim3Parameterization() {}
+    virtual ~Sim3Manifold() {}
     
     // Parameter block format: [tx, ty, tz, qx, qy, qz, qw, s]
-    virtual int GlobalSize() const { return 8; }
+    virtual int AmbientSize() const { return 8; }
     
     // Dimension of the local tangent space
-    virtual int LocalSize() const { return fix_scale_ ? 6 : 7; }
+    virtual int TangentSize() const { return fix_scale_ ? 6 : 7; }
     
     // This is the critical function that must exactly match g2o's behavior
     virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const {
@@ -173,13 +173,14 @@ public:
         return true;
     }
     
-    // Jacobian of Plus(x, delta) w.r.t delta at delta = 0
-    virtual bool ComputeJacobian(const double* x, double* jacobian) const {
+    // In Ceres 2.2, ComputeJacobian is renamed to PlusJacobian
+    virtual bool PlusJacobian(const double* x, double* jacobian) const {
         // Set to zero
-        std::memset(jacobian, 0, sizeof(double) * 8 * LocalSize());
+        std::memset(jacobian, 0, sizeof(double) * 8 * TangentSize());
         
         // Fill the Jacobian with identity blocks for the rotation and translation components
-        Eigen::Map<Eigen::Matrix<double, 8, 7, Eigen::RowMajor>> J(jacobian);
+        Eigen::Map<Eigen::Matrix<double, 8, Eigen::Dynamic, Eigen::RowMajor>> J(
+            jacobian, 8, TangentSize());
         
         // Rotation Jacobian (first 3 rows)
         J.block<3, 3>(3, 0) = Eigen::Matrix3d::Identity(); // dq/domega
@@ -190,6 +191,82 @@ public:
         // Scale Jacobian (last row)
         if (!fix_scale_) {
             J(7, 6) = x[7]; // ds/ds = s
+        }
+        
+        return true;
+    }
+    
+    // Required by Ceres 2.2
+    virtual bool Minus(const double* y, const double* x, double* delta) const {
+        // This is not actually used in our optimization, but must be implemented
+        // for the Manifold interface
+        
+        // Extract parameters
+        Eigen::Vector3d t_x(x[0], x[1], x[2]);
+        Eigen::Quaterniond q_x(x[6], x[3], x[4], x[5]); // w, x, y, z
+        q_x.normalize();
+        double s_x = x[7];
+        
+        Eigen::Vector3d t_y(y[0], y[1], y[2]);
+        Eigen::Quaterniond q_y(y[6], y[3], y[4], y[5]); // w, x, y, z
+        q_y.normalize();
+        double s_y = y[7];
+        
+        // Compute delta rotation
+        Eigen::Quaterniond q_delta = q_x.conjugate() * q_y;
+        q_delta.normalize();
+        
+        // Convert to axis-angle
+        Eigen::Vector3d omega;
+        double angle = 2.0 * atan2(q_delta.vec().norm(), q_delta.w());
+        
+        if (q_delta.vec().norm() > 1e-10) {
+            omega = angle * q_delta.vec() / q_delta.vec().norm();
+        } else {
+            omega.setZero();
+        }
+        
+        // Compute delta translation
+        Eigen::Vector3d dt = t_y - t_x;
+        
+        // Compute delta scale
+        double ds = log(s_y / s_x);
+        
+        // Fill delta vector
+        delta[0] = omega.x();
+        delta[1] = omega.y();
+        delta[2] = omega.z();
+        delta[3] = dt.x();
+        delta[4] = dt.y();
+        delta[5] = dt.z();
+        
+        if (!fix_scale_) {
+            delta[6] = ds;
+        }
+        
+        return true;
+    }
+    
+    // Required by Ceres 2.2
+    virtual bool MinusJacobian(const double* x, double* jacobian) const {
+        // This is not actually used in our optimization, but must be implemented
+        // for the Manifold interface
+        
+        // For simplicity, we'll use the identity Jacobian
+        std::memset(jacobian, 0, sizeof(double) * TangentSize() * 8);
+        
+        Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 8, Eigen::RowMajor>> J(
+            jacobian, TangentSize(), 8);
+        
+        // First 3 rows: rotation
+        J.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();
+        
+        // Next 3 rows: translation
+        J.block<3, 3>(3, 0) = Eigen::Matrix3d::Identity();
+        
+        // Last row: scale (if unfixed)
+        if (!fix_scale_) {
+            J(6, 7) = 1.0 / x[7]; // dds/ds = 1/s
         }
         
         return true;
@@ -756,8 +833,8 @@ public:
             sim3_blocks[id] = sim3_block;
             
             // Add the parameter block to the problem with appropriate manifold
-            ceres::LocalParameterization* parameterization = new Sim3Parameterization(fix_scale);
-            problem.AddParameterBlock(sim3_block, 8, parameterization);
+            ceres::Manifold* manifold = new Sim3Manifold(fix_scale);
+            problem.AddParameterBlock(sim3_block, 8, manifold);
             
             // Fix the initial keyframe
             if (id == init_kf_id || id == loop_kf_id) {
@@ -1013,7 +1090,6 @@ public:
         
         // Update map points
         for (auto& mp_pair : map_points_) {
-            int id = mp_pair.first;
             MapPoint& mp = mp_pair.second;
             
             if (mp.is_bad) continue;
