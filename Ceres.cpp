@@ -85,67 +85,65 @@ struct KeyFrame {
     std::map<int, int> covisible_keyframes; // KF_ID -> weight
 };
 
-// Custom Sim3 manifold for Ceres 2.2
 class Sim3Manifold : public ceres::Manifold {
 public:
     Sim3Manifold(bool fix_scale = true) : fix_scale_(fix_scale) {}
     
     virtual ~Sim3Manifold() {}
     
-    // Parameter block format: [tx, ty, tz, qx, qy, qz, qw, s]
+    // 参数块格式: [tx, ty, tz, qx, qy, qz, qw, s]
     virtual int AmbientSize() const { return 8; }
     
-    // Dimension of the local tangent space
+    // 局部切空间维度
     virtual int TangentSize() const { return fix_scale_ ? 6 : 7; }
     
-    // This is the critical function that must exactly match g2o's behavior
+    // 这是确保与g2o行为一致的关键函数
     virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const {
-        // Extract the current parameters
+        // 提取当前参数
         Eigen::Vector3d t(x[0], x[1], x[2]);
-        Eigen::Quaterniond q(x[6], x[3], x[4], x[5]); // w, x, y, z order
+        Eigen::Quaterniond q(x[6], x[3], x[4], x[5]); // w, x, y, z顺序
         q.normalize();
         double s = x[7];
         
-        // For tangent space vectors: [rotation, translation, scale]
-        Eigen::Vector3d omega(delta[0], delta[1], delta[2]);
-        Eigen::Vector3d dt(delta[3], delta[4], delta[5]);
-        double ds = fix_scale_ ? 0.0 : (TangentSize() > 6 ? delta[6] : 0.0);
+        // 提取增量参数
+        Eigen::Vector3d omega(delta[0], delta[1], delta[2]); // 旋转增量（轴角表示）
+        Eigen::Vector3d dt(delta[3], delta[4], delta[5]);    // 平移增量
+        double ds = fix_scale_ ? 0.0 : (TangentSize() > 6 ? delta[6] : 0.0); // 尺度增量
         
-        // Rotation delta as quaternion
+        // 从轴角计算四元数增量
         double theta = omega.norm();
         Eigen::Quaterniond dq;
         
         if (theta > 1e-10) {
-            omega = omega / theta; // normalize
+            omega = omega / theta; // 归一化
             dq = Eigen::Quaterniond(cos(theta/2.0), 
-                                    sin(theta/2.0) * omega.x(),
-                                    sin(theta/2.0) * omega.y(), 
-                                    sin(theta/2.0) * omega.z());
+                                   sin(theta/2.0) * omega.x(),
+                                   sin(theta/2.0) * omega.y(), 
+                                   sin(theta/2.0) * omega.z());
         } else {
             dq = Eigen::Quaterniond(1.0, 0.0, 0.0, 0.0);
         }
         
-        // Apply right multiplication update - this is CRITICAL for matching g2o
-        // Rotation update: q' = q * dq
+        // 右乘更新 - 这与ORB-SLAM3的g2o实现匹配
         Eigen::Quaterniond q_plus = q * dq;
         q_plus.normalize();
         
-        // Scale update: s' = s * exp(ds)
+        // 尺度更新是乘法（不是加法）
         double s_plus = s * exp(ds);
         
-        // Check for stability - sometimes optimization can explode
+        // 稳定性检查
         if (!std::isfinite(s_plus)) s_plus = s;
         
-        // Translation update: t' = t + dt
+        // 平移更新是加法
         Eigen::Vector3d t_plus = t + dt;
         
-        // Check for stability
+        // 稳定性检查
         for (int i = 0; i < 3; i++) {
             if (!std::isfinite(t_plus[i])) t_plus[i] = t[i];
-            if (std::abs(t_plus[i]) > 1e10) t_plus[i] = t[i]; // Avoid extreme values
+            if (std::abs(t_plus[i]) > 1e10) t_plus[i] = t[i]; // 避免极端值
         }
         
-        // Store the updated values
+        // 存储更新后的值
         x_plus_delta[0] = t_plus.x();
         x_plus_delta[1] = t_plus.y();
         x_plus_delta[2] = t_plus.z();
@@ -158,35 +156,31 @@ public:
         return true;
     }
     
-    // In Ceres 2.2, ComputeJacobian is renamed to PlusJacobian
+    // PlusJacobian必须与Plus一致
     virtual bool PlusJacobian(const double* x, double* jacobian) const {
-        // Set to zero
+        // 初始化为零
         std::memset(jacobian, 0, sizeof(double) * 8 * TangentSize());
         
-        // Fill the Jacobian with identity blocks for the rotation and translation components
         Eigen::Map<Eigen::Matrix<double, 8, Eigen::Dynamic, Eigen::RowMajor>> J(
             jacobian, 8, TangentSize());
         
-        // Rotation Jacobian (first 3 rows)
+        // 旋转的Jacobian
         J.block<3, 3>(3, 0) = Eigen::Matrix3d::Identity(); // dq/domega
         
-        // Translation Jacobian (next 3 rows)
+        // 平移的Jacobian
         J.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity(); // dt/ddt
         
-        // Scale Jacobian (last row)
+        // 尺度的Jacobian
         if (!fix_scale_ && TangentSize() > 6) {
-            J(7, 6) = x[7]; // ds/ds = s
+            J(7, 6) = x[7]; // ds/dds = s (因为s_new = s * exp(ds))
         }
         
         return true;
     }
     
-    // Required by Ceres 2.2
+    // Ceres 2.2需要的辅助函数
     virtual bool Minus(const double* y, const double* x, double* delta) const {
-        // This is not actually used in our optimization, but must be implemented
-        // for the Manifold interface
-        
-        // Extract parameters
+        // 提取参数
         Eigen::Vector3d t_x(x[0], x[1], x[2]);
         Eigen::Quaterniond q_x(x[6], x[3], x[4], x[5]); // w, x, y, z
         q_x.normalize();
@@ -197,11 +191,11 @@ public:
         q_y.normalize();
         double s_y = y[7];
         
-        // Compute delta rotation
+        // 计算旋转差异
         Eigen::Quaterniond q_delta = q_x.conjugate() * q_y;
         q_delta.normalize();
         
-        // Convert to axis-angle
+        // 转换为轴角
         Eigen::Vector3d omega;
         double angle = 2.0 * atan2(q_delta.vec().norm(), q_delta.w());
         
@@ -211,13 +205,13 @@ public:
             omega.setZero();
         }
         
-        // Compute delta translation
+        // 计算平移差异
         Eigen::Vector3d dt = t_y - t_x;
         
-        // Compute delta scale
+        // 计算尺度差异
         double ds = log(s_y / s_x);
         
-        // Fill delta vector
+        // 填充增量向量
         delta[0] = omega.x();
         delta[1] = omega.y();
         delta[2] = omega.z();
@@ -232,24 +226,19 @@ public:
         return true;
     }
     
-    // Required by Ceres 2.2
     virtual bool MinusJacobian(const double* x, double* jacobian) const {
-        // This is not actually used in our optimization, but must be implemented
-        // for the Manifold interface
-        
-        // For simplicity, we'll use the identity Jacobian
         std::memset(jacobian, 0, sizeof(double) * TangentSize() * 8);
         
         Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 8, Eigen::RowMajor>> J(
             jacobian, TangentSize(), 8);
         
-        // First 3 rows: rotation
+        // 旋转
         J.block<3, 3>(0, 3) = Eigen::Matrix3d::Identity();
         
-        // Next 3 rows: translation
+        // 平移
         J.block<3, 3>(3, 0) = Eigen::Matrix3d::Identity();
         
-        // Last row: scale (if unfixed)
+        // 尺度
         if (!fix_scale_ && TangentSize() > 6) {
             J(6, 7) = 1.0 / x[7]; // dds/ds = 1/s
         }
@@ -258,20 +247,17 @@ public:
     }
 
 private:
-    bool fix_scale_;  // Whether to keep scale fixed
+    bool fix_scale_;  // 是否固定尺度
 };
 
-// Sim3 error term that exactly matches g2o's EdgeSim3
 struct Sim3Error {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
-    Sim3Error(const Sim3& measurement, double information_factor = 1.0)
-        : measurement_(measurement), information_factor_(information_factor) {}
+    Sim3Error(const Sim3& measurement) : measurement_(measurement) {}
 
     template <typename T>
     bool operator()(const T* const param_i, const T* const param_j, T* residuals) const {
-        // Extract parameters
-        // Sim3 Parameter block: [tx, ty, tz, qx, qy, qz, qw, s]
+        // 提取参数
         Eigen::Map<const Eigen::Matrix<T, 3, 1>> t_i(param_i);
         Eigen::Quaternion<T> q_i(param_i[6], param_i[3], param_i[4], param_i[5]); // w, x, y, z
         q_i.normalize();
@@ -282,7 +268,7 @@ struct Sim3Error {
         q_j.normalize();
         T s_j = param_j[7];
         
-        // Convert measurement to T
+        // 转换测量值到模板类型T
         Eigen::Quaternion<T> q_meas(
             T(measurement_.quaternion().w()),
             T(measurement_.quaternion().x()),
@@ -297,25 +283,25 @@ struct Sim3Error {
         
         T s_meas = T(measurement_.scale());
         
-        // Compute the relative Sim3 transformation: Sji = Sj * Si^-1
-        // First compute Si^-1
+        // 计算相对Sim3变换: Sji = Sj * Si^-1
+        // 首先计算Si^-1
         Eigen::Quaternion<T> q_i_inv = q_i.conjugate();
         Eigen::Matrix<T, 3, 1> t_i_inv = -(q_i_inv * t_i) / s_i;
         T s_i_inv = T(1.0) / s_i;
         
-        // Now compute Sji = Sj * Si^-1
+        // 然后计算Sji = Sj * Si^-1
         Eigen::Quaternion<T> q_ji = q_j * q_i_inv;
         q_ji.normalize();
         
         Eigen::Matrix<T, 3, 1> t_ji = s_j * (q_j * t_i_inv) + t_j;
         T s_ji = s_j * s_i_inv;
         
-        // Compute the error between measurement and computed transformation
-        // Rotation error: log(q_meas^-1 * q_ji)
+        // 计算测量值与估计值之间的误差
+        // 旋转误差: log(q_meas^-1 * q_ji)
         Eigen::Quaternion<T> q_error = q_meas.conjugate() * q_ji;
         q_error.normalize();
         
-        // Convert quaternion error to axis-angle representation
+        // 转换四元数误差到轴角表示
         Eigen::Matrix<T, 3, 1> omega;
         T angle = T(2.0) * atan2(q_error.vec().norm(), q_error.w());
         
@@ -325,33 +311,33 @@ struct Sim3Error {
             omega.setZero();
         }
         
-        // Translation error: t_ji - t_meas
+        // 平移误差: t_ji - t_meas
         Eigen::Matrix<T, 3, 1> t_error = t_ji - t_meas;
         
-        // Scale error: log(s_ji / s_meas)
+        // 尺度误差: log(s_ji / s_meas)
         T s_error = log(s_ji / s_meas);
         
-        // Construct the 7D error vector [omega, t_error, s_error]
-        residuals[0] = omega.x() * T(information_factor_);
-        residuals[1] = omega.y() * T(information_factor_);
-        residuals[2] = omega.z() * T(information_factor_);
-        residuals[3] = t_error.x() * T(information_factor_);
-        residuals[4] = t_error.y() * T(information_factor_);
-        residuals[5] = t_error.z() * T(information_factor_);
-        residuals[6] = s_error * T(information_factor_);
+        // 构造7维误差向量 [omega, t_error, s_error]
+        residuals[0] = omega.x();
+        residuals[1] = omega.y();
+        residuals[2] = omega.z();
+        residuals[3] = t_error.x();
+        residuals[4] = t_error.y();
+        residuals[5] = t_error.z();
+        residuals[6] = s_error;
         
         return true;
     }
 
-    static ceres::CostFunction* Create(const Sim3& measurement, double information_factor = 1.0) {
+    static ceres::CostFunction* Create(const Sim3& measurement) {
         return new ceres::AutoDiffCostFunction<Sim3Error, 7, 8, 8>(
-            new Sim3Error(measurement, information_factor));
+            new Sim3Error(measurement));
     }
 
 private:
     Sim3 measurement_;
-    double information_factor_;
 };
+
 
 class TrajectoryOptimizer {
 public:
@@ -663,26 +649,24 @@ public:
         return !optimization_params.empty();
     }
     
-    // Optimize the essential graph - main function
     bool OptimizeEssentialGraph(const std::string& output_file) {
-        // Determine if we should fix scale
-        bool fix_scale = true;  // Default to fixing scale
+        // 确定是否应该固定尺度
+        bool fix_scale = true;  // 默认固定尺度
         if (optimization_params.find("FIXED_SCALE") != optimization_params.end()) {
             fix_scale = (optimization_params["FIXED_SCALE"] == "true");
         }
         
-        // Set up the Ceres problem
+        // 设置Ceres优化问题
         ceres::Problem problem;
         
-        // Create parameter blocks for all keyframes
+        // 为所有关键帧创建参数块
         std::map<int, double*> sim3_blocks;
-        std::map<int, Sim3> vScw;  // Original Sim3 (similar to ORB-SLAM3)
-        std::map<int, Sim3> vCorrectedSwc;  // Corrected inverse Sim3
+        std::map<int, Sim3> vScw;  // 原始Sim3
         
-        // The minimum number of common features to create an edge
-        const int minFeat = 100;  // Same as in ORB-SLAM3
+        // 共视图中最小共视特征点数阈值
+        const int minFeat = 100; 
         
-        // Add keyframe vertices
+        // 添加关键帧顶点
         std::cout << "Setting up keyframe vertices..." << std::endl;
         for (const auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
@@ -690,13 +674,13 @@ public:
             
             if (kf.is_bad) continue;
             
-            // Parameter block format: [tx, ty, tz, qx, qy, qz, qw, s]
+            // 参数块格式: [tx, ty, tz, qx, qy, qz, qw, s]
             double* sim3_block = new double[8];
             
-            // Check if this keyframe has corrected Sim3
+            // 检查该关键帧是否有校正后的Sim3
             auto it_corrected = corrected_sim3_.find(id);
             if (it_corrected != corrected_sim3_.end()) {
-                // Use the corrected Sim3
+                // 使用校正后的Sim3
                 const Sim3& corrected_sim3 = it_corrected->second;
                 
                 sim3_block[0] = corrected_sim3.translation().x();
@@ -710,7 +694,7 @@ public:
                 
                 vScw[id] = corrected_sim3;
             } else {
-                // Use the current pose with scale = 1.0
+                // 使用当前位姿，尺度=1.0
                 sim3_block[0] = kf.position.x();
                 sim3_block[1] = kf.position.y();
                 sim3_block[2] = kf.position.z();
@@ -718,29 +702,29 @@ public:
                 sim3_block[4] = kf.rotation.y();
                 sim3_block[5] = kf.rotation.z();
                 sim3_block[6] = kf.rotation.w();
-                sim3_block[7] = 1.0;  // Scale = 1.0
+                sim3_block[7] = 1.0;  // 尺度=1.0
                 
                 Sim3 Siw(kf.rotation, kf.position, 1.0);
                 vScw[id] = Siw;
             }
             
-            // Store the parameter block
+            // 存储参数块
             sim3_blocks[id] = sim3_block;
             
-            // Add the parameter block to the problem with appropriate manifold
+            // 添加参数块到优化问题，并设置正确的流形
             ceres::Manifold* manifold = new Sim3Manifold(fix_scale);
             problem.AddParameterBlock(sim3_block, 8, manifold);
             
-            // Fix the initial keyframe and loop keyframe
+            // 固定初始关键帧和回环关键帧
             if (id == init_kf_id || id == loop_kf_id) {
                 problem.SetParameterBlockConstant(sim3_block);
             }
         }
         
-        // Set to track inserted edges and avoid duplicates
+        // 用于跟踪已添加的边，避免重复
         std::set<std::pair<int, int>> inserted_edges;
         
-        // Add loop closure edges (from LoopConnections)
+        // 添加回环闭合边 (从LoopConnections)
         std::cout << "Adding loop closure edges..." << std::endl;
         int count_loop = 0;
         for (const auto& entry : loop_connections_) {
@@ -755,11 +739,11 @@ public:
             for (int target_id : connected_kfs) {
                 if (sim3_blocks.find(target_id) == sim3_blocks.end()) continue;
                 
-                // Skip if already processed (both directions)
+                // 如果已处理过，则跳过（考虑两个方向）
                 std::pair<int, int> edge_pair(std::min(source_id, target_id), std::max(source_id, target_id));
                 if (inserted_edges.count(edge_pair)) continue;
                 
-                // Get the weight from covisibility graph if available
+                // 从共视图获取权重（如果可用）
                 int weight = 0;
                 if (keyframes_.find(source_id) != keyframes_.end() &&
                     keyframes_[source_id].covisible_keyframes.find(target_id) != 
@@ -767,33 +751,33 @@ public:
                     weight = keyframes_[source_id].covisible_keyframes[target_id];
                 }
                 
-                // Skip low weight edges unless it's the current loop closure
+                // 跳过权重低的边，除非是当前回环
                 if ((source_id != current_kf_id || target_id != loop_kf_id) && weight < minFeat) continue;
                 
                 const Sim3& Sjw = vScw[target_id];
                 const Sim3 Sji = Sjw * Swi;
                 
-                // Create cost function
-                ceres::CostFunction* cost_function = Sim3Error::Create(Sji, 1.0);
+                // 创建误差函数
+                ceres::CostFunction* cost_function = Sim3Error::Create(Sji);
                 
-                // Add robust loss function
+                // 添加鲁棒核
                 ceres::LossFunction* loss_function = new ceres::HuberLoss(1.345);
                 
-                // Add to problem
+                // 添加到优化问题
                 problem.AddResidualBlock(
                     cost_function,
                     loss_function,
                     sim3_blocks[source_id],
                     sim3_blocks[target_id]);
                 
-                // Mark as processed
+                // 标记为已处理
                 inserted_edges.insert(edge_pair);
                 count_loop++;
             }
         }
         std::cout << "Added " << count_loop << " loop edges" << std::endl;
         
-        // Add spanning tree edges
+        // 添加生成树边
         std::cout << "Adding spanning tree edges..." << std::endl;
         int count_spanning = 0;
         for (const auto& kf_pair : keyframes_) {
@@ -807,35 +791,35 @@ public:
             if (sim3_blocks.find(source_id) == sim3_blocks.end() || 
                 sim3_blocks.find(target_id) == sim3_blocks.end()) continue;
             
-            // Skip if already processed
+            // 跳过已处理的边
             std::pair<int, int> edge_pair(std::min(source_id, target_id), std::max(source_id, target_id));
             if (inserted_edges.count(edge_pair)) continue;
             
-            // Compute the relative Sim3
+            // 计算相对Sim3
             const Sim3& Siw = vScw[source_id];
             const Sim3& Sjw = vScw[target_id];
             const Sim3 Sji = Sjw * Siw.inverse();
             
-            // Create cost function
-            ceres::CostFunction* cost_function = Sim3Error::Create(Sji, 1.0);
+            // 创建误差函数
+            ceres::CostFunction* cost_function = Sim3Error::Create(Sji);
             
-            // Add robust loss function
+            // 添加鲁棒核
             ceres::LossFunction* loss_function = new ceres::HuberLoss(1.345);
             
-            // Add to problem
+            // 添加到优化问题
             problem.AddResidualBlock(
                 cost_function,
                 loss_function,
                 sim3_blocks[source_id],
                 sim3_blocks[target_id]);
             
-            // Mark as processed
+            // 标记为已处理
             inserted_edges.insert(edge_pair);
             count_spanning++;
         }
         std::cout << "Added " << count_spanning << " spanning tree edges" << std::endl;
         
-        // Add existing loop edges (previously detected loops)
+        // 添加已存在的回环边
         std::cout << "Adding existing loop edges..." << std::endl;
         int count_existing_loop = 0;
         for (const auto& kf_pair : keyframes_) {
@@ -845,42 +829,42 @@ public:
             if (kf.is_bad) continue;
             
             for (int target_id : kf.loop_edges) {
-                // Only process once
+                // 只处理一次
                 if (target_id >= source_id) continue;
                 
                 if (sim3_blocks.find(source_id) == sim3_blocks.end() || 
                     sim3_blocks.find(target_id) == sim3_blocks.end()) continue;
                 
-                // Skip if already processed
+                // 跳过已处理的边
                 std::pair<int, int> edge_pair(std::min(source_id, target_id), std::max(source_id, target_id));
                 if (inserted_edges.count(edge_pair)) continue;
                 
-                // Compute the relative Sim3
+                // 计算相对Sim3
                 const Sim3& Siw = vScw[source_id];
                 const Sim3& Sjw = vScw[target_id];
                 const Sim3 Sji = Sjw * Siw.inverse();
                 
-                // Create cost function
-                ceres::CostFunction* cost_function = Sim3Error::Create(Sji, 1.0);
+                // 创建误差函数
+                ceres::CostFunction* cost_function = Sim3Error::Create(Sji);
                 
-                // Add robust loss function
+                // 添加鲁棒核
                 ceres::LossFunction* loss_function = new ceres::HuberLoss(1.345);
                 
-                // Add to problem
+                // 添加到优化问题
                 problem.AddResidualBlock(
                     cost_function,
                     loss_function,
                     sim3_blocks[source_id],
                     sim3_blocks[target_id]);
                 
-                // Mark as processed
+                // 标记为已处理
                 inserted_edges.insert(edge_pair);
                 count_existing_loop++;
             }
         }
         std::cout << "Added " << count_existing_loop << " existing loop edges" << std::endl;
         
-        // Add covisibility edges
+        // 添加共视图边
         std::cout << "Adding covisibility edges..." << std::endl;
         int count_covisibility = 0;
         for (const auto& kf_pair : keyframes_) {
@@ -889,81 +873,81 @@ public:
             
             if (kf.is_bad) continue;
             
-            // Process covisible keyframes
+            // 处理共视关键帧
             for (const auto& covis_pair : kf.covisible_keyframes) {
                 int target_id = covis_pair.first;
                 int weight = covis_pair.second;
                 
-                // Only process in one direction and skip parent
+                // 只处理一个方向，并跳过父关键帧
                 if (target_id <= source_id || target_id == kf.parent_id) continue;
                 
-                // Skip if already in loop edges
+                // 跳过已在回环边中的
                 if (kf.loop_edges.count(target_id)) continue;
                 
                 if (sim3_blocks.find(source_id) == sim3_blocks.end() || 
                     sim3_blocks.find(target_id) == sim3_blocks.end()) continue;
                 
-                // Skip if already processed
+                // 跳过已处理的边
                 std::pair<int, int> edge_pair(source_id, target_id);
                 if (inserted_edges.count(edge_pair)) continue;
                 
-                // Skip if weight too low
+                // 跳过权重过低的边
                 if (weight < minFeat) continue;
                 
-                // Compute the relative Sim3
+                // 计算相对Sim3
                 const Sim3& Siw = vScw[source_id];
                 const Sim3& Sjw = vScw[target_id];
                 const Sim3 Sji = Sjw * Siw.inverse();
                 
-                // Create cost function
-                ceres::CostFunction* cost_function = Sim3Error::Create(Sji, 1.0);
+                // 创建误差函数
+                ceres::CostFunction* cost_function = Sim3Error::Create(Sji);
                 
-                // Add robust loss function
+                // 添加鲁棒核
                 ceres::LossFunction* loss_function = new ceres::HuberLoss(1.345);
                 
-                // Add to problem
+                // 添加到优化问题
                 problem.AddResidualBlock(
                     cost_function,
                     loss_function,
                     sim3_blocks[source_id],
                     sim3_blocks[target_id]);
                 
-                // Mark as processed
+                // 标记为已处理
                 inserted_edges.insert(edge_pair);
                 count_covisibility++;
             }
         }
         std::cout << "Added " << count_covisibility << " covisibility edges" << std::endl;
         
-        // Set solver options
+        // 设置求解器选项
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
         options.minimizer_progress_to_stdout = true;
         options.num_threads = 8;
         
-        // Get max iterations from optimization parameters, default to 20
+        // 从优化参数获取最大迭代次数，默认为20
         options.max_num_iterations = 20;
         if (optimization_params.find("NUM_ITERATIONS") != optimization_params.end()) {
             options.max_num_iterations = std::stoi(optimization_params["NUM_ITERATIONS"]);
         }
         
-        // Critical: Set initial trust region radius to match g2o's lambda
+        // 关键：设置初始信任区域半径以匹配g2o的lambda
         options.initial_trust_region_radius = 1e-16;
         
-        // Add stability settings
+        // 添加稳定性设置
         options.function_tolerance = 1e-6;
         options.parameter_tolerance = 1e-8;
         options.gradient_tolerance = 1e-10;
         options.max_num_consecutive_invalid_steps = 5;
         
-        // Solve the optimization problem
+        // 解决优化问题
         std::cout << "Optimizing..." << std::endl;
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         
         std::cout << summary.BriefReport() << std::endl;
         
-        // Update keyframes with the optimized values
+        // 更新关键帧位姿
         std::cout << "Updating keyframes..." << std::endl;
         for (auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
@@ -971,16 +955,16 @@ public:
             
             if (sim3_blocks.find(id) == sim3_blocks.end()) continue;
             
-            // Get the optimized Sim3
+            // 获取优化后的Sim3
             const double* sim3_block = sim3_blocks[id];
             
-            // Extract components
+            // 提取组件
             Eigen::Vector3d t(sim3_block[0], sim3_block[1], sim3_block[2]);
             Eigen::Quaterniond q(sim3_block[6], sim3_block[3], sim3_block[4], sim3_block[5]); // w, x, y, z
             q.normalize();
             double s = sim3_block[7];
             
-            // Sanity check for extreme values or NaNs
+            // 检查极端值或NaN
             bool has_nan = false;
             bool has_extreme = false;
             
@@ -995,21 +979,21 @@ public:
                 }
             }
             
-            // Skip this keyframe if values are extreme
+            // 如果值极端，则跳过此关键帧
             if (has_nan || has_extreme || !std::isfinite(s) || s <= 0) {
                 std::cerr << "Warning: Extreme values detected for KF " << id << ", skipping update" << std::endl;
                 continue;
             }
             
-            // Update keyframe pose - convert to SE3 by dividing translation by scale
+            // 更新关键帧位姿 - 将Sim3转换为SE3，通过除以尺度
             kf.rotation = q;
             kf.position = t / s;
         }
         
-        // Save the optimized trajectory
+        // 保存优化后的轨迹
         SaveOptimizedTrajectory(output_file);
         
-        // Clean up
+        // 清理
         for (auto& block_pair : sim3_blocks) {
             delete[] block_pair.second;
         }
