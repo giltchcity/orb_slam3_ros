@@ -11,6 +11,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <ceres/ceres.h>
+#include <ceres/autodiff_manifold.h>
 
 // g2o::Sim3 equivalent for Ceres
 class Sim3 {
@@ -95,56 +96,56 @@ struct Edge {
     double rel_scale;
 };
 
-// 修改Sim3Parameterization类，使用现代Ceres 2.2 API
-class Sim3Parameterization : public ceres::Manifold {
-public:
-    Sim3Parameterization(bool fix_scale = false) : fix_scale_(fix_scale) {}
-
-    // Sim3有8个环境参数：[s, qw, qx, qy, qz, tx, ty, tz]
-    virtual int AmbientSize() const override { return 8; }
+// Sim3 Plus function operator for AutoDiffManifold
+struct Sim3PlusFunctor {
+    Sim3PlusFunctor(bool fix_scale) : fix_scale_(fix_scale) {}
     
-    // 如果scale固定，则有6个自由度，否则有7个
-    virtual int TangentSize() const override { return fix_scale_ ? 6 : 7; }
+    template <typename T>
+    bool operator()(const T* x, const T* delta, T* x_plus_delta) const {
+        // Each parameter block is: [s, qw, qx, qy, qz, tx, ty, tz]
+        
+        // Extract current parameters
+        const T scale = x[0];
+        const Eigen::Quaternion<T> rotation(x[1], x[2], x[3], x[4]);  // w, x, y, z
+        const Eigen::Matrix<T, 3, 1> translation(x[5], x[6], x[7]);
 
-    // Plus操作：将更新量delta应用到当前参数x
-    virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const override {
-        // 提取当前参数
-        double scale = x[0];
-        Eigen::Quaterniond rotation(x[1], x[2], x[3], x[4]);  // w, x, y, z
-        Eigen::Vector3d translation(x[5], x[6], x[7]);
-
-        // 首先更新缩放因子（如果未固定）
-        double new_scale = scale;
+        // Initialize delta index
         int delta_idx = 0;
         
+        // Update scale (if not fixed)
+        T new_scale = scale;
         if (!fix_scale_) {
-            // 应用乘法缩放更新：s_new = s * exp(delta[0])
+            // Apply multiplicative scale update: s_new = s * exp(delta[0])
             new_scale = scale * exp(delta[delta_idx++]);
         }
 
-        // 使用指数映射更新旋转
-        Eigen::Vector3d omega(delta[delta_idx], delta[delta_idx+1], delta[delta_idx+2]);
+        // Update rotation using exponential map
+        Eigen::Matrix<T, 3, 1> omega(delta[delta_idx], delta[delta_idx+1], delta[delta_idx+2]);
         delta_idx += 3;
         
-        Eigen::Quaterniond dq;
-        if (omega.norm() < 1e-10) {
-            dq = Eigen::Quaterniond(1.0, 0.0, 0.0, 0.0);
+        Eigen::Quaternion<T> dq;
+        const T omega_norm = omega.norm();
+        
+        if (omega_norm < T(1e-10)) {
+            dq = Eigen::Quaternion<T>(T(1.0), T(0.0), T(0.0), T(0.0));
         } else {
-            double theta = omega.norm();
-            omega.normalize();
-            dq = Eigen::Quaterniond(cos(theta/2.0), sin(theta/2.0)*omega.x(),
-                                   sin(theta/2.0)*omega.y(), sin(theta/2.0)*omega.z());
+            const T theta = omega_norm;
+            omega = omega / omega_norm; // Normalize
+            dq = Eigen::Quaternion<T>(cos(theta/T(2.0)), 
+                                     sin(theta/T(2.0))*omega.x(),
+                                     sin(theta/T(2.0))*omega.y(), 
+                                     sin(theta/T(2.0))*omega.z());
         }
         
-        Eigen::Quaterniond new_rotation = dq * rotation;
+        // Apply rotation update
+        Eigen::Quaternion<T> new_rotation = dq * rotation;
         new_rotation.normalize();
 
-        // 更新平移
-        Eigen::Vector3d new_translation = translation + Eigen::Vector3d(delta[delta_idx], 
-                                                                      delta[delta_idx+1], 
-                                                                      delta[delta_idx+2]);
+        // Update translation
+        Eigen::Matrix<T, 3, 1> new_translation = translation + 
+            Eigen::Matrix<T, 3, 1>(delta[delta_idx], delta[delta_idx+1], delta[delta_idx+2]);
 
-        // 打包更新后的参数
+        // Pack updated parameters
         x_plus_delta[0] = new_scale;
         x_plus_delta[1] = new_rotation.w();
         x_plus_delta[2] = new_rotation.x();
@@ -156,14 +157,69 @@ public:
 
         return true;
     }
+    
+    bool fix_scale_;
+};
 
-    // Manifold接口需要实现VerifyJacobian，但我们可以不实现
-    // Ceres将使用数值微分来计算雅可比矩阵
-
-    // Ceres 2.x不再需要ComputeJacobian方法
-
-private:
-    bool fix_scale_;  // 如果为true，则缩放固定（6DoF），否则为7DoF
+// Sim3 Minus function operator for AutoDiffManifold
+struct Sim3MinusFunctor {
+    Sim3MinusFunctor(bool fix_scale) : fix_scale_(fix_scale) {}
+    
+    template <typename T>
+    bool operator()(const T* y, const T* x, T* delta) const {
+        // Extract parameters
+        const T scale_x = x[0];
+        const Eigen::Quaternion<T> q_x(x[1], x[2], x[3], x[4]);  // w, x, y, z
+        const Eigen::Matrix<T, 3, 1> t_x(x[5], x[6], x[7]);
+        
+        const T scale_y = y[0];
+        const Eigen::Quaternion<T> q_y(y[1], y[2], y[3], y[4]);  // w, x, y, z
+        const Eigen::Matrix<T, 3, 1> t_y(y[5], y[6], y[7]);
+        
+        // Initialize delta index
+        int delta_idx = 0;
+        
+        // Compute scale delta (if not fixed)
+        if (!fix_scale_) {
+            delta[delta_idx++] = log(scale_y / scale_x);
+        }
+        
+        // Compute rotation delta (quaternion difference)
+        const Eigen::Quaternion<T> q_delta = q_x.inverse() * q_y;
+        
+        // Convert to axis-angle representation
+        T angle = T(2.0) * atan2(q_delta.vec().norm(), q_delta.w());
+        Eigen::Matrix<T, 3, 1> axis;
+        
+        if (q_delta.vec().norm() < T(1e-10)) {
+            axis = Eigen::Matrix<T, 3, 1>(T(0.0), T(0.0), T(0.0));
+            angle = T(0.0);
+        } else {
+            axis = q_delta.vec() / q_delta.vec().norm();
+        }
+        
+        // Wrap angle to [-pi, pi]
+        if (angle > T(M_PI)) {
+            angle = angle - T(2.0 * M_PI);
+        } else if (angle < -T(M_PI)) {
+            angle = angle + T(2.0 * M_PI);
+        }
+        
+        // Store rotation delta as axis-angle
+        delta[delta_idx++] = angle * axis.x();
+        delta[delta_idx++] = angle * axis.y();
+        delta[delta_idx++] = angle * axis.z();
+        
+        // Compute translation delta
+        const Eigen::Matrix<T, 3, 1> t_delta = t_y - t_x;
+        delta[delta_idx++] = t_delta.x();
+        delta[delta_idx++] = t_delta.y();
+        delta[delta_idx++] = t_delta.z();
+        
+        return true;
+    }
+    
+    bool fix_scale_;
 };
 
 // Sim3 error class for Ceres that matches the g2o::EdgeSim3 approach
@@ -583,15 +639,18 @@ public:
         
         std::cout << "Setting up optimization problem..." << std::endl;
         
-        // Get max KeyFrame ID to allocate vectors (like ORBSLAM3)
-        int nMaxKFid = GetMaxKFId();
-        
         // Create parameter blocks for each keyframe - using Sim3 [scale, rotation, translation]
         std::map<int, double*> sim3_blocks;
         std::map<int, Sim3> vScw;  // Store original Sim3 (like ORBSLAM3)
         std::map<int, Sim3> vCorrectedSwc;  // For storing corrected inverse Sim3
         
         const int minFeat = 100;  // Minimum features for covisibility, same as ORBSLAM3
+        
+        // Create the AutoDiffManifold for Sim3
+        const int ambient_size = 8;  // [s, qw, qx, qy, qz, tx, ty, tz]
+        const int tangent_size = fix_scale ? 6 : 7;  // 6 or 7 DoF
+
+        typedef ceres::AutoDiffManifold<Sim3PlusFunctor, Sim3MinusFunctor, ambient_size, Eigen::Dynamic> Sim3Manifold;
         
         // Add keyframe vertices - following ORBSLAM3's approach
         for(auto& kf_pair : keyframes_) {
@@ -636,10 +695,14 @@ public:
             
             sim3_blocks[id] = sim3_block;
             
+            // Create a new Sim3Manifold for each parameter block
+            ceres::Manifold* manifold = new Sim3Manifold(
+                Sim3PlusFunctor(fix_scale), 
+                Sim3MinusFunctor(fix_scale),
+                ambient_size, tangent_size);
+            
             // Add parameter block to problem
-            // 替换为:
-            ceres::Manifold* sim3_parameterization = new Sim3Parameterization(fix_scale);
-            problem.AddParameterBlock(sim3_block, 8, sim3_parameterization);
+            problem.AddParameterBlock(sim3_block, 8, manifold);
             
             // Fix the initial KF (similar to ORBSLAM3)
             if(id == loop_kf_id) {
@@ -940,7 +1003,7 @@ public:
         // Sim3:[s,R,t] -> SE3:[R,t/s]
         for(auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
-            KeyFrame kf = kf_pair.second; 
+            KeyFrame& kf = kf_pair.second;
             
             if(sim3_blocks.find(id) == sim3_blocks.end())
                 continue;
