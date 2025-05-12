@@ -259,7 +259,11 @@ struct Sim3Error {
         // This is the estimated transformation from i to j
         const T s_ji_est = scale_j / scale_i;
         const Eigen::Quaternion<T> q_ji_est = rotation_j * rotation_i.inverse();
-        const Eigen::Matrix<T, 3, 1> t_ji_est = (T(1.0)/scale_i) * (rotation_j * rotation_i.inverse() * (-translation_i)) + translation_j;
+        
+        // For translation: t_ji = (sj/si) * (Rj * Ri^-1 * (-ti)) + tj
+        const Eigen::Matrix<T, 3, 1> negated_ti = -translation_i;
+        const Eigen::Matrix<T, 3, 1> rotated_ti = rotation_j * (rotation_i.inverse() * negated_ti);
+        const Eigen::Matrix<T, 3, 1> t_ji_est = (scale_j / scale_i) * rotated_ti + translation_j;
 
         // Compute error between estimated and measured transformation
         // For rotation: error = log(meas_rotation^-1 * q_ji_est)
@@ -508,6 +512,8 @@ public:
                 if (is_new == 1) {
                     connection_changes_.push_back(std::make_pair(source_id, target_id));
                     loop_connections_[source_id].insert(target_id);
+                    // Add the reverse connection too
+                    loop_connections_[target_id].insert(source_id);
                 }
             }
         }
@@ -628,7 +634,10 @@ public:
         options.function_tolerance = 1e-6;
         options.gradient_tolerance = 1e-10;
         options.parameter_tolerance = 1e-8;
-        options.initial_trust_region_radius = 1e-16;  // Similar to ORBSLAM3's userLambdaInit
+        
+        // Use a more reasonable trust region radius that allows actual steps
+        options.initial_trust_region_radius = 1e-4;
+        options.max_trust_region_radius = 1e3;
         
         std::cout << "Setting up optimization problem..." << std::endl;
         
@@ -731,19 +740,13 @@ public:
                                                     std::max(source_id, target_id))))
                     continue;
                 
-                // Skip if weight is too low (similar to ORBSLAM3)
-                auto weight_it = keyframes_[source_id].covisible_keyframes.find(target_id);
-                if((source_id != current_kf_id || target_id != loop_kf_id) && 
-                   (weight_it == keyframes_[source_id].covisible_keyframes.end() || weight_it->second < minFeat))
-                    continue;
-                
                 const Sim3& Sjw = vScw[target_id];
                 const Sim3 Sji = Sjw * Swi;
                 
-                // Add Sim3 edge
+                // Add Sim3 edge with higher weight for loop connections
                 ceres::CostFunction* cost_function = 
                     new ceres::AutoDiffCostFunction<Sim3Error, 7, 8, 8>(
-                        new Sim3Error(Sji, 1.0));
+                        new Sim3Error(Sji, 5.0));  // Information scale = 5.0
                 
                 problem.AddResidualBlock(cost_function,
                                          loss_function,
@@ -752,6 +755,9 @@ public:
                                          
                 sInsertedEdges.insert(std::make_pair(std::min(source_id, target_id), 
                                                     std::max(source_id, target_id)));
+                
+                // Debug output
+                std::cout << "Added loop edge: " << source_id << " -> " << target_id << std::endl;
             }
         }
         
@@ -776,35 +782,9 @@ public:
                 continue;
             
             // Get the relative Sim3 transformation
-            Sim3 Sji;
-            
-            // Check if source has a non-corrected Sim3
-            auto src_it = sim3_non_corrected_map_.find(source_id);
-            if(src_it != sim3_non_corrected_map_.end()) {
-                const Sim3& Swi = (src_it->second).inverse();
-                
-                // Check if target has a non-corrected Sim3
-                auto tgt_it = sim3_non_corrected_map_.find(target_id);
-                if(tgt_it != sim3_non_corrected_map_.end()) {
-                    const Sim3& Sjw = tgt_it->second;
-                    Sji = Sjw * Swi;
-                } else {
-                    const Sim3& Sjw = vScw[target_id];
-                    Sji = Sjw * Swi;
-                }
-            } else {
-                const Sim3& Swi = vScw[source_id].inverse();
-                
-                // Check if target has a non-corrected Sim3
-                auto tgt_it = sim3_non_corrected_map_.find(target_id);
-                if(tgt_it != sim3_non_corrected_map_.end()) {
-                    const Sim3& Sjw = tgt_it->second;
-                    Sji = Sjw * Swi;
-                } else {
-                    const Sim3& Sjw = vScw[target_id];
-                    Sji = Sjw * Swi;
-                }
-            }
+            const Sim3& Siw = vScw[source_id];
+            const Sim3& Sjw = vScw[target_id];
+            const Sim3 Sji = Sjw * Siw.inverse();
             
             // Add Sim3 edge with higher weight for spanning tree
             ceres::CostFunction* cost_function = 
@@ -818,67 +798,47 @@ public:
                                      
             sInsertedEdges.insert(std::make_pair(std::min(source_id, target_id), 
                                                 std::max(source_id, target_id)));
+            
+            // Debug output (every 50 edges)
+            if (sInsertedEdges.size() % 50 == 0) {
+                std::cout << "Added " << sInsertedEdges.size() << " edges so far..." << std::endl;
+            }
         }
         
         // Add loop edges (from previous loop detections)
-        for(const auto& kf_pair : keyframes_) {
-            int source_id = kf_pair.first;
-            KeyFrame kf = kf_pair.second; 
+        std::cout << "Adding loop constraint edges..." << std::endl;
+        for (const auto& edge : loop_edges_) {
+            int source_id = edge.source_id;
+            int target_id = edge.target_id;
             
-            if(kf.is_bad) continue;
+            if(sim3_blocks.find(source_id) == sim3_blocks.end() || 
+               sim3_blocks.find(target_id) == sim3_blocks.end() ||
+               keyframes_[source_id].is_bad || keyframes_[target_id].is_bad)
+                continue;
+                
+            // Skip if this connection has already been processed
+            if(sInsertedEdges.count(std::make_pair(std::min(source_id, target_id), 
+                                                  std::max(source_id, target_id))))
+                continue;
             
-            for(int target_id : kf.loop_edges) {
-                if(target_id < source_id) continue; // Process each edge only once
-                
-                if(sim3_blocks.find(source_id) == sim3_blocks.end() || 
-                   sim3_blocks.find(target_id) == sim3_blocks.end() ||
-                   keyframes_[target_id].is_bad)
-                    continue;
-                    
-                // Skip if this connection has already been processed
-                if(sInsertedEdges.count(std::make_pair(source_id, target_id)))
-                    continue;
-                    
-                // Get the relative Sim3 transformation (similar to spanning tree)
-                Sim3 Sji;
-                
-                auto src_it = sim3_non_corrected_map_.find(source_id);
-                if(src_it != sim3_non_corrected_map_.end()) {
-                    const Sim3& Swi = (src_it->second).inverse();
-                    
-                    auto tgt_it = sim3_non_corrected_map_.find(target_id);
-                    if(tgt_it != sim3_non_corrected_map_.end()) {
-                        const Sim3& Sjw = tgt_it->second;
-                        Sji = Sjw * Swi;
-                    } else {
-                        const Sim3& Sjw = vScw[target_id];
-                        Sji = Sjw * Swi;
-                    }
-                } else {
-                    const Sim3& Swi = vScw[source_id].inverse();
-                    
-                    auto tgt_it = sim3_non_corrected_map_.find(target_id);
-                    if(tgt_it != sim3_non_corrected_map_.end()) {
-                        const Sim3& Sjw = tgt_it->second;
-                        Sji = Sjw * Swi;
-                    } else {
-                        const Sim3& Sjw = vScw[target_id];
-                        Sji = Sjw * Swi;
-                    }
-                }
-                
-                // Add Sim3 edge with loop edge weight
-                ceres::CostFunction* cost_function = 
-                    new ceres::AutoDiffCostFunction<Sim3Error, 7, 8, 8>(
-                        new Sim3Error(Sji, 5.0));  // Higher weight (5.0) for loop edges
-                
-                problem.AddResidualBlock(cost_function,
-                                         loss_function,
-                                         sim3_blocks[source_id],
-                                         sim3_blocks[target_id]);
-                                         
-                sInsertedEdges.insert(std::make_pair(source_id, target_id));
-            }
+            // Create Sim3 from the edge data
+            Sim3 Sji(edge.rel_rotation, edge.rel_translation, edge.rel_scale);
+            
+            // Add Sim3 edge with loop edge weight
+            ceres::CostFunction* cost_function = 
+                new ceres::AutoDiffCostFunction<Sim3Error, 7, 8, 8>(
+                    new Sim3Error(Sji, 5.0));  // Higher weight (5.0) for loop edges
+            
+            problem.AddResidualBlock(cost_function,
+                                     loss_function,
+                                     sim3_blocks[source_id],
+                                     sim3_blocks[target_id]);
+                                     
+            sInsertedEdges.insert(std::make_pair(std::min(source_id, target_id), 
+                                                std::max(source_id, target_id)));
+            
+            // Debug output
+            std::cout << "Added loop constraint edge: " << source_id << " -> " << target_id << std::endl;
         }
         
         // Add covisibility edges
@@ -913,33 +873,10 @@ public:
                    sim3_blocks.find(target_id) == sim3_blocks.end())
                     continue;
                     
-                // Get the relative Sim3 transformation (similar to spanning tree)
-                Sim3 Sji;
-                
-                auto src_it = sim3_non_corrected_map_.find(source_id);
-                if(src_it != sim3_non_corrected_map_.end()) {
-                    const Sim3& Swi = (src_it->second).inverse();
-                    
-                    auto tgt_it = sim3_non_corrected_map_.find(target_id);
-                    if(tgt_it != sim3_non_corrected_map_.end()) {
-                        const Sim3& Sjw = tgt_it->second;
-                        Sji = Sjw * Swi;
-                    } else {
-                        const Sim3& Sjw = vScw[target_id];
-                        Sji = Sjw * Swi;
-                    }
-                } else {
-                    const Sim3& Swi = vScw[source_id].inverse();
-                    
-                    auto tgt_it = sim3_non_corrected_map_.find(target_id);
-                    if(tgt_it != sim3_non_corrected_map_.end()) {
-                        const Sim3& Sjw = tgt_it->second;
-                        Sji = Sjw * Swi;
-                    } else {
-                        const Sim3& Sjw = vScw[target_id];
-                        Sji = Sjw * Swi;
-                    }
-                }
+                // Get the relative Sim3 transformation
+                const Sim3& Siw = vScw[source_id];
+                const Sim3& Sjw = vScw[target_id];
+                const Sim3 Sji = Sjw * Siw.inverse();
                 
                 // Add Sim3 edge with appropriate weight for covisibility
                 ceres::CostFunction* cost_function = 
@@ -952,6 +889,11 @@ public:
                                          sim3_blocks[target_id]);
                                          
                 sInsertedEdges.insert(std::make_pair(source_id, target_id));
+                
+                // Debug output (every 200 edges)
+                if (sInsertedEdges.size() % 200 == 0) {
+                    std::cout << "Added " << sInsertedEdges.size() << " edges so far..." << std::endl;
+                }
             }
         }
         
@@ -987,14 +929,34 @@ public:
                                      
             sInsertedEdges.insert(std::make_pair(std::min(source_id, target_id), 
                                                 std::max(source_id, target_id)));
+            
+            // Debug output
+            std::cout << "Added connection change edge: " << source_id << " -> " << target_id << std::endl;
         }
+        
+        std::cout << "Total edges added: " << sInsertedEdges.size() << std::endl;
+        
+        // Check initial error
+        std::vector<double> residuals;
+        double initial_cost = 0.0;
+        problem.Evaluate(ceres::Problem::EvaluateOptions(), &initial_cost, &residuals, nullptr, nullptr);
+        std::cout << "Initial cost: " << initial_cost << " with " << residuals.size() << " residuals" << std::endl;
         
         // Solve the problem
         std::cout << "Solving optimization problem..." << std::endl;
         ceres::Solver::Summary summary;
         ceres::Solve(options, &problem, &summary);
         
-        std::cout << summary.BriefReport() << std::endl;
+        std::cout << summary.FullReport() << std::endl;
+        
+        if (summary.termination_type == ceres::FAILURE) {
+            std::cerr << "Optimization failed!" << std::endl;
+            // Clean up anyway
+            for(auto& block_pair : sim3_blocks) {
+                delete[] block_pair.second;
+            }
+            return false;
+        }
         
         // SE3 Pose Recovering (similar to ORBSLAM3)
         // Sim3:[s,R,t] -> SE3:[R,t/s]
@@ -1015,36 +977,40 @@ public:
             vCorrectedSwc[id] = CorrectedSiw.inverse();
             
             // Convert to SE3 by dividing translation by scale
-            kf.rotation = Eigen::Quaterniond(sim3_block[1], sim3_block[2], sim3_block[3], sim3_block[4]);
+            kf.rotation = Eigen::Quaterniond(sim3_block[1], sim3_block[2], sim3_block[3], sim3_block[4]).normalized();
             kf.position = Eigen::Vector3d(sim3_block[5]/s, sim3_block[6]/s, sim3_block[7]/s);
         }
         
         // Correct map points (similar to ORBSLAM3)
-        for(MapPoint& mp : map_points_) {
-            if(mp.is_bad)
-                continue;
+        if (!map_points_.empty()) {
+            std::cout << "Correcting map points..." << std::endl;
             
-            // Get reference keyframe
-            int nIDr;
-            if(mp.corrected_by_kf == current_kf_id) {
-                nIDr = mp.corrected_reference;
-            } else {
-                nIDr = mp.reference_kf_id;
-            }
-            
-            if(vScw.find(nIDr) == vScw.end() || vCorrectedSwc.find(nIDr) == vCorrectedSwc.end())
-                continue;
+            for(MapPoint& mp : map_points_) {
+                if(mp.is_bad)
+                    continue;
                 
-            // Get the original and corrected Sim3 transformations
-            Sim3 Srw = vScw[nIDr];
-            Sim3 correctedSwr = vCorrectedSwc[nIDr];
-            
-            // Transform the point from world to reference KF and back with corrected pose
-            Eigen::Vector3d eigP3Dw = mp.position;
-            Eigen::Vector3d eigCorrectedP3Dw = correctedSwr.map(Srw.map(eigP3Dw));
-            
-            // Update the map point position
-            mp.position = eigCorrectedP3Dw;
+                // Get reference keyframe
+                int nIDr;
+                if(mp.corrected_by_kf == current_kf_id) {
+                    nIDr = mp.corrected_reference;
+                } else {
+                    nIDr = mp.reference_kf_id;
+                }
+                
+                if(vScw.find(nIDr) == vScw.end() || vCorrectedSwc.find(nIDr) == vCorrectedSwc.end())
+                    continue;
+                    
+                // Get the original and corrected Sim3 transformations
+                Sim3 Srw = vScw[nIDr];
+                Sim3 correctedSwr = vCorrectedSwc[nIDr];
+                
+                // Transform the point from world to reference KF and back with corrected pose
+                Eigen::Vector3d eigP3Dw = mp.position;
+                Eigen::Vector3d eigCorrectedP3Dw = correctedSwr.map(Srw.map(eigP3Dw));
+                
+                // Update the map point position
+                mp.position = eigCorrectedP3Dw;
+            }
         }
         
         // Clean up
@@ -1171,11 +1137,22 @@ int main(int argc, char** argv) {
     
     // Attempt to load map points, but continue if not available
     std::cout << "Loading map points..." << std::endl;
-    optimizer.LoadMapPoints(input_dir + "/transformed/mappoints_sim3_transformed.txt");
+    try {
+        optimizer.LoadMapPoints(input_dir + "/transformed/mappoints_sim3_transformed.txt");
+    } catch (const std::exception& e) {
+        std::cerr << "Warning: Failed to load map points: " << e.what() << std::endl;
+        std::cerr << "Continuing without map points..." << std::endl;
+    }
     
-    // Set loop keyframe ID (usually KF 1)
-    optimizer.loop_kf_id = 1;
+    // Set loop keyframe ID (reading from loop_info.txt metadata)
+    optimizer.loop_kf_id = 1; // Default from the loop_info.txt you provided
     optimizer.current_kf_id = optimizer.GetMaxKFId();
+    
+    std::cout << "Key information before optimization:" << std::endl;
+    std::cout << "Current KF ID: " << optimizer.current_kf_id << std::endl;
+    std::cout << "Loop KF ID: " << optimizer.loop_kf_id << std::endl;
+    std::cout << "Total keyframes: " << optimizer.keyframes_.size() << std::endl;
+    std::cout << "Total loop connections: " << optimizer.loop_connections_.size() << std::endl;
     
     // Optimize the essential graph
     std::cout << "Optimizing essential graph..." << std::endl;
