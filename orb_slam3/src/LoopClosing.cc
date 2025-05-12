@@ -155,6 +155,7 @@ void LoopClosing::SaveCompleteTrajectory(const std::string& filename, Map* pMap)
     file.close();
 }
 
+
 void LoopClosing::SaveDetailedKeyFrames(const std::string& filename, const std::vector<KeyFrame*>& vpKFs)
 {
     std::ofstream file(filename);
@@ -163,9 +164,19 @@ void LoopClosing::SaveDetailedKeyFrames(const std::string& filename, const std::
         return;
     }
     
-    file << "# KF_ID timestamp mTimeStamp tx ty tz qx qy qz qw vx vy vz parent_KF_ID loop_edges fixed_in_optimization mBAGlobalForKF mbNotErase" << std::endl;
+    // 复制关键帧指针并按时间戳排序
+    std::vector<KeyFrame*> sortedKFs = vpKFs;
+    std::sort(sortedKFs.begin(), sortedKFs.end(), [](const KeyFrame* a, const KeyFrame* b) {
+        return a->mTimeStamp < b->mTimeStamp;
+    });
     
-    for(KeyFrame* pKF : vpKFs) {
+    // 更详细的header，包含时间戳（秒和纳秒）
+    file << "# KF_ID timestamp_s timestamp_ns tx ty tz qx qy qz qw vx vy vz "
+         << "parent_KF_ID loop_edges covisibility_KFs fixed_in_optimization "
+         << "mBALocalForKF mBAFixedForKF mBAGlobalForKF mbNotErase "
+         << "scale_from_parent bias_gx bias_gy bias_gz bias_ax bias_ay bias_az" << std::endl;
+    
+    for(KeyFrame* pKF : sortedKFs) {
         if(!pKF || pKF->isBad())
             continue;
             
@@ -177,39 +188,80 @@ void LoopClosing::SaveDetailedKeyFrames(const std::string& filename, const std::
         // 获取速度
         Eigen::Vector3f v = pKF->GetVelocity();
         
-        // 获取父关键帧
+        // 获取父关键帧和相对尺度
         KeyFrame* pParent = pKF->GetParent();
-        long unsigned int parentId = pParent ? pParent->mnId : 0;
+        long unsigned int parentId = pParent ? pParent->mnId : -1;
+        
+        // 计算相对于父节点的尺度（如果有父节点）
+        float scaleFromParent = 1.0f;
+        if(pParent) {
+            // 计算相对距离比例作为尺度估计
+            float dist_current = pKF->GetCameraCenter().norm();
+            float dist_parent = pParent->GetCameraCenter().norm();
+            if(dist_parent > 0) {
+                scaleFromParent = dist_current / dist_parent;
+            }
+        }
         
         // 获取回环边
         std::set<KeyFrame*> loopEdges = pKF->GetLoopEdges();
         std::stringstream ssLoopEdges;
-        ssLoopEdges << "\"";
+        ssLoopEdges << "[";
         bool first = true;
         for(KeyFrame* pLoopKF : loopEdges) {
             if(!first) ssLoopEdges << ",";
             ssLoopEdges << pLoopKF->mnId;
             first = false;
         }
-        ssLoopEdges << "\"";
+        ssLoopEdges << "]";
         
-        // 修复: 使用实际存在的属性替代isFixed()和GetNotErase()
+        // 获取共视关键帧
+        std::vector<KeyFrame*> vpCovisible = pKF->GetVectorCovisibleKeyFrames();
+        std::stringstream ssCovis;
+        ssCovis << "[";
+        first = true;
+        for(size_t i = 0; i < std::min(size_t(5), vpCovisible.size()); i++) {
+            if(!first) ssCovis << ",";
+            ssCovis << vpCovisible[i]->mnId << ":" << pKF->GetWeight(vpCovisible[i]);
+            first = false;
+        }
+        ssCovis << "]";
+        
+        // 获取IMU偏置（如果有）
+        Eigen::Vector3f bg(0, 0, 0), ba(0, 0, 0);
+        if(pKF->GetMap()->IsInertial()) {
+            bg = pKF->GetGyroBias();
+            ba = pKF->GetAccBias();
+        }
+        
+        // 优化相关标志
         bool isFixed = (pKF->mnBAGlobalForKF > 0); // 参与过全局BA的可视为fixed
         
         file << pKF->mnId << " " 
-             << std::fixed << std::setprecision(3) << pKF->mTimeStamp << " "
-             << std::setprecision(9) << pKF->mTimeStamp << " "
+             << std::fixed << std::setprecision(9) 
+             << pKF->mTimeStamp << " "                    // 时间戳（秒）
+             << static_cast<long long>(pKF->mTimeStamp * 1e9) << " "  // 时间戳（纳秒）
              << t.x() << " " << t.y() << " " << t.z() << " "
              << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << " "
              << v.x() << " " << v.y() << " " << v.z() << " "
              << parentId << " " 
              << ssLoopEdges.str() << " "
-             << (isFixed ? 1 : 0) << " " // 替代 isFixed()
+             << ssCovis.str() << " "
+             << (isFixed ? 1 : 0) << " "
+             << pKF->mnBALocalForKF << " "
+             << pKF->mnBAFixedForKF << " "
              << pKF->mnBAGlobalForKF << " "
-             << (pKF->GetNotErase() ? 1 : 0) << std::endl; // 使用 GetNotErase() 方法
+             << (pKF->GetNotErase() ? 1 : 0) << " "
+             << scaleFromParent << " "
+             << bg.x() << " " << bg.y() << " " << bg.z() << " "
+             << ba.x() << " " << ba.y() << " " << ba.z() << std::endl;
     }
     
     file.close();
+    
+    // 添加调试信息
+    std::cout << "Saved " << sortedKFs.size() << " keyframes (sorted by timestamp) to: " 
+              << filename << std::endl;
 }
 
 
@@ -1957,10 +2009,6 @@ void LoopClosing::CorrectLoop()
         }
     }
     
-    // 记录融合时间
-    // std::chrono::steady_clock::time_point timeAfterFusion = std::chrono::steady_clock::now();
-    // double fusionTimeMs = std::chrono::duration_cast<std::chrono::duration<double,std::milli>>(timeAfterFusion-timeAfterSim3).count();
-    // mTimingInfo.fusionTimeMs = fusionTimeMs;
     
     // 原有代码 - 检测新连接...
     
@@ -1984,6 +2032,51 @@ void LoopClosing::CorrectLoop()
             LoopConnections[pKFi].erase(*vit2);
         }
     }
+
+    
+    // 保存变换后但未优化的轨迹
+    if(mSaveLoopData)
+    {
+        std::string transformedDir = loopDir + "transformed/";
+        
+        // 创建目录
+        struct stat st = {0};
+        if (stat(transformedDir.c_str(), &st) == -1) {
+            #ifdef _WIN32
+                _mkdir(transformedDir.c_str());
+            #else
+                mkdir(transformedDir.c_str(), 0755);
+            #endif
+        }
+        
+        // 保存Sim3变换后但未优化的轨迹
+        SaveCompleteTrajectory(transformedDir + "standard_trajectory_sim3_transformed.txt", pLoopMap);
+        SaveDetailedKeyFrames(transformedDir + "keyframes_sim3_transformed.txt", pLoopMap->GetAllKeyFrames());
+        
+        // 保存变换信息
+        std::ofstream fileTransform(transformedDir + "transform_info.txt");
+        if(fileTransform.is_open())
+        {
+            fileTransform << "# Sim3 transformation applied, before Essential Graph optimization" << std::endl;
+            fileTransform << "LOOP_SCALE: " << mg2oLoopScw.scale() << std::endl;
+            fileTransform << "NUM_CORRECTED_KFS: " << CorrectedSim3.size() << std::endl;
+            fileTransform << "NUM_CONNECTED_KFS: " << mvpCurrentConnectedKFs.size() << std::endl;
+            
+            // 保存变换矩阵
+            Eigen::Matrix3d R = mg2oLoopScw.rotation().toRotationMatrix();
+            Eigen::Vector3d t = mg2oLoopScw.translation();
+            fileTransform << "LOOP_ROTATION:" << std::endl;
+            for(int i = 0; i < 3; i++)
+            {
+                for(int j = 0; j < 3; j++)
+                    fileTransform << R(i,j) << " ";
+                fileTransform << std::endl;
+            }
+            fileTransform << "LOOP_TRANSLATION: " << t.x() << " " << t.y() << " " << t.z() << std::endl;
+            fileTransform.close();
+        }
+    }
+    
 
     // Optimize graph
     bool bFixedScale = mbFixScale;
