@@ -69,9 +69,7 @@ private:
     double s_;              // Scale factor
 };
 
-// Data structures to store loaded data
-
-// KeyFrame structure
+// KeyFrame structure - Simplified for trajectory-only optimization
 struct KeyFrame {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     
@@ -82,32 +80,15 @@ struct KeyFrame {
     
     // For the optimization
     bool is_bad = false;           // Is this a bad KF
-    KeyFrame* parent = nullptr;    // Parent in spanning tree
     int parent_id = -1;            // Parent ID
     std::set<int> loop_edges;      // Loop edge connections
     std::map<int, int> covisible_keyframes; // KF_ID -> weight
-    
-    // For inertial support (if available)
-    bool is_inertial = false;      // Is this an inertial KF
-    KeyFrame* prev_kf = nullptr;   // Previous KF in inertial sequence
 };
 
-// MapPoint structure
-struct MapPoint {
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    
-    int id;                        // MapPoint ID
-    Eigen::Vector3d position;      // 3D position
-    bool is_bad = false;           // Is this a bad point
-    int reference_kf_id = -1;      // Reference KeyFrame ID
-    int corrected_by_kf = -1;      // Corrected by KeyFrame ID
-    int corrected_reference = -1;  // Corrected reference
-};
-
-// Custom Sim3 manifold for Ceres 2.2 - This is critical for matching g2o
+// Custom Sim3 manifold for Ceres 2.2
 class Sim3Manifold : public ceres::Manifold {
 public:
-    Sim3Manifold(bool fix_scale = false) : fix_scale_(fix_scale) {}
+    Sim3Manifold(bool fix_scale = true) : fix_scale_(fix_scale) {}
     
     virtual ~Sim3Manifold() {}
     
@@ -126,7 +107,7 @@ public:
         double s = x[7];
         
         // Create delta components
-        Eigen::Map<const Eigen::Matrix<double, 7, 1>> delta_vec(delta);
+        Eigen::Map<const Eigen::Vector<double, Eigen::Dynamic>> delta_vec(delta, TangentSize());
         
         // Extract delta rotation (first 3 elements) and create quaternion
         Eigen::Vector3d omega = delta_vec.head<3>();
@@ -157,8 +138,17 @@ public:
         // Scale update: s' = s * exp(ds)
         double s_plus = s * exp(ds);
         
+        // Check for stability - sometimes optimization can explode
+        if (!std::isfinite(s_plus)) s_plus = s;
+        
         // Translation update: t' = t + dt
         Eigen::Vector3d t_plus = t + dt;
+        
+        // Check for stability
+        for (int i = 0; i < 3; i++) {
+            if (!std::isfinite(t_plus[i])) t_plus[i] = t[i];
+            if (std::abs(t_plus[i]) > 1e10) t_plus[i] = t[i]; // Avoid extreme values
+        }
         
         // Store the updated values
         x_plus_delta[0] = t_plus.x();
@@ -368,13 +358,11 @@ private:
     double information_factor_;
 };
 
-class EssentialGraphOptimizer {
+class TrajectoryOptimizer {
 public:
     // Constructor
-    EssentialGraphOptimizer() 
+    TrajectoryOptimizer() 
         : current_kf_id(0), loop_kf_id(1), init_kf_id(0) {}
-    
-    // Main loading functions
     
     // Load keyframe trajectory
     bool LoadTrajectory(const std::string& filename) {
@@ -441,8 +429,6 @@ public:
             return false;
         }
         
-        loop_constraints_.clear();
-        
         std::string line;
         while (std::getline(file, line)) {
             if (line.empty() || line[0] == '#') continue;
@@ -483,7 +469,7 @@ public:
         }
         
         file.close();
-        std::cout << "Loaded " << loop_constraints_.size() << " loop constraints from " << filename << std::endl;
+        std::cout << "Loaded " << loop_constraints_.size() << " loop constraints" << std::endl;
         return !loop_constraints_.empty();
     }
     
@@ -510,8 +496,6 @@ public:
                     if (keyframes_.find(source_id) != keyframes_.end() && 
                         keyframes_.find(target_id) != keyframes_.end()) {
                         keyframes_[source_id].parent_id = target_id;
-                        keyframes_[source_id].parent = &keyframes_[target_id];
-                        
                         spanning_tree_edges_.push_back(std::make_pair(source_id, target_id));
                     }
                 } else if (edge_type == "COVISIBILITY") {
@@ -519,11 +503,10 @@ public:
                     if (keyframes_.find(source_id) != keyframes_.end() && 
                         keyframes_.find(target_id) != keyframes_.end()) {
                         keyframes_[source_id].covisible_keyframes[target_id] = weight;
-                        
                         covisibility_edges_.push_back(std::make_tuple(source_id, target_id, weight));
                     }
                 } else if (edge_type == "LOOP") {
-                    // Add loop relationship (already handled in LoadLoopConstraints)
+                    // Add loop relationship
                     if (keyframes_.find(source_id) != keyframes_.end() && 
                         keyframes_.find(target_id) != keyframes_.end()) {
                         keyframes_[source_id].loop_edges.insert(target_id);
@@ -536,7 +519,7 @@ public:
         file.close();
         std::cout << "Loaded essential graph with " << spanning_tree_edges_.size() 
                   << " spanning tree edges and " << covisibility_edges_.size() 
-                  << " covisibility edges from " << filename << std::endl;
+                  << " covisibility edges" << std::endl;
         return true;
     }
     
@@ -567,53 +550,7 @@ public:
         }
         
         file.close();
-        std::cout << "Loaded " << connection_changes_.size() << " connection changes from " << filename << std::endl;
-        return true;
-    }
-    
-    // Load manual connections file
-    bool LoadConnections(const std::string& filename) {
-        std::ifstream file(filename);
-        if (!file.is_open()) {
-            std::cerr << "Failed to open connections file: " << filename << std::endl;
-            return false;
-        }
-        
-        std::string line;
-        while (std::getline(file, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            
-            std::istringstream iss(line);
-            int source_id, target_id;
-            double weight;
-            int is_loop;
-            
-            if (iss >> source_id >> target_id >> weight >> is_loop) {
-                if (is_loop == 1) {
-                    // This is a loop edge
-                    if (keyframes_.find(source_id) != keyframes_.end() && 
-                        keyframes_.find(target_id) != keyframes_.end()) {
-                        keyframes_[source_id].loop_edges.insert(target_id);
-                        keyframes_[target_id].loop_edges.insert(source_id);
-                        
-                        // Add to loop connections
-                        loop_connections_[source_id].insert(target_id);
-                        loop_connections_[target_id].insert(source_id);
-                    }
-                } else {
-                    // Regular covisibility
-                    if (keyframes_.find(source_id) != keyframes_.end() && 
-                        keyframes_.find(target_id) != keyframes_.end()) {
-                        keyframes_[source_id].covisible_keyframes[target_id] = weight;
-                        
-                        covisibility_edges_.push_back(std::make_tuple(source_id, target_id, weight));
-                    }
-                }
-            }
-        }
-        
-        file.close();
-        std::cout << "Loaded connections from " << filename << std::endl;
+        std::cout << "Loaded " << connection_changes_.size() << " connection changes" << std::endl;
         return true;
     }
     
@@ -657,43 +594,8 @@ public:
         }
         
         file.close();
-        std::cout << "Loaded " << non_corrected_sim3_.size() << " Sim3 transformations from " << filename << std::endl;
+        std::cout << "Loaded " << non_corrected_sim3_.size() << " Sim3 transformations" << std::endl;
         return !non_corrected_sim3_.empty();
-    }
-    
-    // Load map points
-    bool LoadMapPoints(const std::string& filename) {
-        std::ifstream file(filename);
-        if (!file.is_open()) {
-            std::cerr << "Failed to open map points file: " << filename << std::endl;
-            return false;
-        }
-        
-        map_points_.clear();
-        
-        std::string line;
-        while (std::getline(file, line)) {
-            if (line.empty() || line[0] == '#') continue;
-            
-            std::istringstream iss(line);
-            int id, ref_kf_id;
-            double x, y, z;
-            int is_bad = 0;
-            
-            if (iss >> id >> x >> y >> z >> ref_kf_id >> is_bad) {
-                MapPoint mp;
-                mp.id = id;
-                mp.position = Eigen::Vector3d(x, y, z);
-                mp.reference_kf_id = ref_kf_id;
-                mp.is_bad = (is_bad == 1);
-                
-                map_points_[id] = mp;
-            }
-        }
-        
-        file.close();
-        std::cout << "Loaded " << map_points_.size() << " map points from " << filename << std::endl;
-        return !map_points_.empty();
     }
     
     // Load loop info
@@ -723,8 +625,6 @@ public:
                     current_kf_id = std::stoi(value);
                 } else if (key == "MATCHED_KF_ID") {
                     loop_kf_id = std::stoi(value);
-                } else if (key == "MAP_ID") {
-                    // Map ID, usually 0
                 } else if (key == "FIXED_SCALE") {
                     // Store in optimization parameters
                     optimization_params["FIXED_SCALE"] = value;
@@ -782,7 +682,7 @@ public:
         // Create parameter blocks for all keyframes
         std::map<int, double*> sim3_blocks;
         std::map<int, Sim3> vScw;  // Original Sim3 (similar to ORB-SLAM3)
-        std::map<int, Sim3> vCorrectedSwc;  // Corrected inverse Sim3 (for map point correction)
+        std::map<int, Sim3> vCorrectedSwc;  // Corrected inverse Sim3
         
         // The minimum number of common features to create an edge
         const int minFeat = 100;  // Same as in ORB-SLAM3
@@ -836,7 +736,7 @@ public:
             ceres::Manifold* manifold = new Sim3Manifold(fix_scale);
             problem.AddParameterBlock(sim3_block, 8, manifold);
             
-            // Fix the initial keyframe
+            // Fix the initial keyframe and loop keyframe
             if (id == init_kf_id || id == loop_kf_id) {
                 problem.SetParameterBlockConstant(sim3_block);
             }
@@ -1055,6 +955,12 @@ public:
         // Critical: Set initial trust region radius to match g2o's lambda
         options.initial_trust_region_radius = 1e-16;
         
+        // Add stability settings
+        options.function_tolerance = 1e-6;
+        options.parameter_tolerance = 1e-8;
+        options.gradient_tolerance = 1e-10;
+        options.max_num_consecutive_invalid_steps = 5;
+        
         // Solve the optimization problem
         std::cout << "Optimizing..." << std::endl;
         ceres::Solver::Summary summary;
@@ -1063,7 +969,7 @@ public:
         std::cout << summary.BriefReport() << std::endl;
         
         // Update keyframes with the optimized values
-        std::cout << "Updating keyframes and map points..." << std::endl;
+        std::cout << "Updating keyframes..." << std::endl;
         for (auto& kf_pair : keyframes_) {
             int id = kf_pair.first;
             KeyFrame& kf = kf_pair.second;
@@ -1079,49 +985,34 @@ public:
             q.normalize();
             double s = sim3_block[7];
             
-            // Store the corrected inverse Sim3 for map point correction
-            Sim3 CorrectedSiw(q, t, s);
-            vCorrectedSwc[id] = CorrectedSiw.inverse();
+            // Sanity check for extreme values or NaNs
+            bool has_nan = false;
+            bool has_extreme = false;
+            
+            for (int i = 0; i < 3; i++) {
+                if (!std::isfinite(t[i])) {
+                    has_nan = true;
+                    break;
+                }
+                if (std::abs(t[i]) > 1e10) {
+                    has_extreme = true;
+                    break;
+                }
+            }
+            
+            // Skip this keyframe if values are extreme
+            if (has_nan || has_extreme || !std::isfinite(s) || s <= 0) {
+                std::cerr << "Warning: Extreme values detected for KF " << id << ", skipping update" << std::endl;
+                continue;
+            }
             
             // Update keyframe pose - convert to SE3 by dividing translation by scale
             kf.rotation = q;
             kf.position = t / s;
         }
         
-        // Update map points
-        for (auto& mp_pair : map_points_) {
-            MapPoint& mp = mp_pair.second;
-            
-            if (mp.is_bad) continue;
-            
-            // Get reference keyframe
-            int ref_kf_id = mp.reference_kf_id;
-            
-            // Check if this point was corrected by the current KF
-            int nIDr;
-            if (mp.corrected_by_kf == current_kf_id) {
-                nIDr = mp.corrected_reference;
-            } else {
-                nIDr = ref_kf_id;
-            }
-            
-            // Skip if ref KF not found in sim3 maps
-            if (vScw.find(nIDr) == vScw.end() || vCorrectedSwc.find(nIDr) == vCorrectedSwc.end()) continue;
-            
-            // Get original and corrected Sim3 transforms
-            Sim3 Srw = vScw[nIDr];
-            Sim3 correctedSwr = vCorrectedSwc[nIDr];
-            
-            // Transform the point: world -> reference KF -> corrected world
-            Eigen::Vector3d eigP3Dw = mp.position;
-            Eigen::Vector3d eigCorrectedP3Dw = correctedSwr.map(Srw.map(eigP3Dw));
-            
-            // Update map point position
-            mp.position = eigCorrectedP3Dw;
-        }
-        
         // Save the optimized trajectory
-        SaveOptimizedData(output_file);
+        SaveOptimizedTrajectory(output_file);
         
         // Clean up
         for (auto& block_pair : sim3_blocks) {
@@ -1132,8 +1023,8 @@ public:
         return true;
     }
     
-    // Save optimized data
-    void SaveOptimizedData(const std::string& output_file) {
+    // Save optimized trajectory
+    void SaveOptimizedTrajectory(const std::string& output_file) {
         // Save trajectory file
         std::ofstream file(output_file);
         if (!file.is_open()) {
@@ -1156,6 +1047,20 @@ public:
         for (int id : sorted_ids) {
             const KeyFrame& kf = keyframes_[id];
             
+            // Sanity check for output
+            bool has_nan = false;
+            for (int i = 0; i < 3; i++) {
+                if (!std::isfinite(kf.position[i])) {
+                    has_nan = true;
+                    break;
+                }
+            }
+            
+            if (has_nan) {
+                std::cerr << "Warning: KF " << id << " has NaN values, skipping in output" << std::endl;
+                continue;
+            }
+            
             file << id << " " 
                  << std::fixed << std::setprecision(9) << kf.timestamp << " "
                  << std::fixed << std::setprecision(6)
@@ -1170,38 +1075,10 @@ public:
         
         file.close();
         std::cout << "Saved optimized trajectory to: " << output_file << std::endl;
-        
-        // Save map points if available
-        if (!map_points_.empty()) {
-            std::string mp_file = output_file.substr(0, output_file.find_last_of('.')) + "_mappoints.txt";
-            std::ofstream mp_out(mp_file);
-            
-            if (mp_out.is_open()) {
-                mp_out << "# id x y z ref_kf_id is_bad" << std::endl;
-                
-                for (const auto& mp_pair : map_points_) {
-                    const MapPoint& mp = mp_pair.second;
-                    
-                    if (!mp.is_bad) {
-                        mp_out << mp.id << " " 
-                               << std::fixed << std::setprecision(6)
-                               << mp.position.x() << " " 
-                               << mp.position.y() << " " 
-                               << mp.position.z() << " "
-                               << mp.reference_kf_id << " " 
-                               << "0" << std::endl;
-                    }
-                }
-                
-                mp_out.close();
-                std::cout << "Saved optimized map points to: " << mp_file << std::endl;
-            }
-        }
     }
     
     // Data storage
     std::map<int, KeyFrame> keyframes_;
-    std::map<int, MapPoint> map_points_;
     std::map<int, Sim3> non_corrected_sim3_;
     std::map<int, Sim3> corrected_sim3_;
     std::map<int, std::set<int>> loop_connections_;
@@ -1229,13 +1106,18 @@ int main(int argc, char** argv) {
     
     // Create output directory if it doesn't exist
     std::string output_dir = output_file.substr(0, output_file.find_last_of('/'));
-    struct stat st = {0};
-    if (stat(output_dir.c_str(), &st) == -1) {
-        mkdir(output_dir.c_str(), 0755);
+    struct stat info;
+    if (stat(output_dir.c_str(), &info) != 0) {
+        // Directory doesn't exist, create it
+        #ifdef _WIN32
+            _mkdir(output_dir.c_str());
+        #else
+            mkdir(output_dir.c_str(), 0755);
+        #endif
     }
     
     // Create the optimizer
-    EssentialGraphOptimizer optimizer;
+    TrajectoryOptimizer optimizer;
     
     // Load input data
     std::cout << "Loading input data..." << std::endl;
@@ -1266,16 +1148,13 @@ int main(int argc, char** argv) {
     
     // Load Connections (if available)
     try {
-        optimizer.LoadConnections(input_dir + "/connections.txt");
+        std::ifstream test_file(input_dir + "/connections.txt");
+        if (test_file.is_open()) {
+            test_file.close();
+            optimizer.LoadConnectionChanges(input_dir + "/connections.txt");
+        }
     } catch (const std::exception& e) {
         std::cout << "No connections.txt file available (this is optional)" << std::endl;
-    }
-    
-    // Try to load MapPoints (if available)
-    try {
-        optimizer.LoadMapPoints(input_dir + "/pre/mappoints_no_loop.txt");
-    } catch (const std::exception& e) {
-        std::cout << "No map points file available (this is optional)" << std::endl;
     }
     
     // Run the optimization
