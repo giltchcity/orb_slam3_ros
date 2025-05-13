@@ -9,7 +9,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <ceres/ceres.h>
-// 尝试版但是不行
+
 // Forward declarations
 class KeyFrame;
 class MapPoint;
@@ -127,6 +127,208 @@ private:
     std::vector<MapPoint*> mvpMapPoints;
 };
 
+// Custom manifold for SE3 in Ceres 2.2
+class SE3Manifold : public ceres::Manifold {
+public:
+    virtual ~SE3Manifold() {}
+
+    // Plus operation for SE3: x_plus_delta = Plus(x, delta)
+    virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const {
+        // Extract the current state
+        Eigen::Map<const Eigen::Vector3d> rotation(x);
+        Eigen::Map<const Eigen::Vector3d> translation(x + 3);
+        
+        // Extract the delta
+        Eigen::Map<const Eigen::Vector3d> delta_rot(delta);
+        Eigen::Map<const Eigen::Vector3d> delta_trans(delta + 3);
+        
+        // Get rotation matrices
+        Eigen::AngleAxisd curr_rot_aa;
+        if (rotation.norm() < 1e-8) {
+            curr_rot_aa = Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitX());
+        } else {
+            curr_rot_aa = Eigen::AngleAxisd(rotation.norm(), rotation.normalized());
+        }
+        Eigen::Matrix3d current_rot = curr_rot_aa.toRotationMatrix();
+        
+        Eigen::AngleAxisd delta_rot_aa;
+        if (delta_rot.norm() < 1e-8) {
+            delta_rot_aa = Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitX());
+        } else {
+            delta_rot_aa = Eigen::AngleAxisd(delta_rot.norm(), delta_rot.normalized());
+        }
+        Eigen::Matrix3d delta_rot_mat = delta_rot_aa.toRotationMatrix();
+        
+        // Apply the delta
+        Eigen::Matrix3d result_rot_mat = delta_rot_mat * current_rot;
+        Eigen::Vector3d result_trans = delta_rot_mat * translation + delta_trans;
+        
+        // Convert back to angle-axis representation
+        Eigen::AngleAxisd result_rot_aa(result_rot_mat);
+        
+        // Store the results
+        Eigen::Map<Eigen::Vector3d> result_rot(x_plus_delta);
+        Eigen::Map<Eigen::Vector3d> result_trans(x_plus_delta + 3);
+        
+        if (result_rot_aa.angle() < 1e-10) {
+            result_rot.setZero();
+        } else {
+            result_rot = result_rot_aa.angle() * result_rot_aa.axis();
+        }
+        result_trans = result_trans;
+        
+        return true;
+    }
+
+    // PlusJacobian replaces ComputeJacobian in Ceres 2.2
+    virtual bool PlusJacobian(const double* x, double* jacobian) const {
+        // For SE3, Jacobian is 6x6
+        Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> J(jacobian);
+        J.setZero();
+        
+        // Rotation block: identity for small changes
+        J.block<3, 3>(0, 0).setIdentity();
+        
+        // Translation block: identity
+        J.block<3, 3>(3, 3).setIdentity();
+        
+        // Cross-term: rotation affects translation
+        Eigen::Map<const Eigen::Vector3d> angleAxis(x);
+        
+        Eigen::AngleAxisd aa;
+        if (angleAxis.norm() < 1e-8) {
+            aa = Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitX());
+        } else {
+            aa = Eigen::AngleAxisd(angleAxis.norm(), angleAxis.normalized());
+        }
+        
+        Eigen::Matrix3d R = aa.toRotationMatrix();
+        
+        Eigen::Map<const Eigen::Vector3d> t(x + 3);
+        Eigen::Matrix3d skew;
+        skew << 0, -t(2), t(1),
+                t(2), 0, -t(0),
+                -t(1), t(0), 0;
+                
+        J.block<3, 3>(3, 0) = -R * skew;
+        
+        return true;
+    }
+    
+    // Minus operation for SE3: y_minus_x = Minus(y, x)
+    virtual bool Minus(const double* y, const double* x, double* y_minus_x) const {
+        // y and x are [angle-axis (3), translation (3)]
+        // y_minus_x is the tangent space difference [rotation_diff (3), translation_diff (3)]
+        
+        // Convert to SE3 matrices
+        Eigen::Map<const Eigen::Vector3d> x_aa(x);
+        Eigen::Map<const Eigen::Vector3d> x_t(x + 3);
+        Eigen::Map<const Eigen::Vector3d> y_aa(y);
+        Eigen::Map<const Eigen::Vector3d> y_t(y + 3);
+        
+        // Convert angle-axis to rotation matrices with safety checks
+        Eigen::AngleAxisd x_rotation;
+        if (x_aa.norm() < 1e-8) {
+            x_rotation = Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitX());
+        } else {
+            x_rotation = Eigen::AngleAxisd(x_aa.norm(), x_aa.normalized());
+        }
+        
+        Eigen::AngleAxisd y_rotation;
+        if (y_aa.norm() < 1e-8) {
+            y_rotation = Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitX());
+        } else {
+            y_rotation = Eigen::AngleAxisd(y_aa.norm(), y_aa.normalized());
+        }
+        
+        Eigen::Matrix3d R_x = x_rotation.toRotationMatrix();
+        Eigen::Matrix3d R_y = y_rotation.toRotationMatrix();
+        
+        // Compute the relative rotation R_rel = R_y * R_x^T
+        Eigen::Matrix3d R_rel = R_y * R_x.transpose();
+        
+        // Convert back to angle-axis representation
+        Eigen::AngleAxisd aa_rel(R_rel);
+        Eigen::Map<Eigen::Vector3d> result_aa(y_minus_x);
+        
+        if (aa_rel.angle() < 1e-10) {
+            result_aa.setZero();
+        } else {
+            result_aa = aa_rel.angle() * aa_rel.axis();
+        }
+        
+        // Compute the relative translation: R_x^T * (y_t - x_t)
+        Eigen::Map<Eigen::Vector3d> result_t(y_minus_x + 3);
+        result_t = R_x.transpose() * (y_t - x_t);
+        
+        return true;
+    }
+    
+    // MinusJacobian computes the derivative of Minus(y, x) with respect to x
+    virtual bool MinusJacobian(const double* x, double* jacobian) const {
+        // Compute the Jacobian of y_minus_x with respect to x
+        Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> J(jacobian);
+        J.setZero();
+        
+        // For small perturbations, we can approximate with negative identity for rotations
+        J.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity();
+        
+        // Convert angle-axis to rotation matrix with safety check
+        Eigen::Map<const Eigen::Vector3d> x_aa(x);
+        Eigen::AngleAxisd aa;
+        if (x_aa.norm() < 1e-8) {
+            aa = Eigen::AngleAxisd(0.0, Eigen::Vector3d::UnitX());
+        } else {
+            aa = Eigen::AngleAxisd(x_aa.norm(), x_aa.normalized());
+        }
+        
+        Eigen::Matrix3d R_x = aa.toRotationMatrix();
+        
+        // For translation, we need -R_x^T
+        J.block<3, 3>(3, 3) = -R_x.transpose();
+        
+        // Cross-term: Translation is affected by rotation
+        Eigen::Map<const Eigen::Vector3d> t(x + 3);
+        Eigen::Matrix3d skew;
+        skew << 0, -t(2), t(1),
+                t(2), 0, -t(0),
+                -t(1), t(0), 0;
+                
+        // Note: This is an approximation for small angle changes
+        J.block<3, 3>(3, 0) = R_x.transpose() * skew;
+        
+        return true;
+    }
+
+    virtual bool RightMultiplyByPlusJacobian(const double* x, 
+                                           const int num_rows,
+                                           const double* ambient_matrix,
+                                           double* tangent_matrix) const {
+        // This method computes tangent_matrix = ambient_matrix * plus_jacobian
+        // where plus_jacobian is the Jacobian of Plus(x, delta) with respect to delta
+        
+        // We'll use the default implementation provided by ceres::Manifold
+        double* plus_jacobian = new double[6 * 6];
+        PlusJacobian(x, plus_jacobian);
+        
+        // Perform the matrix multiplication
+        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, 6, Eigen::RowMajor>> 
+            ambient(ambient_matrix, num_rows, 6);
+        Eigen::Map<const Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> 
+            jacobian(plus_jacobian, 6, 6);
+        Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 6, Eigen::RowMajor>> 
+            tangent(tangent_matrix, num_rows, 6);
+        
+        tangent = ambient * jacobian;
+        
+        delete[] plus_jacobian;
+        return true;
+    }
+
+    virtual int AmbientSize() const { return 6; }  // Renamed from GlobalSize in Ceres 2.2
+    virtual int TangentSize() const { return 6; }  // Renamed from LocalSize in Ceres 2.2
+};
+
 // Stabilized angle-axis conversion for better numerical stability
 template <typename T>
 void StabilizedRotationToMatrix(const T* angle_axis, T* R) {
@@ -237,165 +439,6 @@ struct SE3EdgeCostFunction {
     double weight_;
 };
 
-// Custom manifold for SE3 in Ceres 2.2
-class SE3Manifold : public ceres::Manifold {
-public:
-    virtual ~SE3Manifold() {}
-
-    // Plus operation for SE3: x_plus_delta = Plus(x, delta)
-    virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const {
-        // x is [angle-axis (3), translation (3)]
-        // delta is [angle-axis delta (3), translation delta (3)]
-        // x_plus_delta is the result
-        
-        // Handle rotation (angle-axis)
-        Eigen::Map<const Eigen::Vector3d> angleAxis(x);
-        Eigen::Map<const Eigen::Vector3d> delta_angleAxis(delta);
-        Eigen::Map<Eigen::Vector3d> result_angleAxis(x_plus_delta);
-        
-        // Convert to quaternions, multiply, and convert back to angle-axis
-        Eigen::AngleAxisd aa1(angleAxis.norm(), angleAxis.normalized());
-        Eigen::AngleAxisd aa2(delta_angleAxis.norm(), delta_angleAxis.normalized());
-        
-        Eigen::Quaterniond q1(aa1);
-        Eigen::Quaterniond q2(aa2);
-        Eigen::Quaterniond q_res = q2 * q1;
-        
-        Eigen::AngleAxisd aa_res(q_res);
-        result_angleAxis = aa_res.angle() * aa_res.axis();
-        
-        // Handle translation
-        Eigen::Map<const Eigen::Vector3d> translation(x + 3);
-        Eigen::Map<const Eigen::Vector3d> delta_translation(delta + 3);
-        Eigen::Map<Eigen::Vector3d> result_translation(x_plus_delta + 3);
-        
-        // Compute updated translation
-        Eigen::Matrix3d R_delta = aa2.toRotationMatrix();
-        result_translation = R_delta * translation + delta_translation;
-        
-        return true;
-    }
-
-    // PlusJacobian replaces ComputeJacobian in Ceres 2.2
-    virtual bool PlusJacobian(const double* x, double* jacobian) const {
-        // For SE3, Jacobian is 6x6
-        Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> J(jacobian);
-        J.setZero();
-        
-        // Rotation block: identity for small changes
-        J.block<3, 3>(0, 0).setIdentity();
-        
-        // Translation block: identity
-        J.block<3, 3>(3, 3).setIdentity();
-        
-        // Cross-term: rotation affects translation
-        Eigen::Map<const Eigen::Vector3d> angleAxis(x);
-        Eigen::AngleAxisd aa(angleAxis.norm(), angleAxis.normalized());
-        Eigen::Matrix3d R = aa.toRotationMatrix();
-        
-        Eigen::Map<const Eigen::Vector3d> t(x + 3);
-        Eigen::Matrix3d skew;
-        skew << 0, -t(2), t(1),
-                t(2), 0, -t(0),
-                -t(1), t(0), 0;
-                
-        J.block<3, 3>(3, 0) = -R * skew;
-        
-        return true;
-    }
-    
-    // Minus operation for SE3: y_minus_x = Minus(y, x)
-    virtual bool Minus(const double* y, const double* x, double* y_minus_x) const {
-        // y and x are [angle-axis (3), translation (3)]
-        // y_minus_x is the tangent space difference [rotation_diff (3), translation_diff (3)]
-        
-        // Convert to SE3 matrices
-        Eigen::Map<const Eigen::Vector3d> x_aa(x);
-        Eigen::Map<const Eigen::Vector3d> x_t(x + 3);
-        Eigen::Map<const Eigen::Vector3d> y_aa(y);
-        Eigen::Map<const Eigen::Vector3d> y_t(y + 3);
-        
-        // Convert angle-axis to rotation matrices
-        Eigen::AngleAxisd x_rotation(x_aa.norm(), x_aa.normalized());
-        Eigen::AngleAxisd y_rotation(y_aa.norm(), y_aa.normalized());
-        
-        Eigen::Matrix3d R_x = x_rotation.toRotationMatrix();
-        Eigen::Matrix3d R_y = y_rotation.toRotationMatrix();
-        
-        // Compute the relative rotation R_rel = R_y * R_x^T
-        Eigen::Matrix3d R_rel = R_y * R_x.transpose();
-        
-        // Convert back to angle-axis representation
-        Eigen::AngleAxisd aa_rel(R_rel);
-        Eigen::Map<Eigen::Vector3d> result_aa(y_minus_x);
-        result_aa = aa_rel.angle() * aa_rel.axis();
-        
-        // Compute the relative translation: R_x^T * (y_t - x_t)
-        Eigen::Map<Eigen::Vector3d> result_t(y_minus_x + 3);
-        result_t = R_x.transpose() * (y_t - x_t);
-        
-        return true;
-    }
-    
-    // MinusJacobian computes the derivative of Minus(y, x) with respect to x
-    virtual bool MinusJacobian(const double* x, double* jacobian) const {
-        // Compute the Jacobian of y_minus_x with respect to x
-        Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> J(jacobian);
-        J.setZero();
-        
-        // For small perturbations, we can approximate with negative identity for rotations
-        J.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity();
-        
-        // Convert angle-axis to rotation matrix
-        Eigen::Map<const Eigen::Vector3d> x_aa(x);
-        Eigen::AngleAxisd aa(x_aa.norm(), x_aa.normalized());
-        Eigen::Matrix3d R_x = aa.toRotationMatrix();
-        
-        // For translation, we need -R_x^T
-        J.block<3, 3>(3, 3) = -R_x.transpose();
-        
-        // Cross-term: Translation is affected by rotation
-        Eigen::Map<const Eigen::Vector3d> t(x + 3);
-        Eigen::Matrix3d skew;
-        skew << 0, -t(2), t(1),
-                t(2), 0, -t(0),
-                -t(1), t(0), 0;
-                
-        // Note: This is an approximation for small angle changes
-        J.block<3, 3>(3, 0) = R_x.transpose() * skew;
-        
-        return true;
-    }
-
-    virtual bool RightMultiplyByPlusJacobian(const double* x, 
-                                           const int num_rows,
-                                           const double* ambient_matrix,
-                                           double* tangent_matrix) const {
-        // This method computes tangent_matrix = ambient_matrix * plus_jacobian
-        // where plus_jacobian is the Jacobian of Plus(x, delta) with respect to delta
-        
-        // We'll use the default implementation provided by ceres::Manifold
-        double* plus_jacobian = new double[6 * 6];
-        PlusJacobian(x, plus_jacobian);
-        
-        // Perform the matrix multiplication
-        Eigen::Map<const Eigen::Matrix<double, Eigen::Dynamic, 6, Eigen::RowMajor>> 
-            ambient(ambient_matrix, num_rows, 6);
-        Eigen::Map<const Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> 
-            jacobian(plus_jacobian, 6, 6);
-        Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, 6, Eigen::RowMajor>> 
-            tangent(tangent_matrix, num_rows, 6);
-        
-        tangent = ambient * jacobian;
-        
-        delete[] plus_jacobian;
-        return true;
-    }
-
-    virtual int AmbientSize() const { return 6; }  // Renamed from GlobalSize in Ceres 2.2
-    virtual int TangentSize() const { return 6; }  // Renamed from LocalSize in Ceres 2.2
-};
-
 // Function to save trajectory to a file
 void SaveTrajectory(const std::string& filename, const std::vector<KeyFrame*>& vpKFs, 
                     const std::vector<double*>& vPoseParams = std::vector<double*>()) {
@@ -456,6 +499,44 @@ void SaveTrajectory(const std::string& filename, const std::vector<KeyFrame*>& v
     std::cout << "Saved trajectory to " << filename << std::endl;
 }
 
+// Helper function to print parameter statistics
+void PrintParamStats(const std::vector<double*>& vPoseParams, size_t n) {
+    double max_rot = 0.0, max_trans = 0.0;
+    double avg_rot = 0.0, avg_trans = 0.0;
+    int count = 0;
+    
+    for(size_t i = 0; i < vPoseParams.size() && count < n; i++) {
+        if(vPoseParams[i]) {
+            double* params = vPoseParams[i];
+            double rot_norm = sqrt(params[0]*params[0] + params[1]*params[1] + params[2]*params[2]);
+            double trans_norm = sqrt(params[3]*params[3] + params[4]*params[4] + params[5]*params[5]);
+            
+            max_rot = std::max(max_rot, rot_norm);
+            max_trans = std::max(max_trans, trans_norm);
+            avg_rot += rot_norm;
+            avg_trans += trans_norm;
+            count++;
+            
+            if(count < 10) {  // Print some samples
+                std::cout << "Param[" << i << "]: Rot=" 
+                          << params[0] << "," << params[1] << "," << params[2] 
+                          << " |r|=" << rot_norm << " Trans="
+                          << params[3] << "," << params[4] << "," << params[5]
+                          << " |t|=" << trans_norm << std::endl;
+            }
+        }
+    }
+    
+    if(count > 0) {
+        avg_rot /= count;
+        avg_trans /= count;
+    }
+    
+    std::cout << "Parameter statistics (n=" << count << "):" << std::endl;
+    std::cout << "  Rotation - Max: " << max_rot << ", Avg: " << avg_rot << std::endl;
+    std::cout << "  Translation - Max: " << max_trans << ", Avg: " << avg_trans << std::endl;
+}
+
 // OptimizeEssentialGraphCeres - Ceres 2.2 implementation of OptimizeEssentialGraph
 void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
                                  const KeyFrameAndPose& NonCorrectedSE3,
@@ -470,14 +551,23 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     std::string initialTrajectoryFile = outputDir + "step1_initial_trajectory.txt";
     std::string optimizedTrajectoryFile = outputDir + "step2_optimized_trajectory.txt";
     
+    // Save initial trajectory for comparison
+    SaveTrajectory(initialTrajectoryFile, pMap->GetAllKeyFrames());
+    
     // Setup CERES optimizer - similar to g2o setup in original code
     ceres::Problem problem;
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.minimizer_progress_to_stdout = true;
-    options.max_num_iterations = 20; // Same as original code
-    options.function_tolerance = 1e-6;
-    options.initial_trust_region_radius = 1e-16; // Similar to g2o's lambda init
+    options.max_num_iterations = 50;  // Increased from 20
+    options.function_tolerance = 1e-4;  // Less strict than 1e-6
+    options.gradient_tolerance = 1e-8;  // Less strict
+    options.parameter_tolerance = 1e-8;
+    options.initial_trust_region_radius = 1.0;  // Much larger than 1e-16
+    options.max_trust_region_radius = 1e8;
+    options.min_trust_region_radius = 1e-8;
+    options.use_nonmonotonic_steps = true;  // Allow non-monotonic steps
+    options.max_consecutive_nonmonotonic_steps = 5;
     
     const std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
     const std::vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
@@ -521,15 +611,20 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
             
             // Convert to angle-axis for Ceres
             Eigen::AngleAxisd aa(q);
-            pose_params[0] = aa.angle() * aa.axis()[0];
-            pose_params[1] = aa.angle() * aa.axis()[1];
-            pose_params[2] = aa.angle() * aa.axis()[2];
+            double angle = aa.angle();
+            Eigen::Vector3d axis = aa.axis();
+            
+            pose_params[0] = angle * axis[0];
+            pose_params[1] = angle * axis[1];
+            pose_params[2] = angle * axis[2];
             pose_params[3] = t[0];
             pose_params[4] = t[1];
             pose_params[5] = t[2];
             
             if(nIDi == pLoopKF->mnId || nIDi == pCurKF->mnId) {
                 std::cout << "Important KF " << nIDi << " found in CorrectedSE3" << std::endl;
+                std::cout << "  Angle-axis: " << pose_params[0] << ", " << pose_params[1] << ", " << pose_params[2] << std::endl;
+                std::cout << "  Translation: " << pose_params[3] << ", " << pose_params[4] << ", " << pose_params[5] << std::endl;
             }
         } else {
             // If not found, use current keyframe pose (exactly like original code)
@@ -551,9 +646,12 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
             
             // Convert to angle-axis for Ceres
             Eigen::AngleAxisd aa(q);
-            pose_params[0] = aa.angle() * aa.axis()[0];
-            pose_params[1] = aa.angle() * aa.axis()[1];
-            pose_params[2] = aa.angle() * aa.axis()[2];
+            double angle = aa.angle();
+            Eigen::Vector3d axis = aa.axis();
+            
+            pose_params[0] = angle * axis[0];
+            pose_params[1] = angle * axis[1];
+            pose_params[2] = angle * axis[2];
             pose_params[3] = tcw_d[0];
             pose_params[4] = tcw_d[1];
             pose_params[5] = tcw_d[2];
@@ -563,6 +661,8 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
                 if(pKF == pLoopKF) std::cout << "LoopKF";
                 if(pKF == pCurKF) std::cout << "CurKF";
                 std::cout << ") not in CorrectedSE3, using current pose" << std::endl;
+                std::cout << "  Angle-axis: " << pose_params[0] << ", " << pose_params[1] << ", " << pose_params[2] << std::endl;
+                std::cout << "  Translation: " << pose_params[3] << ", " << pose_params[4] << ", " << pose_params[5] << std::endl;
             }
         }
         
@@ -580,17 +680,8 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     
     std::cout << "All parameter blocks created successfully" << std::endl;
     
-    // The rest of the implementation will be completed later
-    // This includes:
-    // - Adding loop edges
-    // - Adding spanning tree edges
-    // - Adding existing loop edges
-    // - Adding covisibility graph edges
-    // - Running the optimization
-    // - Updating poses and map points
-
-    // As requested, we've completed approximately the first 100 lines of the function
-    // The rest will be implemented based on your further directions
+    // Print parameter statistics
+    PrintParamStats(vPoseParams, 20);
     
     // ===== 添加回环连接边 =====
     std::cout << "Step 2: Adding loop connection edges..." << std::endl;
@@ -635,12 +726,15 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
             
             Eigen::Matrix3d R_ji = q_ji.toRotationMatrix();
             
-            // 添加边约束
-            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 1.0);
-            problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_j);
+            // 添加边约束，包含鲁棒核函数
+            ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
+            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 10.0);  // 调整权重
+            problem.AddResidualBlock(edge_se3, loss_function, poseParams_i, poseParams_j);
             
             loopConnectionEdgeCount++;
             sInsertedEdges.insert(std::make_pair(std::min(nIDi, nIDj), std::max(nIDi, nIDj)));
+            
+            std::cout << "Added loop connection edge: " << nIDi << " - " << nIDj << std::endl;
         }
     }
     std::cout << "Added " << loopConnectionEdgeCount << " loop connection edges" << std::endl;
@@ -703,11 +797,16 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
             
             Eigen::Matrix3d R_ji = q_ji.toRotationMatrix();
             
-            // 添加边约束
+            // 添加边约束，包含鲁棒核函数
+            ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
             ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 100.0);  // 权重较高
-            problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_j);
+            problem.AddResidualBlock(edge_se3, loss_function, poseParams_i, poseParams_j);
             
             spanningEdgeCount++;
+            
+            if(spanningEdgeCount < 5) {
+                std::cout << "Added spanning tree edge: " << nIDi << " - " << nIDj << std::endl;
+            }
         }
         
         // ===== 添加现有回环边 =====
@@ -735,9 +834,10 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
                 
                 Eigen::Matrix3d R_li = q_li.toRotationMatrix();
                 
-                // 添加边约束
+                // 添加边约束，包含鲁棒核函数
+                ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
                 ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_li, t_li, 10.0);  // 权重适中
-                problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_l);
+                problem.AddResidualBlock(edge_se3, loss_function, poseParams_i, poseParams_l);
                 
                 existingLoopEdgeCount++;
             }
@@ -774,10 +874,11 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
                     
                     Eigen::Matrix3d R_ni = q_ni.toRotationMatrix();
                     
-                    // 添加边约束 - 权重基于共视关系
+                    // 添加边约束 - 权重基于共视关系，包含鲁棒核函数
                     double weight = pKF->GetWeight(pKFn) * 0.1;  // 适当缩放权重
+                    ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
                     ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ni, t_ni, weight);
-                    problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_n);
+                    problem.AddResidualBlock(edge_se3, loss_function, poseParams_i, poseParams_n);
                     
                     covisibilityEdgeCount++;
                     sInsertedEdges.insert(std::make_pair(std::min(pKF->mnId, pKFn->mnId), 
@@ -809,9 +910,10 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
             
             Eigen::Matrix3d R_pi = q_pi.toRotationMatrix();
             
-            // 添加边约束
+            // 添加边约束，包含鲁棒核函数
+            ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
             ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_pi, t_pi, 50.0);  // IMU边权重较高
-            problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_p);
+            problem.AddResidualBlock(edge_se3, loss_function, poseParams_i, poseParams_p);
             
             imuEdgeCount++;
         }
@@ -824,16 +926,57 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     std::cout << "Added " << imuEdgeCount << " IMU edges" << std::endl;
     std::cout << "Total inserted edges: " << sInsertedEdges.size() << std::endl;
     
+    // 测试边约束的残差计算
+    std::cout << "Testing residual computation for sample edges..." << std::endl;
+    double sample_cost = 0.0;
+    std::vector<double> residuals(6);
+    int sample_count = 0;
+    
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad() || !pKF->mpParent || sample_count >= 5) continue;
+        
+        int nIDi = pKF->mnId;
+        int nIDj = pKF->mpParent->mnId;
+        
+        double* params_i = vPoseParams[nIDi];
+        double* params_j = vPoseParams[nIDj];
+        
+        if(!params_i || !params_j) continue;
+        
+        // Get keyframe poses
+        Eigen::Quaterniond q_i = vRotations[nIDi];
+        Eigen::Vector3d t_i = vTranslations[nIDi];
+        Eigen::Quaterniond q_j = vRotations[nIDj];
+        Eigen::Vector3d t_j = vTranslations[nIDj];
+        
+        // Calculate relative transformation
+        Eigen::Quaterniond q_i_inv = q_i.conjugate();
+        Eigen::Quaterniond q_ji = q_j * q_i_inv;
+        Eigen::Vector3d t_ji = t_j - q_j * q_i_inv * t_i;
+        Eigen::Matrix3d R_ji = q_ji.toRotationMatrix();
+        
+        // Create a cost function manually for testing
+        SE3EdgeCostFunction cost_func(R_ji, t_ji, 1.0);
+        bool result = cost_func(params_i, params_j, residuals.data());
+        
+        double block_cost = 0;
+        for(int i = 0; i < 6; i++) {
+            block_cost += residuals[i] * residuals[i];
+        }
+        std::cout << "Edge " << nIDi << "-" << nIDj << " residual norm: " 
+                  << sqrt(block_cost) << " [";
+        for(int i = 0; i < 6; i++) {
+            std::cout << residuals[i] << (i<5 ? ", " : "");
+        }
+        std::cout << "]" << std::endl;
+        
+        sample_cost += block_cost;
+        sample_count++;
+    }
+    std::cout << "Sample cost: " << sample_cost << std::endl;
+    
     // ===== 执行优化 =====
     std::cout << "Step 4: Running optimization..." << std::endl;
-    
-    // 配置求解器选项
-    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.minimizer_progress_to_stdout = true;
-    options.max_num_iterations = 20; // 与原始代码相同
-    options.function_tolerance = 1e-6;
-    options.gradient_tolerance = 1e-10;
-    options.parameter_tolerance = 1e-8;
     
     // 执行优化
     ceres::Solver::Summary summary;
@@ -845,11 +988,62 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     std::cout << "Initial cost: " << summary.initial_cost << std::endl;
     std::cout << "Final cost: " << summary.final_cost << std::endl;
     std::cout << "Change: " << (summary.initial_cost - summary.final_cost) / summary.initial_cost * 100.0 << "%" << std::endl;
-
     
-    // // 保存优化后的轨迹用于验证
-    // SaveTrajectory(optimizedTrajectoryFile, vpKFs, vPoseParams);
+    // Check parameter stats after optimization
+    std::cout << "Parameter statistics after optimization:" << std::endl;
+    PrintParamStats(vPoseParams, 20);
     
+    // 保存优化后的轨迹用于验证
+    SaveTrajectory(optimizedTrajectoryFile, vpKFs, vPoseParams);
+    
+    // 更新Map中KeyFrame的位姿（如果优化成功）
+    if(summary.termination_type != ceres::FAILURE) {
+        std::cout << "Optimization succeeded, updating keyframe poses..." << std::endl;
+        
+        // 遍历所有关键帧，更新位姿
+        for(KeyFrame* pKF : vpKFs) {
+            if(pKF->isBad()) continue;
+            
+            const int nIDi = pKF->mnId;
+            double* pose_params = vPoseParams[nIDi];
+            if(!pose_params) continue;
+            
+            // 从优化后的参数中提取位姿
+            Eigen::Vector3d rot(pose_params[0], pose_params[1], pose_params[2]);
+            Eigen::Vector3d trans(pose_params[3], pose_params[4], pose_params[5]);
+            
+            // 转换为旋转矩阵
+            double angle = rot.norm();
+            Eigen::Matrix3f R;
+            
+            if(angle > 1e-10) {
+                Eigen::Vector3d axis = rot / angle;
+                Eigen::AngleAxisd aa(angle, axis);
+                Eigen::Matrix3d Rcw = aa.toRotationMatrix();
+                R = Rcw.cast<float>();
+            } else {
+                // 几乎没有旋转
+                R = Eigen::Matrix3f::Identity();
+            }
+            
+            // 设置新的位姿
+            Eigen::Vector3f t = trans.cast<float>();
+            pKF->SetPose(R, t);
+        }
+        
+        // 更新MapPoint位置（如果需要）
+        // 注意：这部分代码在完整版中应该实现
+    }
+    
+    // 清理内存
+    for(size_t i = 0; i < vPoseParams.size(); i++) {
+        if(vPoseParams[i]) {
+            delete[] vPoseParams[i];
+        }
+    }
+    delete se3_manifold;
+    
+    std::cout << "OptimizeEssentialGraphCeres completed." << std::endl;
 }
 
 // Main function for testing
@@ -949,7 +1143,7 @@ int main(int /* argc */, char** /* argv */) {
                 Eigen::Matrix3f R = q.toRotationMatrix();
                 Eigen::Vector3f t(tx, ty, tz);
                 
-                pKF->SetPose(R, t);
+                pKF->SetPose(R.inverse(), -R.inverse() * t);
                 poseCount++;
             }
         }
@@ -1167,6 +1361,9 @@ int main(int /* argc */, char** /* argv */) {
                 
                 CorrectedSE3[pKF] = std::make_pair(q, t);
                 cseCount++;
+                
+                std::cout << "CorrectedSE3[" << id << "]: q=(" << qw << "," << qx << "," << qy << "," << qz 
+                          << "), t=(" << tx << "," << ty << "," << tz << "), s=" << s << std::endl;
             }
         }
         
@@ -1264,8 +1461,7 @@ int main(int /* argc */, char** /* argv */) {
     pMap->SetKeyFrames(vpKFs);
     pMap->SetMapPoints(vpMPs);
     
-    // Run OptimizeEssentialGraph with CERES - but only the first 100 lines
-    std::cout << "Starting OptimizeEssentialGraphCeres - First 100 lines only" << std::endl;
+    // Run OptimizeEssentialGraph with CERES
     OptimizeEssentialGraphCeres(pMap, pLoopKF, pCurKF, NonCorrectedSE3, CorrectedSE3, LoopConnections, bFixScale);
     
     // Clean up
