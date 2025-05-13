@@ -121,7 +121,14 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mnCorrectionGBA = 0;
 }
 
-void LoopClosing::SaveOptimizationData(const string& baseDir)
+void LoopClosing::SaveOptimizationData(const string& baseDir, 
+                                      Map* pMap, 
+                                      KeyFrame* pLoopKF, 
+                                      KeyFrame* pCurKF,
+                                      const LoopClosing::KeyFrameAndPose &NonCorrectedSim3,
+                                      const LoopClosing::KeyFrameAndPose &CorrectedSim3,
+                                      const map<KeyFrame *, set<KeyFrame *> > &LoopConnections, 
+                                      const bool &bFixScale)
 {
     // 创建主目录
     string optimDir = baseDir + "/optimization_data/";
@@ -133,8 +140,6 @@ void LoopClosing::SaveOptimizationData(const string& baseDir)
             mkdir(optimDir.c_str(), 0755);
         #endif
     }
-    
-    Map* pMap = mpCurrentKF->GetMap();
     
     // 1. 保存Map基本信息
     ofstream mapFile(optimDir + "map_info.txt");
@@ -153,9 +158,9 @@ void LoopClosing::SaveOptimizationData(const string& baseDir)
     
     // 2. 保存KeyFrame IDs (pLoopKF和pCurKF)
     ofstream kfidsFile(optimDir + "keyframe_ids.txt");
-    kfidsFile << "LOOP_KF_ID " << mpLoopMatchedKF->mnId << endl;
-    kfidsFile << "CURRENT_KF_ID " << mpCurrentKF->mnId << endl;
-    kfidsFile << "FIXED_SCALE " << (mbFixScale ? 1 : 0) << endl;
+    kfidsFile << "LOOP_KF_ID " << pLoopKF->mnId << endl;
+    kfidsFile << "CURRENT_KF_ID " << pCurKF->mnId << endl;
+    kfidsFile << "FIXED_SCALE " << (bFixScale ? 1 : 0) << endl;
     kfidsFile.close();
     
     // 3. 保存所有关键帧数据
@@ -2338,7 +2343,9 @@ void LoopClosing::CorrectLoop()
 #endif
     cout << "Optimize essential graph" << endl;
     // 在调用OptimizeEssentialGraph前保存数据
-    SaveOptimizationData(mSaveDirectory + "loop_" + to_string(mLoopClosureCount));
+    // SaveOptimizationData(mSaveDirectory + "loop_" + to_string(mLoopClosureCount));
+    SaveOptimizationData(loopDir, pLoopMap, mpLoopMatchedKF, mpCurrentKF, 
+                    NonCorrectedSim3, CorrectedSim3, LoopConnections, mbFixScale);
     
     if(pLoopMap->IsInertial() && pLoopMap->isImuInitialized())
     {
