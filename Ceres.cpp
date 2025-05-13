@@ -578,9 +578,6 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
         }
     }
     
-    // Save initial trajectory for verification
-    SaveTrajectory(initialTrajectoryFile, vpKFs, vPoseParams);
-    
     std::cout << "All parameter blocks created successfully" << std::endl;
     
     // The rest of the implementation will be completed later
@@ -594,6 +591,248 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
 
     // As requested, we've completed approximately the first 100 lines of the function
     // The rest will be implemented based on your further directions
+    
+    // ===== 添加回环连接边 =====
+    std::cout << "Step 2: Adding loop connection edges..." << std::endl;
+    int loopConnectionEdgeCount = 0;
+    // 记录插入的边，避免重复
+    std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
+    
+    // 添加回环连接边 - 与原始代码对应
+    for(const auto& mit : LoopConnections) {
+        KeyFrame* pKF = mit.first;
+        const long unsigned int nIDi = pKF->mnId;
+        const std::set<KeyFrame*> &spConnections = mit.second;
+        
+        // 获取关键帧i的位姿
+        double* poseParams_i = vPoseParams[nIDi];
+        if(!poseParams_i) continue;
+    
+        // 获取逆变换 (Swi)
+        Eigen::Quaterniond q_i = vRotations[nIDi];
+        Eigen::Vector3d t_i = vTranslations[nIDi];
+        
+        Eigen::Quaterniond q_i_inv = q_i.conjugate();
+        Eigen::Vector3d t_i_inv = -(q_i_inv * t_i);
+    
+        for(KeyFrame* pKFj : spConnections) {
+            const long unsigned int nIDj = pKFj->mnId;
+            
+            // 根据原始代码的条件判断
+            if((nIDi != pCurKF->mnId || nIDj != pLoopKF->mnId) && pKF->GetWeight(pKFj) < minFeat)
+                continue;
+                
+            double* poseParams_j = vPoseParams[nIDj];
+            if(!poseParams_j) continue;
+            
+            // 获取关键帧j的位姿
+            Eigen::Quaterniond q_j = vRotations[nIDj];
+            Eigen::Vector3d t_j = vTranslations[nIDj];
+            
+            // 计算相对变换 Sji = Sjw * Swi
+            Eigen::Quaterniond q_ji = q_j * q_i_inv;
+            Eigen::Vector3d t_ji = t_j - q_j * q_i_inv * t_i;
+            
+            Eigen::Matrix3d R_ji = q_ji.toRotationMatrix();
+            
+            // 添加边约束
+            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 1.0);
+            problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_j);
+            
+            loopConnectionEdgeCount++;
+            sInsertedEdges.insert(std::make_pair(std::min(nIDi, nIDj), std::max(nIDi, nIDj)));
+        }
+    }
+    std::cout << "Added " << loopConnectionEdgeCount << " loop connection edges" << std::endl;
+    
+    // ===== 添加普通边 =====
+    std::cout << "Step 3: Adding normal edges (spanning tree, existing loops, covisibility)..." << std::endl;
+    int spanningEdgeCount = 0;
+    int existingLoopEdgeCount = 0;
+    int covisibilityEdgeCount = 0;
+    int imuEdgeCount = 0;
+    
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad())
+            continue;
+            
+        const int nIDi = pKF->mnId;
+        double* poseParams_i = vPoseParams[nIDi];
+        if(!poseParams_i) continue;
+        
+        // 获取Swi (逆变换)
+        Eigen::Quaterniond q_i = vRotations[nIDi];
+        Eigen::Vector3d t_i = vTranslations[nIDi];
+        
+        Eigen::Quaterniond q_i_inv = q_i.conjugate();
+        Eigen::Vector3d t_i_inv = -(q_i_inv * t_i);
+        
+        // 检查是否在NonCorrectedSE3中有不同的位姿
+        Eigen::Quaterniond q_wi_inv = q_i_inv;
+        Eigen::Vector3d t_wi_inv = t_i_inv;
+        
+        auto iti = NonCorrectedSE3.find(pKF);
+        if(iti != NonCorrectedSE3.end()) {
+            const SE3Pose& se3pose = iti->second;
+            q_wi_inv = se3pose.first.conjugate();
+            t_wi_inv = -(q_wi_inv * se3pose.second);
+        }
+        
+        // ===== 添加生成树边 =====
+        KeyFrame* pParentKF = pKF->GetParent();
+        if(pParentKF && !pParentKF->isBad()) {
+            int nIDj = pParentKF->mnId;
+            double* poseParams_j = vPoseParams[nIDj];
+            if(!poseParams_j) continue;
+            
+            // 获取父节点位姿 Sjw
+            Eigen::Quaterniond q_j = vRotations[nIDj];
+            Eigen::Vector3d t_j = vTranslations[nIDj];
+            
+            // 检查是否在NonCorrectedSE3中有不同的位姿
+            auto itj = NonCorrectedSE3.find(pParentKF);
+            if(itj != NonCorrectedSE3.end()) {
+                const SE3Pose& se3pose = itj->second;
+                q_j = se3pose.first;
+                t_j = se3pose.second;
+            }
+            
+            // 计算相对变换 Sji = Sjw * Swi
+            Eigen::Quaterniond q_ji = q_j * q_wi_inv;
+            Eigen::Vector3d t_ji = t_j - q_j * q_wi_inv * t_i;
+            
+            Eigen::Matrix3d R_ji = q_ji.toRotationMatrix();
+            
+            // 添加边约束
+            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 100.0);  // 权重较高
+            problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_j);
+            
+            spanningEdgeCount++;
+        }
+        
+        // ===== 添加现有回环边 =====
+        const std::set<KeyFrame*> sLoopEdges = pKF->GetLoopEdges();
+        for(KeyFrame* pLKF : sLoopEdges) {
+            if(pLKF->mnId < pKF->mnId) {  // 确保每条边只添加一次
+                double* poseParams_l = vPoseParams[pLKF->mnId];
+                if(!poseParams_l) continue;
+                
+                // 获取回环关键帧位姿 Slw
+                Eigen::Quaterniond q_l = vRotations[pLKF->mnId];
+                Eigen::Vector3d t_l = vTranslations[pLKF->mnId];
+                
+                // 检查是否在NonCorrectedSE3中有不同的位姿
+                auto itl = NonCorrectedSE3.find(pLKF);
+                if(itl != NonCorrectedSE3.end()) {
+                    const SE3Pose& se3pose = itl->second;
+                    q_l = se3pose.first;
+                    t_l = se3pose.second;
+                }
+                
+                // 计算相对变换 Sli = Slw * Swi
+                Eigen::Quaterniond q_li = q_l * q_wi_inv;
+                Eigen::Vector3d t_li = t_l - q_l * q_wi_inv * t_i;
+                
+                Eigen::Matrix3d R_li = q_li.toRotationMatrix();
+                
+                // 添加边约束
+                ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_li, t_li, 10.0);  // 权重适中
+                problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_l);
+                
+                existingLoopEdgeCount++;
+            }
+        }
+        
+        // ===== 添加共视图边 =====
+        const std::vector<KeyFrame*> vpConnectedKFs = pKF->GetCovisiblesByWeight(minFeat);
+        for(KeyFrame* pKFn : vpConnectedKFs) {
+            if(pKFn && pKFn != pParentKF && !pKF->hasChild(pKFn) /* && !sLoopEdges.count(pKFn) */) {
+                if(!pKFn->isBad() && pKFn->mnId < pKF->mnId) {
+                    // 检查是否已经添加过这条边
+                    if(sInsertedEdges.count(std::make_pair(std::min(pKF->mnId, pKFn->mnId), 
+                                                   std::max(pKF->mnId, pKFn->mnId))))
+                        continue;
+                        
+                    double* poseParams_n = vPoseParams[pKFn->mnId];
+                    if(!poseParams_n) continue;
+                    
+                    // 获取共视关键帧位姿 Snw
+                    Eigen::Quaterniond q_n = vRotations[pKFn->mnId];
+                    Eigen::Vector3d t_n = vTranslations[pKFn->mnId];
+                    
+                    // 检查是否在NonCorrectedSE3中有不同的位姿
+                    auto itn = NonCorrectedSE3.find(pKFn);
+                    if(itn != NonCorrectedSE3.end()) {
+                        const SE3Pose& se3pose = itn->second;
+                        q_n = se3pose.first;
+                        t_n = se3pose.second;
+                    }
+                    
+                    // 计算相对变换 Sni = Snw * Swi
+                    Eigen::Quaterniond q_ni = q_n * q_wi_inv;
+                    Eigen::Vector3d t_ni = t_n - q_n * q_wi_inv * t_i;
+                    
+                    Eigen::Matrix3d R_ni = q_ni.toRotationMatrix();
+                    
+                    // 添加边约束 - 权重基于共视关系
+                    double weight = pKF->GetWeight(pKFn) * 0.1;  // 适当缩放权重
+                    ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ni, t_ni, weight);
+                    problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_n);
+                    
+                    covisibilityEdgeCount++;
+                    sInsertedEdges.insert(std::make_pair(std::min(pKF->mnId, pKFn->mnId), 
+                                                 std::max(pKF->mnId, pKFn->mnId)));
+                }
+            }
+        }
+        
+        // ===== 添加IMU边 =====
+        if(pKF->bImu && pKF->mPrevKF) {
+            double* poseParams_p = vPoseParams[pKF->mPrevKF->mnId];
+            if(!poseParams_p) continue;
+            
+            // 获取前一关键帧位姿 Spw
+            Eigen::Quaterniond q_p = vRotations[pKF->mPrevKF->mnId];
+            Eigen::Vector3d t_p = vTranslations[pKF->mPrevKF->mnId];
+            
+            // 检查是否在NonCorrectedSE3中有不同的位姿
+            auto itp = NonCorrectedSE3.find(pKF->mPrevKF);
+            if(itp != NonCorrectedSE3.end()) {
+                const SE3Pose& se3pose = itp->second;
+                q_p = se3pose.first;
+                t_p = se3pose.second;
+            }
+            
+            // 计算相对变换 Spi = Spw * Swi
+            Eigen::Quaterniond q_pi = q_p * q_wi_inv;
+            Eigen::Vector3d t_pi = t_p - q_p * q_wi_inv * t_i;
+            
+            Eigen::Matrix3d R_pi = q_pi.toRotationMatrix();
+            
+            // 添加边约束
+            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_pi, t_pi, 50.0);  // IMU边权重较高
+            problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_p);
+            
+            imuEdgeCount++;
+        }
+    }
+    
+    // 打印边统计信息
+    std::cout << "Added " << spanningEdgeCount << " spanning tree edges" << std::endl;
+    std::cout << "Added " << existingLoopEdgeCount << " existing loop edges" << std::endl;
+    std::cout << "Added " << covisibilityEdgeCount << " covisibility edges" << std::endl;
+    std::cout << "Added " << imuEdgeCount << " IMU edges" << std::endl;
+    std::cout << "Total inserted edges: " << sInsertedEdges.size() << std::endl;
+    
+    // ===== 执行优化 =====
+    // std::cout << "Step 4: Running optimization..." << std::endl;
+    // ceres::Solver::Summary summary;
+    // ceres::Solve(options, &problem, &summary);
+    // std::cout << summary.BriefReport() << std::endl;
+    
+    // // 保存优化后的轨迹用于验证
+    // SaveTrajectory(optimizedTrajectoryFile, vpKFs, vPoseParams);
+    
 }
 
 // Main function for testing
