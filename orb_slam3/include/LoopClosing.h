@@ -141,6 +141,15 @@ public:
                                    int numIterations = 20, float initialError = 0.0, float finalError = 0.0);
     void SaveFusionLog(const std::string& filename, const std::vector<std::pair<MapPoint*, MapPoint*>>& fusedPoints);
     void SaveGBAInfo(const std::string& filename, Map* pMap, unsigned long nLoopKF);    
+    // Add this in the public or protected section of your LoopClosing class in LoopClosing.h
+    void SaveOptimizationData(const string& baseDir, 
+                              Map* pMap, 
+                              KeyFrame* pLoopKF, 
+                              KeyFrame* pCurKF,
+                              const KeyFrameAndPose &NonCorrectedSim3,
+                              const KeyFrameAndPose &CorrectedSim3,
+                              const map<KeyFrame *, set<KeyFrame *> > &LoopConnections, 
+                              const bool &bFixScale);
 
 protected:
 
