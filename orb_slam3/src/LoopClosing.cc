@@ -121,6 +121,235 @@ LoopClosing::LoopClosing(Atlas *pAtlas, KeyFrameDatabase *pDB, ORBVocabulary *pV
     mnCorrectionGBA = 0;
 }
 
+void LoopClosing::SaveOptimizationData(const string& baseDir)
+{
+    // 创建主目录
+    string optimDir = baseDir + "/optimization_data/";
+    struct stat st = {0};
+    if (stat(optimDir.c_str(), &st) == -1) {
+        #ifdef _WIN32
+            _mkdir(optimDir.c_str());
+        #else
+            mkdir(optimDir.c_str(), 0755);
+        #endif
+    }
+    
+    Map* pMap = mpCurrentKF->GetMap();
+    
+    // 1. 保存Map基本信息
+    ofstream mapFile(optimDir + "map_info.txt");
+    mapFile << "MAP_ID " << pMap->GetId() << endl;
+    mapFile << "INIT_KF_ID " << pMap->GetInitKFid() << endl;
+    mapFile << "MAX_KF_ID " << pMap->GetMaxKFid() << endl;
+    mapFile << "NUM_KFS " << pMap->KeyFramesInMap() << endl;
+    mapFile << "NUM_MPS " << pMap->MapPointsInMap() << endl;
+    mapFile << "IS_INERTIAL " << (pMap->IsInertial() ? 1 : 0) << endl;
+    mapFile << "IMU_INITIALIZED " << (pMap->isImuInitialized() ? 1 : 0) << endl;
+    mapFile << "IMU_BA1 " << (pMap->GetIniertialBA1() ? 1 : 0) << endl;
+    mapFile << "IMU_BA2 " << (pMap->GetIniertialBA2() ? 1 : 0) << endl;
+    // 在map_info.txt中添加:
+    mapFile << "MIN_COVISIBILITY_FEATURES " << 100 << endl;  // 默认值
+    mapFile.close();
+    
+    // 2. 保存KeyFrame IDs (pLoopKF和pCurKF)
+    ofstream kfidsFile(optimDir + "keyframe_ids.txt");
+    kfidsFile << "LOOP_KF_ID " << mpLoopMatchedKF->mnId << endl;
+    kfidsFile << "CURRENT_KF_ID " << mpCurrentKF->mnId << endl;
+    kfidsFile << "FIXED_SCALE " << (mbFixScale ? 1 : 0) << endl;
+    kfidsFile.close();
+    
+    // 3. 保存所有关键帧数据
+    vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
+    
+    // 3.1 保存KF的基本信息
+    ofstream kfsFile(optimDir + "keyframes.txt");
+    kfsFile << "# KF_ID Parent_ID HasVelocity IsFixed IsBad IsInertial IsVirtual" << endl;
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad()) continue;
+        
+        KeyFrame* pParent = pKF->GetParent();
+        long unsigned int parentId = (pParent ? pParent->mnId : 0);
+        bool isFixed = (pKF->mnId == pMap->GetInitKFid());
+        
+        kfsFile << pKF->mnId << " " 
+                << parentId << " "
+                << (pKF->isVelocitySet() ? 1 : 0) << " "
+                << (isFixed ? 1 : 0) << " "
+                << (pKF->isBad() ? 1 : 0) << " "
+                << (pKF->bImu ? 1 : 0) << " 0" << endl;
+    }
+    kfsFile.close();
+    
+    // 3.2 保存KF位姿
+    ofstream posesFile(optimDir + "keyframe_poses.txt");
+    posesFile << "# KF_ID tx ty tz qx qy qz qw" << endl;
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad()) continue;
+        
+        Sophus::SE3f Tcw = pKF->GetPose();
+        Eigen::Quaternionf q = Tcw.unit_quaternion();
+        Eigen::Vector3f t = Tcw.translation();
+        
+        posesFile << pKF->mnId << " "
+                  << t.x() << " " << t.y() << " " << t.z() << " "
+                  << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
+    }
+    posesFile.close();
+    
+    // 3.3 保存速度和IMU数据 (如果有)
+    ofstream imuFile(optimDir + "keyframe_imu.txt");
+    imuFile << "# KF_ID vx vy vz bg_x bg_y bg_z ba_x ba_y ba_z prev_KF_ID next_KF_ID" << endl;
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad() || !pKF->bImu) continue;
+        
+        Eigen::Vector3f v = pKF->GetVelocity();
+        Eigen::Vector3f bg = pKF->GetGyroBias();
+        Eigen::Vector3f ba = pKF->GetAccBias();
+        
+        KeyFrame* pPrevKF = pKF->mPrevKF;
+        KeyFrame* pNextKF = pKF->mNextKF;
+        
+        imuFile << pKF->mnId << " "
+                << v.x() << " " << v.y() << " " << v.z() << " "
+                << bg.x() << " " << bg.y() << " " << bg.z() << " "
+                << ba.x() << " " << ba.y() << " " << ba.z() << " "
+                << (pPrevKF ? pPrevKF->mnId : 0) << " "
+                << (pNextKF ? pNextKF->mnId : 0) << endl;
+    }
+    imuFile.close();
+    
+    // 4. 保存MapPoints 
+    vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
+    ofstream mpsFile(optimDir + "mappoints.txt");
+    mpsFile << "# MP_ID x y z ref_KF_ID corrected_by_KF corrected_ref" << endl;
+    for(MapPoint* pMP : vpMPs) {
+        if(pMP->isBad()) continue;
+        
+        Eigen::Vector3f pos = pMP->GetWorldPos();
+        KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
+        
+        mpsFile << pMP->mnId << " "
+                << pos.x() << " " << pos.y() << " " << pos.z() << " "
+                << (pRefKF ? pRefKF->mnId : 0) << " "
+                << pMP->mnCorrectedByKF << " "
+                << pMP->mnCorrectedReference << endl;
+    }
+    mpsFile.close();
+    
+    // 5. 保存图连接 (所有三种：生成树、回环边、共视边)
+    
+    // 5.1 保存生成树连接
+    ofstream spanningFile(optimDir + "spanning_tree.txt");
+    spanningFile << "# Child_KF_ID Parent_KF_ID" << endl;
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad()) continue;
+        
+        KeyFrame* pParent = pKF->GetParent();
+        if(pParent)
+            spanningFile << pKF->mnId << " " << pParent->mnId << endl;
+    }
+    spanningFile.close();
+    
+    // 5.2 保存回环边
+    ofstream loopEdgesFile(optimDir + "loop_edges.txt");
+    loopEdgesFile << "# KF_ID Loop_KF_ID" << endl;
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad()) continue;
+        
+        set<KeyFrame*> sLoopEdges = pKF->GetLoopEdges();
+        for(KeyFrame* pLoopKF : sLoopEdges) {
+            // 只保存一个方向，避免重复
+            if(pKF->mnId < pLoopKF->mnId)
+                loopEdgesFile << pKF->mnId << " " << pLoopKF->mnId << endl;
+        }
+    }
+    loopEdgesFile.close();
+    
+    // 5.3 保存共视图
+    ofstream covisFile(optimDir + "covisibility.txt");
+    covisFile << "# KF_ID Connected_KF_ID Weight" << endl;
+    
+    set<pair<unsigned long, unsigned long>> processedEdges;
+    
+    for(KeyFrame* pKF : vpKFs) {
+        if(pKF->isBad()) continue;
+        
+        vector<KeyFrame*> vpConnected = pKF->GetVectorCovisibleKeyFrames();
+        for(KeyFrame* pKFConn : vpConnected) {
+            if(pKFConn->isBad()) continue;
+            
+            // 处理方向，确保每条边只保存一次
+            unsigned long id1 = pKF->mnId;
+            unsigned long id2 = pKFConn->mnId;
+            
+            pair<unsigned long, unsigned long> edge = id1 < id2 ? 
+                make_pair(id1, id2) : make_pair(id2, id1);
+                
+            if(processedEdges.count(edge)) continue;
+            processedEdges.insert(edge);
+            
+            int weight = pKF->GetWeight(pKFConn);
+            covisFile << pKF->mnId << " " << pKFConn->mnId << " " << weight << endl;
+        }
+    }
+    covisFile.close();
+    
+    // 6. 保存NonCorrectedSim3和CorrectedSim3
+    
+    // 6.1 保存NonCorrectedSim3
+    ofstream nonCorrectedFile(optimDir + "non_corrected_sim3.txt");
+    nonCorrectedFile << "# KF_ID scale tx ty tz qx qy qz qw" << endl;
+    for(const auto& entry : NonCorrectedSim3) {
+        KeyFrame* pKF = entry.first;
+        const g2o::Sim3& sim3 = entry.second;
+        
+        Eigen::Quaterniond q = sim3.rotation();
+        Eigen::Vector3d t = sim3.translation();
+        double s = sim3.scale();
+        
+        nonCorrectedFile << pKF->mnId << " "
+                          << s << " "
+                          << t.x() << " " << t.y() << " " << t.z() << " "
+                          << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
+    }
+    nonCorrectedFile.close();
+    
+    // 6.2 保存CorrectedSim3
+    ofstream correctedFile(optimDir + "corrected_sim3.txt");
+    correctedFile << "# KF_ID scale tx ty tz qx qy qz qw" << endl;
+    for(const auto& entry : CorrectedSim3) {
+        KeyFrame* pKF = entry.first;
+        const g2o::Sim3& sim3 = entry.second;
+        
+        Eigen::Quaterniond q = sim3.rotation();
+        Eigen::Vector3d t = sim3.translation();
+        double s = sim3.scale();
+        
+        correctedFile << pKF->mnId << " "
+                       << s << " "
+                       << t.x() << " " << t.y() << " " << t.z() << " "
+                       << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
+    }
+    correctedFile.close();
+    
+    // 7. 保存LoopConnections
+    ofstream loopConnFile(optimDir + "loop_connections.txt");
+    loopConnFile << "# KF_ID Connected_KF_IDs..." << endl;
+    for(const auto& entry : LoopConnections) {
+        KeyFrame* pKF = entry.first;
+        const set<KeyFrame*>& sConnected = entry.second;
+        
+        loopConnFile << pKF->mnId;
+        for(KeyFrame* pConnKF : sConnected) {
+            loopConnFile << " " << pConnKF->mnId;
+        }
+        loopConnFile << endl;
+    }
+    loopConnFile.close();
+    
+    cout << "Optimization data saved to: " << optimDir << endl;
+}
+
 
 void LoopClosing::SaveCompleteTrajectory(const std::string& filename, Map* pMap)
 {
@@ -2108,6 +2337,9 @@ void LoopClosing::CorrectLoop()
         vdLoopFusion_ms.push_back(timeFusion);
 #endif
     cout << "Optimize essential graph" << endl;
+    // 在调用OptimizeEssentialGraph前保存数据
+    SaveOptimizationData(mSaveDirectory + "loop_" + to_string(mLoopClosureCount));
+    
     if(pLoopMap->IsInertial() && pLoopMap->isImuInitialized())
     {
         Optimizer::OptimizeEssentialGraph4DoF(pLoopMap, mpLoopMatchedKF, mpCurrentKF, NonCorrectedSim3, CorrectedSim3, LoopConnections);
