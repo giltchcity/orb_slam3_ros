@@ -1194,8 +1194,95 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     }
     
     std::cout << "\n=== Optimization complete ===" << std::endl;
+    // ===== 更新关键帧位姿 =====
+    std::cout << "\n=== Updating KeyFrame poses ===" << std::endl;
+    {
+        std::unique_lock<std::mutex> lock(pMap->mMutexMapUpdate);
+        
+        for(KeyFrame* pKFi : vpKFs) {
+            if(pKFi->isBad()) continue;
+            
+            const int nIDi = pKFi->mnId;
+            double* params = vPoseParams[nIDi];
+            
+            if(!params) continue;
+            
+            // 获取优化后的位姿参数
+            Eigen::Vector3d rot(params[0], params[1], params[2]);
+            Eigen::Vector3d trans(params[3], params[4], params[5]);
+            
+            // 转换为旋转矩阵
+            double angle = rot.norm();
+            if(angle > 1e-10) {
+                Eigen::AngleAxisd aa(angle, rot.normalized());
+                Eigen::Matrix3d R = aa.toRotationMatrix();
+                
+                // 更新关键帧位姿（RGBD/双目系统scale=1）
+                Eigen::Matrix3f Rf = R.cast<float>();
+                Eigen::Vector3f tf = trans.cast<float>();
+                
+                pKFi->SetPose(Rf, tf);
+            } else {
+                // 单位旋转
+                pKFi->SetPose(Eigen::Matrix3f::Identity(), trans.cast<float>());
+            }
+        }
+        
+        std::cout << "Updated " << vpKFs.size() << " keyframe poses" << std::endl;
+    }
+    
+    // 保存最终优化后的轨迹
+    SaveTrajectory(outputDir + "final_optimized_trajectory.txt", vpKFs);
+    
+    void SaveTUMTrajectory(const std::string& filename, 
+                       const std::vector<KeyFrame*>& vpKFs) {
+        std::ofstream f;
+        f.open(filename.c_str());
+        f << std::fixed;
+        
+        // 按ID排序
+        std::vector<KeyFrame*> sortedKFs = vpKFs;
+        std::sort(sortedKFs.begin(), sortedKFs.end(), 
+                  [](KeyFrame* a, KeyFrame* b) { return a->mnId < b->mnId; });
+        
+        for(KeyFrame* pKF : sortedKFs) {
+            if(pKF->isBad()) continue;
+            
+            // 生成时间戳（基于ID）
+            // 使用TUM数据集的典型时间戳格式：纳秒精度
+            long long base_timestamp = 1317384506000000000LL; // 基准时间（纳秒）
+            long long timestamp = base_timestamp + static_cast<long long>(pKF->mnId * 33333333LL); // 30Hz
+            
+            // 获取相机在世界坐标系的位姿（Twc）
+            Eigen::Matrix3f Rwc;
+            Eigen::Vector3f twc;
+            pKF->GetPoseInverse(Rwc, twc);
+            
+            Eigen::Quaternionf q(Rwc);
+            q.normalize();
+            
+            // TUM格式：timestamp x y z qx qy qz qw
+            f << std::setprecision(9) << timestamp / 1e9 << " "  // 转换为秒
+              << std::setprecision(6) << twc.x() << " " << twc.y() << " " << twc.z() << " "
+              << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+        }
+        
+        f.close();
+        std::cout << "Saved TUM trajectory to " << filename 
+                  << " with " << sortedKFs.size() << " poses" << std::endl;
+    }
+    
+    // 在优化完成后
+    std::cout << "\n=== Generating final outputs ===" << std::endl;
+    
+    // 调用TUM格式保存
+    SaveTUMTrajectory(outputDir + "trajectory_tum.txt", vpKFs);
     
     
+    // 释放参数内存
+    for(double* params : vPoseParams) {
+        if(params) delete[] params;
+    }
 }
 
 // Main function for testing
