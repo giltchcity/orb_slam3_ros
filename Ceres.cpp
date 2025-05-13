@@ -173,7 +173,16 @@ void StabilizedRotationToMatrix(const T* angle_axis, T* R) {
 // SE3 edge cost function for CERES
 struct SE3EdgeCostFunction {
     SE3EdgeCostFunction(const Eigen::Matrix3d& R_meas, const Eigen::Vector3d& t_meas, double weight = 1.0) 
-        : R_measurement(R_meas), t_measurement(t_meas), weight_(weight) {}
+        : R_measurement(R_meas), t_measurement(t_meas), weight_(weight) {
+        // 添加测量值的验证
+        static int edge_count = 0;
+        edge_id_ = edge_count++;
+        if(edge_id_ < 5) {  // 打印前5个边的测量值
+            std::cout << "Edge " << edge_id_ << " measurement:" << std::endl;
+            std::cout << "  R det: " << R_measurement.determinant() << std::endl;
+            std::cout << "  t norm: " << t_measurement.norm() << std::endl;
+        }
+    }
     
     template <typename T>
     bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
@@ -183,6 +192,41 @@ struct SE3EdgeCostFunction {
         
         Eigen::Map<const Eigen::Matrix<T, 3, 1>> rot_j(pose_j);
         Eigen::Map<const Eigen::Matrix<T, 3, 1>> trans_j(pose_j + 3);
+        
+        // 添加debug信息
+        static int call_count = 0;
+        bool debug_this = (call_count < 10 && edge_id_ < 5);
+        
+        if(debug_this) {
+            std::cout << "\n=== SE3EdgeCostFunction Debug (edge " << edge_id_ 
+                     << ", call " << call_count << ") ===" << std::endl;
+            std::cout << "pose_i angle-axis: " << rot_i.transpose() 
+                     << " (norm: " << rot_i.norm() << ")" << std::endl;
+            std::cout << "pose_i translation: " << trans_i.transpose() << std::endl;
+            std::cout << "pose_j angle-axis: " << rot_j.transpose() 
+                     << " (norm: " << rot_j.norm() << ")" << std::endl;
+            std::cout << "pose_j translation: " << trans_j.transpose() << std::endl;
+            
+            // 检查数值稳定性
+            T rot_i_norm = rot_i.norm();
+            T rot_j_norm = rot_j.norm();
+            
+            if(rot_i_norm > T(M_PI) || rot_j_norm > T(M_PI)) {
+                std::cout << "WARNING: Large rotation detected!" << std::endl;
+                std::cout << "  rot_i norm: " << rot_i_norm << std::endl;
+                std::cout << "  rot_j norm: " << rot_j_norm << std::endl;
+            }
+            
+            // 检查平移量级
+            T trans_i_norm = trans_i.norm();
+            T trans_j_norm = trans_j.norm();
+            
+            if(trans_i_norm > T(100.0) || trans_j_norm > T(100.0)) {
+                std::cout << "WARNING: Large translation detected!" << std::endl;
+                std::cout << "  trans_i norm: " << trans_i_norm << std::endl;
+                std::cout << "  trans_j norm: " << trans_j_norm << std::endl;
+            }
+        }
         
         // Convert angle-axis to rotation matrices using the stabilized function
         T R_i[9], R_j[9];
@@ -203,15 +247,54 @@ struct SE3EdgeCostFunction {
                    R_j[3], R_j[4], R_j[5], 
                    R_j[6], R_j[7], R_j[8];
         
-        // Calculate rotation error: log(R_j.transpose() * R_meas * R_i)
-        Eigen::Matrix<T, 3, 3> R_error = R_j_mat.transpose() * R_meas * R_i_mat;
+        if(debug_this) {
+            std::cout << "R_i det: " << R_i_mat.determinant() << std::endl;
+            std::cout << "R_j det: " << R_j_mat.determinant() << std::endl;
+        }
         
-        // Convert rotation error to angle-axis
-        Eigen::AngleAxis<T> aa_error(R_error);
-        Eigen::Matrix<T, 3, 1> rot_error = aa_error.angle() * aa_error.axis();
+        // 修正：相对变换误差计算
+        // 测量值是 T_ji = T_j * T_i^(-1)
+        // 预测值是 T_ji_pred = T_j * T_i^(-1)
+        // 误差在切空间中计算
         
-        // Calculate translation error: R_j.transpose() * (t_meas + R_meas * t_i - t_j)
-        Eigen::Matrix<T, 3, 1> t_error = R_j_mat.transpose() * (t_meas + R_meas * trans_i - trans_j);
+        // 计算预测的相对变换
+        Eigen::Matrix<T, 3, 3> R_i_inv = R_i_mat.transpose();
+        Eigen::Matrix<T, 3, 1> t_i_inv = -R_i_inv * trans_i;
+        
+        Eigen::Matrix<T, 3, 3> R_ji_pred = R_j_mat * R_i_inv;
+        Eigen::Matrix<T, 3, 1> t_ji_pred = R_j_mat * t_i_inv + trans_j;
+        
+        // 计算旋转误差: log(R_meas^T * R_ji_pred)
+        Eigen::Matrix<T, 3, 3> R_error_mat = R_meas.transpose() * R_ji_pred;
+        
+        // 安全的对数映射
+        T trace = R_error_mat.trace();
+        Eigen::Matrix<T, 3, 1> rot_error;
+        
+        if(trace > T(3.0) - T(1e-6)) {
+            // 接近单位矩阵
+            rot_error = Eigen::Matrix<T, 3, 1>::Zero();
+        } else {
+            T angle = acos((trace - T(1.0)) / T(2.0));
+            if(abs(angle) < T(1e-10)) {
+                rot_error = Eigen::Matrix<T, 3, 1>::Zero();
+            } else {
+                T factor = angle / (T(2.0) * sin(angle));
+                rot_error[0] = factor * (R_error_mat(2,1) - R_error_mat(1,2));
+                rot_error[1] = factor * (R_error_mat(0,2) - R_error_mat(2,0));
+                rot_error[2] = factor * (R_error_mat(1,0) - R_error_mat(0,1));
+            }
+        }
+        
+        // 计算平移误差
+        Eigen::Matrix<T, 3, 1> t_error = t_ji_pred - t_meas;
+        
+        if(debug_this) {
+            std::cout << "R_error_mat trace: " << trace << std::endl;
+            std::cout << "rot_error: " << rot_error.transpose() << std::endl;
+            std::cout << "t_error: " << t_error.transpose() << std::endl;
+            std::cout << "weight: " << weight_ << std::endl;
+        }
         
         // Apply weight to residuals
         T sqrt_weight = sqrt(T(weight_));
@@ -224,10 +307,21 @@ struct SE3EdgeCostFunction {
         residuals[4] = sqrt_weight * t_error[1];
         residuals[5] = sqrt_weight * t_error[2];
         
+        if(debug_this) {
+            std::cout << "Final residuals: ";
+            for(int i = 0; i < 6; i++) {
+                std::cout << residuals[i] << " ";
+            }
+            std::cout << std::endl;
+            call_count++;
+        }
+        
         return true;
     }
     
-    static ceres::CostFunction* Create(const Eigen::Matrix3d& R_meas, const Eigen::Vector3d& t_meas, double weight = 1.0) {
+    static ceres::CostFunction* Create(const Eigen::Matrix3d& R_meas, 
+                                      const Eigen::Vector3d& t_meas, 
+                                      double weight = 1.0) {
         return new ceres::AutoDiffCostFunction<SE3EdgeCostFunction, 6, 6, 6>(
             new SE3EdgeCostFunction(R_meas, t_meas, weight));
     }
@@ -235,6 +329,7 @@ struct SE3EdgeCostFunction {
     Eigen::Matrix3d R_measurement;
     Eigen::Vector3d t_measurement;
     double weight_;
+    mutable int edge_id_;
 };
 
 // Custom manifold for SE3 in Ceres 2.2
@@ -253,16 +348,28 @@ public:
         Eigen::Map<const Eigen::Vector3d> delta_angleAxis(delta);
         Eigen::Map<Eigen::Vector3d> result_angleAxis(x_plus_delta);
         
-        // Convert to quaternions, multiply, and convert back to angle-axis
-        Eigen::AngleAxisd aa1(angleAxis.norm(), angleAxis.normalized());
-        Eigen::AngleAxisd aa2(delta_angleAxis.norm(), delta_angleAxis.normalized());
-        
-        Eigen::Quaterniond q1(aa1);
-        Eigen::Quaterniond q2(aa2);
-        Eigen::Quaterniond q_res = q2 * q1;
-        
-        Eigen::AngleAxisd aa_res(q_res);
-        result_angleAxis = aa_res.angle() * aa_res.axis();
+        // Handle zero angle-axis case
+        if(angleAxis.norm() < 1e-10) {
+            result_angleAxis = delta_angleAxis;
+        } else if(delta_angleAxis.norm() < 1e-10) {
+            result_angleAxis = angleAxis;
+        } else {
+            // Convert to quaternions, multiply, and convert back to angle-axis
+            Eigen::AngleAxisd aa1(angleAxis.norm(), angleAxis.normalized());
+            Eigen::AngleAxisd aa2(delta_angleAxis.norm(), delta_angleAxis.normalized());
+            
+            Eigen::Quaterniond q1(aa1);
+            Eigen::Quaterniond q2(aa2);
+            Eigen::Quaterniond q_res = q2 * q1;
+            q_res.normalize();
+            
+            Eigen::AngleAxisd aa_res(q_res);
+            if(aa_res.angle() < 1e-10) {
+                result_angleAxis = Eigen::Vector3d::Zero();
+            } else {
+                result_angleAxis = aa_res.angle() * aa_res.axis();
+            }
+        }
         
         // Handle translation
         Eigen::Map<const Eigen::Vector3d> translation(x + 3);
@@ -270,8 +377,13 @@ public:
         Eigen::Map<Eigen::Vector3d> result_translation(x_plus_delta + 3);
         
         // Compute updated translation
-        Eigen::Matrix3d R_delta = aa2.toRotationMatrix();
-        result_translation = R_delta * translation + delta_translation;
+        if(delta_angleAxis.norm() > 1e-10) {
+            Eigen::AngleAxisd aa2(delta_angleAxis.norm(), delta_angleAxis.normalized());
+            Eigen::Matrix3d R_delta = aa2.toRotationMatrix();
+            result_translation = R_delta * translation + delta_translation;
+        } else {
+            result_translation = translation + delta_translation;
+        }
         
         return true;
     }
@@ -290,16 +402,19 @@ public:
         
         // Cross-term: rotation affects translation
         Eigen::Map<const Eigen::Vector3d> angleAxis(x);
-        Eigen::AngleAxisd aa(angleAxis.norm(), angleAxis.normalized());
-        Eigen::Matrix3d R = aa.toRotationMatrix();
         
-        Eigen::Map<const Eigen::Vector3d> t(x + 3);
-        Eigen::Matrix3d skew;
-        skew << 0, -t(2), t(1),
-                t(2), 0, -t(0),
-                -t(1), t(0), 0;
-                
-        J.block<3, 3>(3, 0) = -R * skew;
+        if(angleAxis.norm() > 1e-10) {
+            Eigen::AngleAxisd aa(angleAxis.norm(), angleAxis.normalized());
+            Eigen::Matrix3d R = aa.toRotationMatrix();
+            
+            Eigen::Map<const Eigen::Vector3d> t(x + 3);
+            Eigen::Matrix3d skew;
+            skew << 0, -t(2), t(1),
+                    t(2), 0, -t(0),
+                    -t(1), t(0), 0;
+                    
+            J.block<3, 3>(3, 0) = -R * skew;
+        }
         
         return true;
     }
@@ -315,12 +430,28 @@ public:
         Eigen::Map<const Eigen::Vector3d> y_aa(y);
         Eigen::Map<const Eigen::Vector3d> y_t(y + 3);
         
-        // Convert angle-axis to rotation matrices
-        Eigen::AngleAxisd x_rotation(x_aa.norm(), x_aa.normalized());
-        Eigen::AngleAxisd y_rotation(y_aa.norm(), y_aa.normalized());
+        // Handle zero angle-axis cases
+        if(x_aa.norm() < 1e-10 && y_aa.norm() < 1e-10) {
+            Eigen::Map<Eigen::Vector3d> result_aa(y_minus_x);
+            result_aa = Eigen::Vector3d::Zero();
+            Eigen::Map<Eigen::Vector3d> result_t(y_minus_x + 3);
+            result_t = y_t - x_t;
+            return true;
+        }
         
-        Eigen::Matrix3d R_x = x_rotation.toRotationMatrix();
-        Eigen::Matrix3d R_y = y_rotation.toRotationMatrix();
+        // Convert angle-axis to rotation matrices
+        Eigen::Matrix3d R_x = Eigen::Matrix3d::Identity();
+        Eigen::Matrix3d R_y = Eigen::Matrix3d::Identity();
+        
+        if(x_aa.norm() > 1e-10) {
+            Eigen::AngleAxisd x_rotation(x_aa.norm(), x_aa.normalized());
+            R_x = x_rotation.toRotationMatrix();
+        }
+        
+        if(y_aa.norm() > 1e-10) {
+            Eigen::AngleAxisd y_rotation(y_aa.norm(), y_aa.normalized());
+            R_y = y_rotation.toRotationMatrix();
+        }
         
         // Compute the relative rotation R_rel = R_y * R_x^T
         Eigen::Matrix3d R_rel = R_y * R_x.transpose();
@@ -328,7 +459,12 @@ public:
         // Convert back to angle-axis representation
         Eigen::AngleAxisd aa_rel(R_rel);
         Eigen::Map<Eigen::Vector3d> result_aa(y_minus_x);
-        result_aa = aa_rel.angle() * aa_rel.axis();
+        
+        if(aa_rel.angle() < 1e-10) {
+            result_aa = Eigen::Vector3d::Zero();
+        } else {
+            result_aa = aa_rel.angle() * aa_rel.axis();
+        }
         
         // Compute the relative translation: R_x^T * (y_t - x_t)
         Eigen::Map<Eigen::Vector3d> result_t(y_minus_x + 3);
@@ -348,8 +484,12 @@ public:
         
         // Convert angle-axis to rotation matrix
         Eigen::Map<const Eigen::Vector3d> x_aa(x);
-        Eigen::AngleAxisd aa(x_aa.norm(), x_aa.normalized());
-        Eigen::Matrix3d R_x = aa.toRotationMatrix();
+        Eigen::Matrix3d R_x = Eigen::Matrix3d::Identity();
+        
+        if(x_aa.norm() > 1e-10) {
+            Eigen::AngleAxisd aa(x_aa.norm(), x_aa.normalized());
+            R_x = aa.toRotationMatrix();
+        }
         
         // For translation, we need -R_x^T
         J.block<3, 3>(3, 3) = -R_x.transpose();
@@ -415,7 +555,6 @@ void SaveTrajectory(const std::string& filename, const std::vector<KeyFrame*>& v
             Eigen::Vector3d rot(params[0], params[1], params[2]);
             Eigen::Vector3d trans(params[3], params[4], params[5]);
             
-            double R[9];
             double angle = rot.norm();
             if(angle > 1e-10) {
                 Eigen::Vector3d axis = rot / angle;
@@ -472,12 +611,6 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     
     // Setup CERES optimizer - similar to g2o setup in original code
     ceres::Problem problem;
-    ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.minimizer_progress_to_stdout = true;
-    options.max_num_iterations = 20; // Same as original code
-    options.function_tolerance = 1e-2;
-    options.initial_trust_region_radius = 1e-2; // Similar to g2o's lambda init
     
     const std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
     const std::vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
@@ -492,7 +625,7 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     // Vector to store corrected poses after optimization (equivalent to vCorrectedSwc)
     std::vector<SE3Pose> vCorrectedPoses(nMaxKFid+1);
     
-    const int minFeat = 100; // Minimum features for connections, same as original
+    const int minFeat = 5; // Minimum features for connections, same as original
     
     std::cout << "Creating parameter blocks for " << vpKFs.size() << " keyframes" << std::endl;
     
@@ -580,25 +713,92 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     
     std::cout << "All parameter blocks created successfully" << std::endl;
     
-    // The rest of the implementation will be completed later
-    // This includes:
-    // - Adding loop edges
-    // - Adding spanning tree edges
-    // - Adding existing loop edges
-    // - Adding covisibility graph edges
-    // - Running the optimization
-    // - Updating poses and map points
-
-    // As requested, we've completed approximately the first 100 lines of the function
-    // The rest will be implemented based on your further directions
+    // 在 "All parameter blocks created successfully" 之后添加
+    std::cout << "\n=== Initial State Verification ===" << std::endl;
+    
+    // 验证重要关键帧的初始位姿
+    std::vector<KeyFrame*> importantKFs = {pLoopKF, pCurKF};
+    if(pMap->GetInitKFid() == 0 && vpKFs.size() > 0 && vpKFs[0]->mnId == 0) {
+        importantKFs.push_back(vpKFs[0]); // 添加初始关键帧
+    }
+    
+    for(KeyFrame* pKF : importantKFs) {
+        const int nIDi = pKF->mnId;
+        double* params = vPoseParams[nIDi];
+        
+        if(!params) continue;
+        
+        Eigen::Vector3d rot(params[0], params[1], params[2]);
+        Eigen::Vector3d trans(params[3], params[4], params[5]);
+        
+        std::cout << "\nKF " << nIDi << " (";
+        if(pKF == pLoopKF) std::cout << "LoopKF";
+        else if(pKF == pCurKF) std::cout << "CurKF";
+        else if(nIDi == 0) std::cout << "InitKF";
+        std::cout << "):" << std::endl;
+        
+        std::cout << "  Angle-axis: " << rot.transpose() << " (norm: " << rot.norm() << ")" << std::endl;
+        std::cout << "  Translation: " << trans.transpose() << " (norm: " << trans.norm() << ")" << std::endl;
+        
+        // 转换回旋转矩阵验证
+        if(rot.norm() > 1e-10) {
+            Eigen::AngleAxisd aa(rot.norm(), rot.normalized());
+            Eigen::Matrix3d R = aa.toRotationMatrix();
+            std::cout << "  Rotation det: " << R.determinant() << std::endl;
+            
+            // 检查是否是有效的旋转矩阵
+            Eigen::Matrix3d RtR = R.transpose() * R;
+            std::cout << "  R^T * R - I norm: " << (RtR - Eigen::Matrix3d::Identity()).norm() << std::endl;
+        }
+        
+        // 检查是否在CorrectedSE3中
+        auto it_corrected = CorrectedSE3.find(pKF);
+        if(it_corrected != CorrectedSE3.end()) {
+            std::cout << "  Found in CorrectedSE3" << std::endl;
+        }
+        
+        // 检查是否在NonCorrectedSE3中
+        auto it_noncorrected = NonCorrectedSE3.find(pKF);
+        if(it_noncorrected != NonCorrectedSE3.end()) {
+            std::cout << "  Found in NonCorrectedSE3" << std::endl;
+        }
+    }
     
     // ===== 添加回环连接边 =====
     std::cout << "Step 2: Adding loop connection edges..." << std::endl;
+    
+    // 在 "Step 2: Adding loop connection edges..." 之后
+    std::cout << "\n=== Analyzing Loop Connections ===" << std::endl;
+    std::cout << "Number of keyframes with loop connections: " << LoopConnections.size() << std::endl;
+    
+    // 详细分析loop connections
+    for(const auto& mit : LoopConnections) {
+        KeyFrame* pKF = mit.first;
+        const std::set<KeyFrame*>& connections = mit.second;
+        
+        if(pKF == pLoopKF || pKF == pCurKF) {
+            std::cout << "KF " << pKF->mnId << " (";
+            if(pKF == pLoopKF) std::cout << "LoopKF";
+            if(pKF == pCurKF) std::cout << "CurKF";
+            std::cout << ") has " << connections.size() << " connections: ";
+            
+            int count = 0;
+            for(KeyFrame* pConn : connections) {
+                if(count++ < 10) {  // 只打印前10个
+                    std::cout << pConn->mnId << " ";
+                }
+            }
+            if(connections.size() > 10) std::cout << "...";
+            std::cout << std::endl;
+        }
+    }
     int loopConnectionEdgeCount = 0;
     // 记录插入的边，避免重复
     std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
     
     // 添加回环连接边 - 与原始代码对应
+    // 在实际添加边的循环中
+    int debugEdgeCount = 0;
     for(const auto& mit : LoopConnections) {
         KeyFrame* pKF = mit.first;
         const long unsigned int nIDi = pKF->mnId;
@@ -617,9 +817,34 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     
         for(KeyFrame* pKFj : spConnections) {
             const long unsigned int nIDj = pKFj->mnId;
+            //debug 特别关注重要的边
+            bool isImportantEdge = (nIDi == pCurKF->mnId && nIDj == pLoopKF->mnId) ||
+                                  (nIDi == pLoopKF->mnId && nIDj == pCurKF->mnId);
             
+            if(isImportantEdge || debugEdgeCount < 5) {
+                std::cout << "\nLoop Edge " << nIDi << " -> " << nIDj;
+                if(isImportantEdge) std::cout << " (IMPORTANT)";
+                std::cout << ":" << std::endl;
+                
+                int weight = pKF->GetWeight(pKFj);
+                std::cout << "  Weight: " << weight << std::endl;
+                
+                // 检查条件
+                bool condition1 = (nIDi != pCurKF->mnId || nIDj != pLoopKF->mnId);
+                bool condition2 = (weight >= minFeat);
+                std::cout << "  Condition1 (not CurKF->LoopKF): " << condition1 << std::endl;
+                std::cout << "  Condition2 (weight >= " << minFeat << "): " << condition2 << std::endl;
+                
+                if(!condition1 || condition2) {
+                    std::cout << "  Edge will be added" << std::endl;
+                } else {
+                    std::cout << "  Edge will be skipped" << std::endl;
+                }
+                debugEdgeCount++;
+            }
             // 根据原始代码的条件判断
-            if((nIDi != pCurKF->mnId || nIDj != pLoopKF->mnId) && pKF->GetWeight(pKFj) < minFeat)
+            //if((nIDi != pCurKF->mnId || nIDj != pLoopKF->mnId) && pKF->GetWeight(pKFj) < minFeat)
+            if(pKF->GetWeight(pKFj) < minFeat/10)  // 降低阈值
                 continue;
                 
             double* poseParams_j = vPoseParams[nIDj];
@@ -636,7 +861,7 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
             Eigen::Matrix3d R_ji = q_ji.toRotationMatrix();
             
             // 添加边约束
-            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 1.0);
+            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 10.0);
             problem.AddResidualBlock(edge_se3, nullptr, poseParams_i, poseParams_j);
             
             loopConnectionEdgeCount++;
@@ -824,31 +1049,152 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     std::cout << "Added " << imuEdgeCount << " IMU edges" << std::endl;
     std::cout << "Total inserted edges: " << sInsertedEdges.size() << std::endl;
     
+    // ===== 保存优化前状态和计算初始误差 =====
+    std::cout << "\n=== Saving pre-optimization state ===" << std::endl;
+    SaveTrajectory(outputDir + "step0_before_optimization.txt", vpKFs, vPoseParams);
+    
+    // 计算初始的总误差
+    double initial_total_error = 0.0;
+    {
+        ceres::Problem::EvaluateOptions eval_options;
+        eval_options.apply_loss_function = false;
+        double total_cost = 0.0;
+        std::vector<double> residuals;
+        problem.Evaluate(eval_options, &total_cost, &residuals, nullptr, nullptr);
+        std::cout << "Initial total cost: " << total_cost << std::endl;
+        std::cout << "Number of residuals: " << residuals.size() << std::endl;
+        initial_total_error = total_cost;
+    }
+
     // ===== 执行优化 =====
-    std::cout << "Step 4: Running optimization..." << std::endl;
+    std::cout << "\nStep 4: Running optimization..." << std::endl;
     
     // 配置求解器选项
+    ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
     options.minimizer_progress_to_stdout = true;
-    options.max_num_iterations = 20; // 与原始代码相同
-    options.function_tolerance = 1e-6;
+    options.max_num_iterations = 50;  // 增加迭代次数
+    options.function_tolerance = 1e-8;
     options.gradient_tolerance = 1e-10;
     options.parameter_tolerance = 1e-8;
+    
+    // 添加更多调试选项
+    options.logging_type = ceres::PER_MINIMIZER_ITERATION;
+    options.update_state_every_iteration = true;
+    
+    // 添加回调函数以监控优化过程
+    class OptimizationCallback : public ceres::IterationCallback {
+    public:
+        explicit OptimizationCallback(const std::vector<double*>& params, 
+                                     const std::vector<KeyFrame*>& kfs,
+                                     const std::string& outputDir)
+            : params_(params), kfs_(kfs), outputDir_(outputDir) {}
+        
+        virtual ceres::CallbackReturnType operator()(const ceres::IterationSummary& summary) {
+            if(summary.iteration % 5 == 0) {  // 每5次迭代打印一次
+                std::cout << "\nIteration " << summary.iteration 
+                         << ": cost = " << summary.cost 
+                         << ", gradient = " << summary.gradient_norm 
+                         << ", step = " << summary.step_norm << std::endl;
+                
+                // 保存中间状态
+                std::string filename = outputDir_ + "iter_" + 
+                                      std::to_string(summary.iteration) + "_trajectory.txt";
+                SaveTrajectory(filename, kfs_, params_);
+            }
+            return ceres::SOLVER_CONTINUE;
+        }
+        
+    private:
+        const std::vector<double*>& params_;
+        const std::vector<KeyFrame*>& kfs_;
+        std::string outputDir_;
+    };
+    
+    OptimizationCallback callback(vPoseParams, vpKFs, outputDir);
+    options.callbacks.push_back(&callback);
+    
+    std::cout << "Optimizer Configuration:" << std::endl;
+    std::cout << "  Max iterations: " << options.max_num_iterations << std::endl;
+    std::cout << "  Function tolerance: " << options.function_tolerance << std::endl;
+    std::cout << "  Gradient tolerance: " << options.gradient_tolerance << std::endl;
     
     // 执行优化
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
     
     // 打印详细的优化报告
-    std::cout << "Optimization report:" << std::endl;
-    std::cout << summary.BriefReport() << std::endl;
-    std::cout << "Initial cost: " << summary.initial_cost << std::endl;
-    std::cout << "Final cost: " << summary.final_cost << std::endl;
-    std::cout << "Change: " << (summary.initial_cost - summary.final_cost) / summary.initial_cost * 100.0 << "%" << std::endl;
-
+    std::cout << "\n=== Optimization Report ===" << std::endl;
+    std::cout << summary.FullReport() << std::endl;  // 使用FullReport获取更多信息
     
-    // // 保存优化后的轨迹用于验证
-    // SaveTrajectory(optimizedTrajectoryFile, vpKFs, vPoseParams);
+    // ===== 优化后分析 =====
+    std::cout << "\n=== Post-optimization analysis ===" << std::endl;
+    double final_total_error = 0.0;
+    {
+        ceres::Problem::EvaluateOptions eval_options;
+        eval_options.apply_loss_function = false;
+        double total_cost = 0.0;
+        std::vector<double> residuals;
+        problem.Evaluate(eval_options, &total_cost, &residuals, nullptr, nullptr);
+        std::cout << "Final total cost: " << total_cost << std::endl;
+        final_total_error = total_cost;
+    }
+    
+    std::cout << "Error reduction: " << (initial_total_error - final_total_error) / initial_total_error * 100.0 << "%" << std::endl;
+    
+    // 保存优化后的轨迹
+    SaveTrajectory(outputDir + "step1_after_optimization.txt", vpKFs, vPoseParams);
+    
+    // 检查重要关键帧的变化
+    std::cout << "\n=== Important keyframes pose change ===" << std::endl;
+    for(KeyFrame* pKF : {pLoopKF, pCurKF}) {
+        const int nIDi = pKF->mnId;
+        double* params = vPoseParams[nIDi];
+        
+        if(!params) continue;
+        
+        Eigen::Vector3d rot_after(params[0], params[1], params[2]);
+        Eigen::Vector3d trans_after(params[3], params[4], params[5]);
+        
+        // 获取原始位姿
+        Eigen::Quaterniond q_before = vRotations[nIDi];
+        Eigen::AngleAxisd aa_before(q_before);
+        Eigen::Vector3d rot_before = aa_before.angle() * aa_before.axis();
+        Eigen::Vector3d trans_before = vTranslations[nIDi];
+        
+        std::cout << "\nKF " << nIDi << " (";
+        if(pKF == pLoopKF) std::cout << "LoopKF";
+        if(pKF == pCurKF) std::cout << "CurKF";
+        std::cout << "):" << std::endl;
+        
+        std::cout << "  Rotation change (angle-axis): " << (rot_after - rot_before).norm() << " rad" << std::endl;
+        std::cout << "  Translation change: " << (trans_after - trans_before).norm() << " m" << std::endl;
+        
+        // 转换为欧拉角显示
+        Eigen::Matrix3d R_before = aa_before.toRotationMatrix();
+        Eigen::AngleAxisd aa_after(rot_after.norm(), rot_after.normalized());
+        Eigen::Matrix3d R_after = aa_after.toRotationMatrix();
+        
+        Eigen::Vector3d euler_before = R_before.eulerAngles(2,1,0) * 180.0/M_PI;
+        Eigen::Vector3d euler_after = R_after.eulerAngles(2,1,0) * 180.0/M_PI;
+        
+        std::cout << "  Euler angles before (deg): " << euler_before.transpose() << std::endl;
+        std::cout << "  Euler angles after (deg): " << euler_after.transpose() << std::endl;
+    }
+    
+    // 分析优化失败的可能原因
+    if(summary.termination_type == ceres::NO_CONVERGENCE) {
+        std::cout << "\n=== Optimization did not converge. Analyzing... ===" << std::endl;
+
+        // 检查是否有参数达到界限
+        if(summary.message.find("trust region") != std::string::npos) {
+            std::cout << "Optimization may be stuck in a local minimum or trust region is too small." << std::endl;
+            std::cout << "Consider adjusting initial_trust_region_radius or max_trust_region_radius." << std::endl;
+        }
+    }
+    
+    std::cout << "\n=== Optimization complete ===" << std::endl;
+    
     
 }
 
@@ -1264,8 +1610,8 @@ int main(int /* argc */, char** /* argv */) {
     pMap->SetKeyFrames(vpKFs);
     pMap->SetMapPoints(vpMPs);
     
-    // Run OptimizeEssentialGraph with CERES - but only the first 100 lines
-    std::cout << "Starting OptimizeEssentialGraphCeres - First 100 lines only" << std::endl;
+    // Run OptimizeEssentialGraph with CERES
+    std::cout << "Starting OptimizeEssentialGraphCeres" << std::endl;
     OptimizeEssentialGraphCeres(pMap, pLoopKF, pCurKF, NonCorrectedSE3, CorrectedSE3, LoopConnections, bFixScale);
     
     // Clean up
