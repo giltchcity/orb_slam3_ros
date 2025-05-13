@@ -826,9 +826,26 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     
     // ===== 执行优化 =====
     std::cout << "Step 4: Running optimization..." << std::endl;
+    
+    // 配置求解器选项
+    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.minimizer_progress_to_stdout = true;
+    options.max_num_iterations = 20; // 与原始代码相同
+    options.function_tolerance = 1e-6;
+    options.gradient_tolerance = 1e-10;
+    options.parameter_tolerance = 1e-8;
+    
+    // 执行优化
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
+    
+    // 打印详细的优化报告
+    std::cout << "Optimization report:" << std::endl;
     std::cout << summary.BriefReport() << std::endl;
+    std::cout << "Initial cost: " << summary.initial_cost << std::endl;
+    std::cout << "Final cost: " << summary.final_cost << std::endl;
+    std::cout << "Change: " << (summary.initial_cost - summary.final_cost) / summary.initial_cost * 100.0 << "%" << std::endl;
+
     
     // // 保存优化后的轨迹用于验证
     // SaveTrajectory(optimizedTrajectoryFile, vpKFs, vPoseParams);
