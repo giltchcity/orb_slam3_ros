@@ -825,10 +825,10 @@ void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
     std::cout << "Total inserted edges: " << sInsertedEdges.size() << std::endl;
     
     // ===== 执行优化 =====
-    // std::cout << "Step 4: Running optimization..." << std::endl;
-    // ceres::Solver::Summary summary;
-    // ceres::Solve(options, &problem, &summary);
-    // std::cout << summary.BriefReport() << std::endl;
+    std::cout << "Step 4: Running optimization..." << std::endl;
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+    std::cout << summary.BriefReport() << std::endl;
     
     // // 保存优化后的轨迹用于验证
     // SaveTrajectory(optimizedTrajectoryFile, vpKFs, vPoseParams);
