@@ -187,7 +187,7 @@ void LoopClosing::SaveOptimizationData(const string& baseDir,
     
     // 3.2 保存KF位姿
     ofstream posesFile(optimDir + "keyframe_poses.txt");
-    posesFile << "# KF_ID tx ty tz qx qy qz qw" << endl;
+    posesFile << "# KF_ID timestamp tx ty tz qx qy qz qw" << endl;
     for(KeyFrame* pKF : vpKFs) {
         if(pKF->isBad()) continue;
         
@@ -196,6 +196,7 @@ void LoopClosing::SaveOptimizationData(const string& baseDir,
         Eigen::Vector3f t = Tcw.translation();
         
         posesFile << pKF->mnId << " "
+                  << fixed << setprecision(9) << pKF->mTimeStamp << " " // 添加时间戳
                   << t.x() << " " << t.y() << " " << t.z() << " "
                   << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
     }
@@ -353,6 +354,33 @@ void LoopClosing::SaveOptimizationData(const string& baseDir,
     loopConnFile.close();
     
     cout << "Optimization data saved to: " << optimDir << endl;
+
+    // 添加到函数末尾
+    ofstream loopConstraintFile(optimDir + "loop_match.txt");
+    loopConstraintFile << "# CURRENT_KF_ID LOOP_KF_ID" << endl;
+    loopConstraintFile << "# 相对变换矩阵(4x4): 从当前KF到回环KF的变换" << endl;
+    
+    // 计算相对变换
+    Sophus::SE3f Tcw = pCurKF->GetPose();
+    Sophus::SE3f Tlw = pLoopKF->GetPose();
+    Sophus::SE3f Tlc = Tlw * Tcw.inverse();
+    
+    // 提取旋转矩阵和平移向量
+    Eigen::Matrix3f R = Tlc.rotationMatrix();
+    Eigen::Vector3f t = Tlc.translation();
+    
+    // 保存为4x4矩阵
+    loopConstraintFile << pCurKF->mnId << " " << pLoopKF->mnId << endl;
+    loopConstraintFile << fixed << setprecision(9);
+    
+    // 保存4x4变换矩阵，按行主顺序
+    for(int i=0; i<3; i++) {
+        for(int j=0; j<3; j++) {
+            loopConstraintFile << R(i,j) << " ";
+        }
+        loopConstraintFile << t(i) << " ";
+    }
+    loopConstraintFile << "0 0 0 1" << endl;
 }
 
 
