@@ -613,7 +613,35 @@ int main(int argc, char** argv) {
         spanning_tree[child_id] = parent_id;
     }
     
+    
     std::cout << "Read " << spanning_tree.size() << " spanning tree edges" << std::endl;
+    
+    // Identify and collect boundary keyframes
+    std::set<std::pair<int, int>> boundary_keyframes;
+    for (const auto& edge : spanning_tree) {
+        int child_id = edge.first;
+        int parent_id = edge.second;
+        
+        bool child_corrected = (corrected_poses.find(child_id) != corrected_poses.end());
+        bool parent_corrected = (corrected_poses.find(parent_id) != corrected_poses.end());
+        bool is_boundary = (child_corrected != parent_corrected);
+        
+        if (is_boundary) {
+            boundary_keyframes.insert(std::make_pair(parent_id, child_id));
+        }
+    }
+    
+    std::cout << "\nFound " << boundary_keyframes.size() << " boundary keyframe pairs:" << std::endl;
+    for (const auto& pair : boundary_keyframes) {
+        std::cout << "  - KF " << pair.first << " -> KF " << pair.second;
+        bool parent_corrected = (corrected_poses.find(pair.first) != corrected_poses.end());
+        if (parent_corrected) {
+            std::cout << " (Parent corrected, Child uncorrected)" << std::endl;
+        } else {
+            std::cout << " (Parent uncorrected, Child corrected)" << std::endl;
+        }
+    }
+    std::cout << std::endl;
     
     // 6. Read map information
     std::ifstream map_info_file(data_dir + "map_info.txt");
@@ -714,6 +742,16 @@ int main(int argc, char** argv) {
             bool parent_corrected = (corrected_poses.find(parent_id) != corrected_poses.end());
             bool is_boundary = (child_corrected != parent_corrected);
             
+            // Always print boundary information
+            if (is_boundary) {
+                std::cout << "FOUND BOUNDARY: KF " << parent_id << " -> KF " << child_id;
+                if (parent_corrected) {
+                    std::cout << " (Parent corrected, Child uncorrected)" << std::endl;
+                } else {
+                    std::cout << " (Parent uncorrected, Child corrected)" << std::endl;
+                }
+            }
+            
             // Print detailed pose information
             printDetailedRelativePose(
                 parent_id, child_id, 
@@ -727,58 +765,116 @@ int main(int argc, char** argv) {
             print_counter++;
             
             // Setup the correct constraint depending on the region
-            Eigen::Quaterniond q_parent, q_child;
-            Eigen::Vector3d t_parent, t_child;
+            Eigen::Matrix4d T_parent_child = Eigen::Matrix4d::Identity();
             
+            // CORRECTED CODE: Handle boundary constraints properly
             if (is_boundary) {
-                // For boundary constraints, special handling is needed
-                if (parent_corrected) {
-                    // Parent is in corrected region
-                    q_parent = getQuaternionFromPose(corrected_poses[parent_id]);
-                    t_parent = getTranslationFromPose(corrected_poses[parent_id]);
+                // For boundary constraints, use pre-correction and original poses to determine the true constraint
+                int corrected_id = parent_corrected ? parent_id : child_id;
+                int uncorrected_id = parent_corrected ? child_id : parent_id;
+                
+                // Check if we have pre-correction data for the corrected keyframe
+                if (non_corrected_poses.find(corrected_id) != non_corrected_poses.end()) {
+                    // Get the pre-correction pose for the corrected keyframe
+                    Eigen::Quaterniond q_corrected_pre = getQuaternionFromPose(non_corrected_poses.at(corrected_id));
+                    Eigen::Vector3d t_corrected_pre = getTranslationFromPose(non_corrected_poses.at(corrected_id));
                     
-                    // Child is in uncorrected region
-                    q_child = getQuaternionFromPose(keyframe_poses[child_id]);
-                    t_child = getTranslationFromPose(keyframe_poses[child_id]);
+                    // Get the original pose for the uncorrected keyframe
+                    Eigen::Quaterniond q_uncorrected = getQuaternionFromPose(keyframe_poses.at(uncorrected_id));
+                    Eigen::Vector3d t_uncorrected = getTranslationFromPose(keyframe_poses.at(uncorrected_id));
+                    
+                    // Compute the true relative transform that should be maintained
+                    Eigen::Matrix3d R_corrected_pre = q_corrected_pre.toRotationMatrix();
+                    Eigen::Matrix3d R_uncorrected = q_uncorrected.toRotationMatrix();
+                    
+                    if (corrected_id == parent_id) {
+                        // Parent is corrected, child is uncorrected
+                        Eigen::Matrix3d R_rel = R_corrected_pre.transpose() * R_uncorrected;
+                        Eigen::Vector3d t_rel = R_corrected_pre.transpose() * (t_uncorrected - t_corrected_pre);
+                        
+                        T_parent_child.block<3, 3>(0, 0) = R_rel;
+                        T_parent_child.block<3, 1>(0, 3) = t_rel;
+                    } else {
+                        // Child is corrected, parent is uncorrected
+                        Eigen::Matrix3d R_rel = R_uncorrected.transpose() * R_corrected_pre;
+                        Eigen::Vector3d t_rel = R_uncorrected.transpose() * (t_corrected_pre - t_uncorrected);
+                        
+                        T_parent_child.block<3, 3>(0, 0) = R_rel;
+                        T_parent_child.block<3, 1>(0, 3) = t_rel;
+                    }
+                    
+                    std::cout << "Used TRUE relative pose for boundary constraint between KF " 
+                              << parent_id << " and KF " << child_id << std::endl;
                 } else {
-                    // Parent is in uncorrected region
-                    q_parent = getQuaternionFromPose(keyframe_poses[parent_id]);
-                    t_parent = getTranslationFromPose(keyframe_poses[parent_id]);
+                    // Fall back to standard approach if no pre-correction data available
+                    std::cerr << "WARNING: No pre-correction data for boundary keyframe " << corrected_id 
+                              << ", using potentially incorrect constraint!" << std::endl;
                     
-                    // Child is in corrected region
-                    q_child = getQuaternionFromPose(corrected_poses[child_id]);
-                    t_child = getTranslationFromPose(corrected_poses[child_id]);
+                    // Use the current poses (which might lead to inconsistent constraints)
+                    Eigen::Quaterniond q_parent, q_child;
+                    Eigen::Vector3d t_parent, t_child;
+                    
+                    if (parent_corrected) {
+                        q_parent = getQuaternionFromPose(corrected_poses[parent_id]);
+                        t_parent = getTranslationFromPose(corrected_poses[parent_id]);
+                        q_child = getQuaternionFromPose(keyframe_poses[child_id]);
+                        t_child = getTranslationFromPose(keyframe_poses[child_id]);
+                    } else {
+                        q_parent = getQuaternionFromPose(keyframe_poses[parent_id]);
+                        t_parent = getTranslationFromPose(keyframe_poses[parent_id]);
+                        q_child = getQuaternionFromPose(corrected_poses[child_id]);
+                        t_child = getTranslationFromPose(corrected_poses[child_id]);
+                    }
+                    
+                    Eigen::Matrix3d R_parent = q_parent.toRotationMatrix();
+                    Eigen::Matrix3d R_child = q_child.toRotationMatrix();
+                    
+                    Eigen::Matrix3d R_parent_child = R_parent.transpose() * R_child;
+                    Eigen::Vector3d t_parent_child = R_parent.transpose() * (t_child - t_parent);
+                    
+                    T_parent_child.block<3, 3>(0, 0) = R_parent_child;
+                    T_parent_child.block<3, 1>(0, 3) = t_parent_child;
                 }
             } else if (parent_corrected && child_corrected) {
                 // Both in corrected region - use corrected poses
-                q_parent = getQuaternionFromPose(corrected_poses[parent_id]);
-                t_parent = getTranslationFromPose(corrected_poses[parent_id]);
+                Eigen::Quaterniond q_parent = getQuaternionFromPose(corrected_poses[parent_id]);
+                Eigen::Vector3d t_parent = getTranslationFromPose(corrected_poses[parent_id]);
                 
-                q_child = getQuaternionFromPose(corrected_poses[child_id]);
-                t_child = getTranslationFromPose(corrected_poses[child_id]);
+                Eigen::Quaterniond q_child = getQuaternionFromPose(corrected_poses[child_id]);
+                Eigen::Vector3d t_child = getTranslationFromPose(corrected_poses[child_id]);
+                
+                Eigen::Matrix3d R_parent = q_parent.toRotationMatrix();
+                Eigen::Matrix3d R_child = q_child.toRotationMatrix();
+                
+                Eigen::Matrix3d R_parent_child = R_parent.transpose() * R_child;
+                Eigen::Vector3d t_parent_child = R_parent.transpose() * (t_child - t_parent);
+                
+                T_parent_child.block<3, 3>(0, 0) = R_parent_child;
+                T_parent_child.block<3, 1>(0, 3) = t_parent_child;
             } else {
                 // Both in uncorrected region - use original poses
-                q_parent = getQuaternionFromPose(keyframe_poses[parent_id]);
-                t_parent = getTranslationFromPose(keyframe_poses[parent_id]);
+                Eigen::Quaterniond q_parent = getQuaternionFromPose(keyframe_poses[parent_id]);
+                Eigen::Vector3d t_parent = getTranslationFromPose(keyframe_poses[parent_id]);
                 
-                q_child = getQuaternionFromPose(keyframe_poses[child_id]);
-                t_child = getTranslationFromPose(keyframe_poses[child_id]);
+                Eigen::Quaterniond q_child = getQuaternionFromPose(keyframe_poses[child_id]);
+                Eigen::Vector3d t_child = getTranslationFromPose(keyframe_poses[child_id]);
+                
+                Eigen::Matrix3d R_parent = q_parent.toRotationMatrix();
+                Eigen::Matrix3d R_child = q_child.toRotationMatrix();
+                
+                Eigen::Matrix3d R_parent_child = R_parent.transpose() * R_child;
+                Eigen::Vector3d t_parent_child = R_parent.transpose() * (t_child - t_parent);
+                
+                T_parent_child.block<3, 3>(0, 0) = R_parent_child;
+                T_parent_child.block<3, 1>(0, 3) = t_parent_child;
             }
             
-            // Compute the relative transformation to use as constraint
-            Eigen::Matrix3d R_parent = q_parent.toRotationMatrix();
-            Eigen::Matrix3d R_child = q_child.toRotationMatrix();
+            // Determine weight - higher weight for boundary constraints
+            double constraint_weight = is_boundary ? 500.0 : 100.0;
             
-            Eigen::Matrix3d R_parent_child = R_parent.transpose() * R_child;
-            Eigen::Vector3d t_parent_child = R_parent.transpose() * (t_child - t_parent);
-            
-            Eigen::Matrix4d T_parent_child = Eigen::Matrix4d::Identity();
-            T_parent_child.block<3, 3>(0, 0) = R_parent_child;
-            T_parent_child.block<3, 1>(0, 3) = t_parent_child;
-            
-            // Add the residual with medium weight (100.0) for spanning tree
+            // Add the residual
             ceres::CostFunction* spanning_tree_cost_function = 
-                new SE3RelativePoseCostFunction(T_parent_child, 100.0);
+                new SE3RelativePoseCostFunction(T_parent_child, constraint_weight);
             
             problem.AddResidualBlock(
                 spanning_tree_cost_function,
@@ -787,11 +883,17 @@ int main(int argc, char** argv) {
                 optimized_poses[child_id]
             );
             
+            // If this is a boundary constraint, we might want to add a positional constraint too
+            if (is_boundary) {
+                std::cout << "Added boundary constraint between KF " << parent_id 
+                          << " and KF " << child_id << " with weight " << constraint_weight << std::endl;
+            }
+            
             spanning_tree_count++;
         }
     }
     
-    std::cout << "\nAdded " << spanning_tree_count << " spanning tree constraints with weight 100.0" << std::endl;
+    std::cout << "\nAdded " << spanning_tree_count << " spanning tree constraints" << std::endl;
     
     // Configure the solver
     ceres::Solver::Options options;
