@@ -1,1373 +1,670 @@
 #include <iostream>
 #include <fstream>
+#include <string>
 #include <vector>
 #include <map>
 #include <set>
-#include <string>
-#include <cmath>
-#include <mutex>
-#include <sstream>
+#include <unordered_map>
+#include <algorithm>
+#include <iomanip>  // For std::setprecision
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <sophus/se3.hpp>
 #include <ceres/ceres.h>
-#include <iomanip>
-#include <algorithm>
 #include <sys/stat.h>
 
-// 前向声明
-class KeyFrame;
-class MapPoint;
-class Map;
-
-// 定义SE3Pose类型
-typedef std::pair<Eigen::Quaterniond, Eigen::Vector3d> SE3Pose;
-
-// 定义KeyFrameAndPose类型
-typedef std::map<KeyFrame*, SE3Pose> KeyFrameAndPose;
-
-// 简化的KeyFrame类
-class KeyFrame {
-public:
-    unsigned long mnId;
-    double mTimeStamp;
-    bool mbFixedLinearizationPoint;
-    bool mbBad;
-    KeyFrame* mpParent;
-    std::set<KeyFrame*> mspLoopEdges;
-    std::vector<KeyFrame*> mvpOrderedConnectedKeyFrames;
-    std::vector<int> mvOrderedWeights;
-    bool bImu;
-    KeyFrame* mPrevKF;
-    KeyFrame* mNextKF;
-    
-    // 姿态作为旋转和平移分别存储
-    Eigen::Matrix3f mRcw;  // 旋转
-    Eigen::Vector3f mtcw;  // 平移
-
-    KeyFrame() : mnId(0), mTimeStamp(0), mbFixedLinearizationPoint(false), mbBad(false),
-                mpParent(nullptr), bImu(false), mPrevKF(nullptr), mNextKF(nullptr) {
-        mRcw = Eigen::Matrix3f::Identity();
-        mtcw = Eigen::Vector3f::Zero();
-    }
-
-    // 方法
-    bool isBad() const { return mbBad; }
-    
-    // 获取/设置姿态方法
-    void GetPose(Eigen::Matrix3f& R, Eigen::Vector3f& t) const {
-        R = mRcw;
-        t = mtcw;
-    }
-    
-    void SetPose(const Eigen::Matrix3f& R, const Eigen::Vector3f& t) {
-        mRcw = R;
-        mtcw = t;
-    }
-    
-    // 转换为逆变换
-    void GetPoseInverse(Eigen::Matrix3f& Rwc, Eigen::Vector3f& twc) const {
-        Rwc = mRcw.transpose();
-        twc = -Rwc * mtcw;
-    }
-    
-    KeyFrame* GetParent() { return mpParent; }
-    bool hasChild(KeyFrame* /* pKF */) const { return false; }  // 简化版
-    std::set<KeyFrame*> GetLoopEdges() const { return mspLoopEdges; }
-    
-    std::vector<KeyFrame*> GetCovisiblesByWeight(int minWeight) const {
-        std::vector<KeyFrame*> result;
-        for(size_t i=0; i<mvpOrderedConnectedKeyFrames.size(); i++) {
-            if(mvOrderedWeights[i] >= minWeight)
-                result.push_back(mvpOrderedConnectedKeyFrames[i]);
-        }
-        return result;
-    }
-    
-    std::vector<KeyFrame*> GetVectorCovisibleKeyFrames() const {
-        return mvpOrderedConnectedKeyFrames;
-    }
-    
-    int GetWeight(KeyFrame* pKF) const { 
-        // 在mvpOrderedConnectedKeyFrames中查找pKF并返回权重
-        for(size_t i=0; i<mvpOrderedConnectedKeyFrames.size(); i++) {
-            if(mvpOrderedConnectedKeyFrames[i] == pKF)
-                return mvOrderedWeights[i];
-        }
-        return 0;
-    }
-    
-    bool isVelocitySet() const { return false; }  // 简化版
-    
-    Eigen::Vector3f GetVelocity() const { return Eigen::Vector3f::Zero(); }  // 简化版
-    
-    Eigen::Vector3f GetGyroBias() const { return Eigen::Vector3f::Zero(); }  // 简化版
-    
-    Eigen::Vector3f GetAccBias() const { return Eigen::Vector3f::Zero(); }  // 简化版
+// 定义关键帧结构
+struct KeyFrame {
+    unsigned long id;
+    unsigned long parent_id;
+    double timestamp;
+    bool is_fixed;
+    Sophus::SE3d pose;  // 世界坐标系到相机坐标系的变换
 };
 
-// 简化的MapPoint类
-class MapPoint {
-public:
-    unsigned long mnId;
-    bool mbBad;
-    Eigen::Vector3f mWorldPos;
-    KeyFrame* mpRefKF;
-    unsigned long mnCorrectedByKF;
-    unsigned long mnCorrectedReference;
-
-    MapPoint() : mnId(0), mbBad(false), mpRefKF(nullptr), 
-                mnCorrectedByKF(0), mnCorrectedReference(0) {
-        mWorldPos = Eigen::Vector3f::Zero();
-    }
-
-    // 方法
-    bool isBad() const { return mbBad; }
-    Eigen::Vector3f GetWorldPos() const { return mWorldPos; }
-    void SetWorldPos(const Eigen::Vector3f& pos) { mWorldPos = pos; }
-    KeyFrame* GetReferenceKeyFrame() { return mpRefKF; }
-    void UpdateNormalAndDepth() { /* 简化版 */ }
-};
-
-// 简化的Map类
-class Map {
-public:
-    unsigned long mnId;
-    unsigned long mnInitKFid;
-    unsigned long mnMaxKFid;
-    bool mbImuInitialized;
-    std::mutex mMutexMapUpdate;
-    
-    Map() : mnId(0), mnInitKFid(0), mnMaxKFid(0), mbImuInitialized(false) {}
-
-    // 方法
-    int GetId() const { return mnId; }
-    unsigned long GetInitKFid() const { return mnInitKFid; }
-    unsigned long GetMaxKFid() const { return mnMaxKFid; }
-    bool IsInertial() const { return false; }  // 简化版
-    bool isImuInitialized() const { return mbImuInitialized; }
-    void IncreaseChangeIndex() { /* 简化版 */ }
-    
-    // 简化的IMU状态函数
-    bool GetIniertialBA1() const { return false; }
-    bool GetIniertialBA2() const { return false; }
-    
-    // 数据访问
-    std::vector<KeyFrame*> GetAllKeyFrames() const { return mvpKeyFrames; }
-    std::vector<MapPoint*> GetAllMapPoints() const { return mvpMapPoints; }
-    int KeyFramesInMap() const { return mvpKeyFrames.size(); }
-    int MapPointsInMap() const { return mvpMapPoints.size(); }
-
-    // 设置数据
-    void SetKeyFrames(const std::vector<KeyFrame*>& vpKFs) { mvpKeyFrames = vpKFs; }
-    void SetMapPoints(const std::vector<MapPoint*>& vpMPs) { mvpMapPoints = vpMPs; }
-
-private:
-    std::vector<KeyFrame*> mvpKeyFrames;
-    std::vector<MapPoint*> mvpMapPoints;
-};
-
-// 用于更好数值稳定性的角轴转换
-template <typename T>
-void StabilizedRotationToMatrix(const T* angle_axis, T* R) {
-    T angle = sqrt(angle_axis[0]*angle_axis[0] + 
-                  angle_axis[1]*angle_axis[1] + 
-                  angle_axis[2]*angle_axis[2]);
-    
-    // 特别处理小角度避免除以零
-    if (angle < T(1e-10)) {
-        // 对小角度使用一阶近似
-        R[0] = T(1.0);
-        R[1] = -angle_axis[2];
-        R[2] = angle_axis[1];
-        R[3] = angle_axis[2];
-        R[4] = T(1.0);
-        R[5] = -angle_axis[0];
-        R[6] = -angle_axis[1];
-        R[7] = angle_axis[0];
-        R[8] = T(1.0);
-        return;
-    }
-    
-    T axis[3];
-    axis[0] = angle_axis[0] / angle;
-    axis[1] = angle_axis[1] / angle;
-    axis[2] = angle_axis[2] / angle;
-    
-    T cos_angle = cos(angle);
-    T sin_angle = sin(angle);
-    T one_minus_cos = T(1.0) - cos_angle;
-    
-    // 标准罗德里格斯公式
-    R[0] = axis[0] * axis[0] * one_minus_cos + cos_angle;
-    R[1] = axis[0] * axis[1] * one_minus_cos - axis[2] * sin_angle;
-    R[2] = axis[0] * axis[2] * one_minus_cos + axis[1] * sin_angle;
-    R[3] = axis[1] * axis[0] * one_minus_cos + axis[2] * sin_angle;
-    R[4] = axis[1] * axis[1] * one_minus_cos + cos_angle;
-    R[5] = axis[1] * axis[2] * one_minus_cos - axis[0] * sin_angle;
-    R[6] = axis[2] * axis[0] * one_minus_cos - axis[1] * sin_angle;
-    R[7] = axis[2] * axis[1] * one_minus_cos + axis[0] * sin_angle;
-    R[8] = axis[2] * axis[2] * one_minus_cos + cos_angle;
-}
-
-// 改进的SE3EdgeCostFunction，更好的数值稳定性
-struct SE3EdgeCostFunction {
-    SE3EdgeCostFunction(const Eigen::Matrix3d& R_meas, const Eigen::Vector3d& t_meas, double weight = 1.0) 
-        : R_measurement(R_meas), t_measurement(t_meas), weight_(weight) {
-        // 验证测量值的正交性
-        double det = R_measurement.determinant();
-        if(std::abs(det - 1.0) > 1e-6) {
-            std::cout << "Warning: Non-orthogonal rotation matrix detected. Det = " << det << std::endl;
-            // 使用SVD进行正交化
-            Eigen::JacobiSVD<Eigen::Matrix3d> svd(R_measurement, Eigen::ComputeFullU | Eigen::ComputeFullV);
-            R_measurement = svd.matrixU() * svd.matrixV().transpose();
-        }
-    }
+// SE3相对位姿代价函数
+struct SE3RelativePoseCostFunctor {
+    SE3RelativePoseCostFunctor(const Sophus::SE3d& T_ab) : T_ab_(T_ab) {}
     
     template <typename T>
-    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
-        // 提取参数（角轴+平移）
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> rot_i(pose_i);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> trans_i(pose_i + 3);
+    bool operator()(
+        const T* const pose_a,  // 7参数：[tx,ty,tz,qx,qy,qz,qw]
+        const T* const pose_b,
+        T* residuals) const {
         
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> rot_j(pose_j);
-        Eigen::Map<const Eigen::Matrix<T, 3, 1>> trans_j(pose_j + 3);
+        // 提取位姿A（世界坐标系到A相机坐标系的变换）
+        Eigen::Map<const Eigen::Matrix<T,3,1>> t_a(pose_a);
+        Eigen::Map<const Eigen::Quaternion<T>> q_a(pose_a + 3);
         
-        // 使用StabilizedRotationToMatrix函数将角轴转换为旋转矩阵
-        T R_i[9], R_j[9];
-        StabilizedRotationToMatrix(rot_i.data(), R_i);
-        StabilizedRotationToMatrix(rot_j.data(), R_j);
+        // 提取位姿B（世界坐标系到B相机坐标系的变换）
+        Eigen::Map<const Eigen::Matrix<T,3,1>> t_b(pose_b);
+        Eigen::Map<const Eigen::Quaternion<T>> q_b(pose_b + 3);
         
-        // 转换为模板类型的测量值
-        Eigen::Matrix<T, 3, 3> R_meas = R_measurement.cast<T>();
-        Eigen::Matrix<T, 3, 1> t_meas = t_measurement.cast<T>();
+        // 计算相对位姿：从B相机坐标系到A相机坐标系的变换
+        Sophus::SE3<T> T_a_w(q_a, t_a);
+        Sophus::SE3<T> T_b_w(q_b, t_b);
+        Sophus::SE3<T> T_a_b = T_a_w * T_b_w.inverse();
         
-        // 创建旋转矩阵
-        Eigen::Matrix<T, 3, 3> R_i_mat, R_j_mat;
-        R_i_mat << R_i[0], R_i[1], R_i[2], 
-                   R_i[3], R_i[4], R_i[5], 
-                   R_i[6], R_i[7], R_i[8];
+        // 计算与测量值的差异
+        Sophus::SE3<T> T_a_b_measured(
+            Eigen::Quaternion<T>(T_ab_.unit_quaternion().cast<T>()),
+            T_ab_.translation().cast<T>());
         
-        R_j_mat << R_j[0], R_j[1], R_j[2], 
-                   R_j[3], R_j[4], R_j[5], 
-                   R_j[6], R_j[7], R_j[8];
-        
-        // 计算预测的相对变换
-        Eigen::Matrix<T, 3, 3> R_i_inv = R_i_mat.transpose();
-        Eigen::Matrix<T, 3, 1> t_i_inv = -R_i_inv * trans_i;
-        
-        Eigen::Matrix<T, 3, 3> R_ji_pred = R_j_mat * R_i_inv;
-        Eigen::Matrix<T, 3, 1> t_ji_pred = R_j_mat * t_i_inv + trans_j;
-        
-        // 计算旋转误差: log(R_meas^T * R_ji_pred)
-        Eigen::Matrix<T, 3, 3> R_error_mat = R_meas.transpose() * R_ji_pred;
-        
-        // 更稳定的对数映射实现
-        Eigen::Matrix<T, 3, 1> rot_error;
-        LogSO3(R_error_mat, rot_error);
-        
-        // 计算平移误差
-        Eigen::Matrix<T, 3, 1> t_error = t_ji_pred - t_meas;
-        
-        // 应用权重 - 使用平方根以兼容信息矩阵
-        T sqrt_weight = sqrt(T(weight_));
+        // 计算误差（SE3的李代数表示）
+        Eigen::Matrix<T,6,1> error = (T_a_b_measured.inverse() * T_a_b).log();
         
         // 填充残差
-        residuals[0] = sqrt_weight * rot_error[0];
-        residuals[1] = sqrt_weight * rot_error[1];
-        residuals[2] = sqrt_weight * rot_error[2];
-        residuals[3] = sqrt_weight * t_error[0];
-        residuals[4] = sqrt_weight * t_error[1];
-        residuals[5] = sqrt_weight * t_error[2];
+        for (int i = 0; i < 6; ++i) {
+            residuals[i] = error[i];
+        }
         
         return true;
     }
     
-    // 更稳定的SO3对数映射
-    template <typename T>
-    static void LogSO3(const Eigen::Matrix<T, 3, 3>& R, Eigen::Matrix<T, 3, 1>& log_r) {
-        T cos_theta = (R.trace() - T(1.0)) * T(0.5);
-        cos_theta = cos_theta < T(-1.0) ? T(-1.0) : (cos_theta > T(1.0) ? T(1.0) : cos_theta);
-        
-        T theta = acos(cos_theta);
-        
-        if (theta < T(1e-10)) {
-            // 近似为零旋转
-            log_r.setZero();
-            return;
-        }
-        
-        // 计算sin(theta)
-        T sin_theta = sin(theta);
-        
-        if (sin_theta < T(1e-10)) {
-            // 处理特殊情况：180度旋转
-            Eigen::Matrix<T, 3, 3> W = (R - R.transpose()) * T(0.5);
-            log_r[0] = W(2, 1);
-            log_r[1] = W(0, 2);
-            log_r[2] = W(1, 0);
-            
-            T norm = log_r.norm();
-            if (norm > T(1e-10)) {
-                log_r = log_r / norm * theta;
-            } else {
-                // 特别处理：找到R+I的行最大值来确定旋转轴
-                Eigen::Matrix<T, 3, 3> RplusI = R + Eigen::Matrix<T, 3, 3>::Identity();
-                Eigen::Matrix<T, 3, 1> col;
-                int max_col = 0;
-                col = RplusI.col(0);
-                
-                for (int i = 1; i < 3; ++i) {
-                    if (RplusI.col(i).norm() > col.norm()) {
-                        col = RplusI.col(i);
-                        max_col = i;
-                    }
-                }
-                
-                col.normalize();
-                log_r = col * theta;
-            }
-        } else {
-            // 标准情况
-            T scale = theta / (T(2.0) * sin_theta);
-            Eigen::Matrix<T, 3, 3> W = (R - R.transpose()) * scale;
-            log_r[0] = W(2, 1);
-            log_r[1] = W(0, 2);
-            log_r[2] = W(1, 0);
-        }
-    }
-    
-    static ceres::CostFunction* Create(const Eigen::Matrix3d& R_meas, 
-                                      const Eigen::Vector3d& t_meas, 
-                                      double weight = 1.0) {
-        return new ceres::AutoDiffCostFunction<SE3EdgeCostFunction, 6, 6, 6>(
-            new SE3EdgeCostFunction(R_meas, t_meas, weight));
-    }
-    
-    Eigen::Matrix3d R_measurement;
-    Eigen::Vector3d t_measurement;
-    double weight_;
+private:
+    Sophus::SE3d T_ab_; // 测量的相对位姿
 };
 
-// Ceres 2.2中的自定义SE3流形
-class SE3Manifold : public ceres::Manifold {
-public:
-    virtual ~SE3Manifold() {}
-
-    // Plus操作: x_plus_delta = Plus(x, delta)
-    virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const {
-        // x为[角轴(3), 平移(3)]
-        // delta为[角轴delta(3), 平移delta(3)]
-        // x_plus_delta为结果
-        
-        // 处理旋转(角轴)
-        Eigen::Map<const Eigen::Vector3d> angleAxis(x);
-        Eigen::Map<const Eigen::Vector3d> delta_angleAxis(delta);
-        Eigen::Map<Eigen::Vector3d> result_angleAxis(x_plus_delta);
-        
-        // 处理零角轴情况
-        if(angleAxis.norm() < 1e-10) {
-            result_angleAxis = delta_angleAxis;
-        } else if(delta_angleAxis.norm() < 1e-10) {
-            result_angleAxis = angleAxis;
-        } else {
-            // 转换为四元数，相乘，再转回角轴
-            Eigen::AngleAxisd aa1(angleAxis.norm(), angleAxis.normalized());
-            Eigen::AngleAxisd aa2(delta_angleAxis.norm(), delta_angleAxis.normalized());
-            
-            Eigen::Quaterniond q1(aa1);
-            Eigen::Quaterniond q2(aa2);
-            Eigen::Quaterniond q_res = q2 * q1;
-            q_res.normalize();
-            
-            Eigen::AngleAxisd aa_res(q_res);
-            if(aa_res.angle() < 1e-10) {
-                result_angleAxis = Eigen::Vector3d::Zero();
-            } else {
-                result_angleAxis = aa_res.angle() * aa_res.axis();
-            }
-        }
-        
-        // 处理平移
-        Eigen::Map<const Eigen::Vector3d> translation(x + 3);
-        Eigen::Map<const Eigen::Vector3d> delta_translation(delta + 3);
-        Eigen::Map<Eigen::Vector3d> result_translation(x_plus_delta + 3);
-        
-        // 计算更新后的平移
-        if(delta_angleAxis.norm() > 1e-10) {
-            Eigen::AngleAxisd aa2(delta_angleAxis.norm(), delta_angleAxis.normalized());
-            Eigen::Matrix3d R_delta = aa2.toRotationMatrix();
-            result_translation = R_delta * translation + delta_translation;
-        } else {
-            result_translation = translation + delta_translation;
-        }
-        
-        return true;
-    }
-
-    // PlusJacobian
-    virtual bool PlusJacobian(const double* x, double* jacobian) const {
-        // SE3的Jacobian为6x6
-        Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> J(jacobian);
-        J.setZero();
-        
-        // 旋转块：对小变化为单位矩阵
-        J.block<3, 3>(0, 0).setIdentity();
-        
-        // 平移块：单位矩阵
-        J.block<3, 3>(3, 3).setIdentity();
-        
-        // 交叉项：旋转影响平移
-        Eigen::Map<const Eigen::Vector3d> angleAxis(x);
-        
-        if(angleAxis.norm() > 1e-10) {
-            Eigen::AngleAxisd aa(angleAxis.norm(), angleAxis.normalized());
-            Eigen::Matrix3d R = aa.toRotationMatrix();
-            
-            Eigen::Map<const Eigen::Vector3d> t(x + 3);
-            Eigen::Matrix3d skew;
-            skew << 0, -t(2), t(1),
-                    t(2), 0, -t(0),
-                    -t(1), t(0), 0;
-                    
-            J.block<3, 3>(3, 0) = -R * skew;
-        }
-        
-        return true;
-    }
+// 处理关键帧位姿
+void processKeyframePose(std::stringstream& ss, std::map<unsigned long, KeyFrame>& keyframes) {
+    unsigned long kf_id;
+    double timestamp, tx, ty, tz, qx, qy, qz, qw;
     
-    // Minus操作: y_minus_x = Minus(y, x)
-    virtual bool Minus(const double* y, const double* x, double* y_minus_x) const {
-        // y和x是[角轴(3), 平移(3)]
-        // y_minus_x是切空间差异[旋转差异(3), 平移差异(3)]
-        
-        // 转换为SE3矩阵
-        Eigen::Map<const Eigen::Vector3d> x_aa(x);
-        Eigen::Map<const Eigen::Vector3d> x_t(x + 3);
-        Eigen::Map<const Eigen::Vector3d> y_aa(y);
-        Eigen::Map<const Eigen::Vector3d> y_t(y + 3);
-        
-        // 处理零角轴情况
-        if(x_aa.norm() < 1e-10 && y_aa.norm() < 1e-10) {
-            Eigen::Map<Eigen::Vector3d> result_aa(y_minus_x);
-            result_aa = Eigen::Vector3d::Zero();
-            Eigen::Map<Eigen::Vector3d> result_t(y_minus_x + 3);
-            result_t = y_t - x_t;
-            return true;
-        }
-        
-        // 将角轴转换为旋转矩阵
-        Eigen::Matrix3d R_x = Eigen::Matrix3d::Identity();
-        Eigen::Matrix3d R_y = Eigen::Matrix3d::Identity();
-        
-        if(x_aa.norm() > 1e-10) {
-            Eigen::AngleAxisd x_rotation(x_aa.norm(), x_aa.normalized());
-            R_x = x_rotation.toRotationMatrix();
-        }
-        
-        if(y_aa.norm() > 1e-10) {
-            Eigen::AngleAxisd y_rotation(y_aa.norm(), y_aa.normalized());
-            R_y = y_rotation.toRotationMatrix();
-        }
-        
-        // 计算相对旋转R_rel = R_y * R_x^T
-        Eigen::Matrix3d R_rel = R_y * R_x.transpose();
-        
-        // 转换回角轴表示
-        Eigen::AngleAxisd aa_rel(R_rel);
-        Eigen::Map<Eigen::Vector3d> result_aa(y_minus_x);
-        
-        if(aa_rel.angle() < 1e-10) {
-            result_aa = Eigen::Vector3d::Zero();
-        } else {
-            result_aa = aa_rel.angle() * aa_rel.axis();
-        }
-        
-        // 计算相对平移: R_x^T * (y_t - x_t)
-        Eigen::Map<Eigen::Vector3d> result_t(y_minus_x + 3);
-        result_t = R_x.transpose() * (y_t - x_t);
-        
-        return true;
-    }
+    ss >> kf_id >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw;
     
-    // MinusJacobian计算Minus(y, x)关于x的导数
-    virtual bool MinusJacobian(const double* x, double* jacobian) const {
-        // 计算y_minus_x关于x的Jacobian
-        Eigen::Map<Eigen::Matrix<double, 6, 6, Eigen::RowMajor>> J(jacobian);
-        J.setZero();
-        
-        // 对于小扰动，我们可以对旋转使用负单位矩阵近似
-        J.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity();
-        
-        // 将角轴转换为旋转矩阵
-        Eigen::Map<const Eigen::Vector3d> x_aa(x);
-        Eigen::Matrix3d R_x = Eigen::Matrix3d::Identity();
-        
-        if(x_aa.norm() > 1e-10) {
-            Eigen::AngleAxisd aa(x_aa.norm(), x_aa.normalized());
-            R_x = aa.toRotationMatrix();
-        }
-        
-        // 对于平移，我们需要-R_x^T
-        J.block<3, 3>(3, 3) = -R_x.transpose();
-        
-        // 交叉项：平移受旋转影响
-        Eigen::Map<const Eigen::Vector3d> t(x + 3);
-        Eigen::Matrix3d skew;
-        skew << 0, -t(2), t(1),
-                t(2), 0, -t(0),
-                -t(1), t(0), 0;
-                
-        // 注意：这对小角度变化是一个近似
-        J.block<3, 3>(3, 0) = R_x.transpose() * skew;
-        
-        return true;
-    }
-
-    virtual int AmbientSize() const { return 6; }  // 环境空间维度
-    virtual int TangentSize() const { return 6; }  // 切空间维度
-};
-
-// 正交化位姿函数
-void OrthogonalizeSE3Poses(std::vector<Eigen::Quaterniond>& vRotations) {
-    for (size_t i = 0; i < vRotations.size(); ++i) {
-        if (vRotations[i].coeffs().norm() > 0) {
-            vRotations[i].normalize();
-        }
-    }
+    KeyFrame& kf = keyframes[kf_id];
+    kf.id = kf_id;
+    kf.timestamp = timestamp;
+    kf.pose = Sophus::SE3d(Eigen::Quaterniond(qw, qx, qy, qz), Eigen::Vector3d(tx, ty, tz));
 }
 
-// 保存轨迹到文件
-void SaveTrajectory(const std::string& filename, const std::vector<KeyFrame*>& vpKFs, 
-                    const std::vector<double*>& vPoseParams = std::vector<double*>()) {
-    std::ofstream f;
-    f.open(filename.c_str());
-    f << std::fixed;
+// 处理关键帧信息
+void processKeyframeInfo(std::stringstream& ss, std::map<unsigned long, KeyFrame>& keyframes) {
+    unsigned long kf_id, parent_id;
+    int has_velocity, is_fixed, is_bad, is_inertial, is_virtual;
     
-    for(size_t i=0; i<vpKFs.size(); i++) {
-        KeyFrame* pKF = vpKFs[i];
-        if(pKF->isBad()) continue;
-        
-        if(!vPoseParams.empty() && i < vPoseParams.size() && vPoseParams[pKF->mnId]) {
-            // 从参数块保存
-            double* params = vPoseParams[pKF->mnId];
-            
-            // 将角轴转换为旋转矩阵
-            Eigen::Vector3d rot(params[0], params[1], params[2]);
-            Eigen::Vector3d trans(params[3], params[4], params[5]);
-            
-            double angle = rot.norm();
-            if(angle > 1e-10) {
-                Eigen::Vector3d axis = rot / angle;
-                Eigen::AngleAxisd aa(angle, axis);
-                Eigen::Matrix3d Rcw = aa.toRotationMatrix();
-                
-                // 保存为Twc (Tcw的逆)
-                Eigen::Matrix3d Rwc = Rcw.transpose();
-                Eigen::Vector3d twc = -Rwc * trans;
-                
-                Eigen::Quaterniond q(Rwc);
-                
-                f << pKF->mTimeStamp << " " 
-                  << twc.x() << " " << twc.y() << " " << twc.z() << " "
-                  << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
-            } else {
-                // 退化情况 - 单位旋转
-                Eigen::Vector3d twc = -trans;
-                f << pKF->mTimeStamp << " " 
-                  << twc.x() << " " << twc.y() << " " << twc.z() << " "
-                  << 0.0 << " " << 0.0 << " " << 0.0 << " " << 1.0 << std::endl;
-            }
-        } else {
-            // 直接从KeyFrame位姿保存
-            Eigen::Matrix3f Rwc;
-            Eigen::Vector3f twc;
-            pKF->GetPoseInverse(Rwc, twc);
-            
-            Eigen::Quaternionf q(Rwc);
-            
-            f << pKF->mTimeStamp << " " 
-              << twc.x() << " " << twc.y() << " " << twc.z() << " "
-              << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
-        }
-    }
+    ss >> kf_id >> parent_id >> has_velocity >> is_fixed >> is_bad >> is_inertial >> is_virtual;
     
-    f.close();
-    std::cout << "Saved trajectory to " << filename << std::endl;
-}
-
-// 从TUM格式文件加载轨迹
-std::vector<KeyFrame*> LoadTUMTrajectory(const std::string& filename) {
-    std::vector<KeyFrame*> vpKFs;
-    std::ifstream f(filename);
-    
-    if(!f.is_open()) {
-        std::cerr << "Cannot open file: " << filename << std::endl;
-        return vpKFs;
-    }
-    
-    std::string line;
-    unsigned long id = 0;
-    
-    while(std::getline(f, line)) {
-        std::istringstream iss(line);
-        double timestamp, tx, ty, tz, qx, qy, qz, qw;
-        
-        if(!(iss >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw)) {
-            continue;  // Skip invalid lines
-        }
-        
-        // 创建新的关键帧
-        KeyFrame* pKF = new KeyFrame();
-        pKF->mnId = id++;
-        pKF->mTimeStamp = timestamp;
-        
-        // 设置位姿：Twc -> Tcw
-        Eigen::Quaterniond q(qw, qx, qy, qz);
-        q.normalize(); // 确保单位四元数
-        
-        Eigen::Matrix3d Rwc = q.toRotationMatrix();
-        Eigen::Vector3d twc(tx, ty, tz);
-        
-        // 计算Tcw = inv(Twc)
-        Eigen::Matrix3d Rcw = Rwc.transpose();
-        Eigen::Vector3d tcw = -Rcw * twc;
-        
-        pKF->SetPose(Rcw.cast<float>(), tcw.cast<float>());
-        pKF->mbBad = false;
-        
-        vpKFs.push_back(pKF);
-    }
-    
-    f.close();
-    std::cout << "Loaded " << vpKFs.size() << " keyframes from " << filename << std::endl;
-    
-    // 设置额外的连接关系（简化版）
-    if(vpKFs.size() > 1) {
-        for(size_t i = 1; i < vpKFs.size(); i++) {
-            // 设置父子关系
-            vpKFs[i]->mpParent = vpKFs[i-1];
-            
-            // 添加共视关系（相邻帧）
-            int weight = 100;  // 默认权重
-            if(i > 0) {
-                vpKFs[i]->mvpOrderedConnectedKeyFrames.push_back(vpKFs[i-1]);
-                vpKFs[i]->mvOrderedWeights.push_back(weight);
-                
-                vpKFs[i-1]->mvpOrderedConnectedKeyFrames.push_back(vpKFs[i]);
-                vpKFs[i-1]->mvOrderedWeights.push_back(weight);
-            }
-        }
-    }
-    
-    return vpKFs;
-}
-
-// 加载共视图
-void LoadCovisibilityGraph(const std::string& filename, 
-                          std::vector<KeyFrame*>& vpKFs,
-                          int minWeight = 50) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Cannot open file: " << filename << std::endl;
+    // 确保关键帧存在
+    if (keyframes.find(kf_id) == keyframes.end()) {
+        std::cerr << "Warning: keyframe " << kf_id << " not found in poses file" << std::endl;
         return;
     }
     
+    KeyFrame& kf = keyframes[kf_id];
+    kf.parent_id = parent_id;
+    kf.is_fixed = (is_fixed == 1);
+}
+
+// 保存轨迹为TUM格式
+void saveTUMTrajectory(const std::string& filename, const std::map<unsigned long, KeyFrame>& keyframes) {
+    std::ofstream file(filename);
+    file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
+    
+    // 创建按时间戳排序的关键帧向量
+    std::vector<std::pair<double, unsigned long>> sorted_timestamps;
+    for (const auto& kf_pair : keyframes) {
+        sorted_timestamps.push_back({kf_pair.second.timestamp, kf_pair.first});
+    }
+    
+    // 按时间戳排序
+    std::sort(sorted_timestamps.begin(), sorted_timestamps.end());
+    
+    // 保存排序后的轨迹
+    for (const auto& ts_pair : sorted_timestamps) {
+        const KeyFrame& kf = keyframes.at(ts_pair.second);
+        Eigen::Vector3d t = kf.pose.translation();
+        Eigen::Quaterniond q = kf.pose.unit_quaternion();
+        
+        file << std::fixed << std::setprecision(9) 
+             << kf.timestamp << " "
+             << t.x() << " " << t.y() << " " << t.z() << " "
+             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+    }
+    
+    file.close();
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <data_dir>" << std::endl;
+        return 1;
+    }
+    
+    std::string data_dir = argv[1];
+    
+    // 1. 读取输入文件
+    
+    // 1.1 读取map_info.txt
+    unsigned long init_kf_id = 0;
+    unsigned long max_kf_id = 0;
+    
+    std::ifstream map_info_file(data_dir + "/optimization_data/map_info.txt");
+    if (!map_info_file.is_open()) {
+        std::cerr << "Failed to open map_info.txt" << std::endl;
+        return 1;
+    }
+    
     std::string line;
-    // 跳过头部
-    std::getline(file, line);
-    
-    int edgeCount = 0;
-    
-    while (std::getline(file, line)) {
+    while (std::getline(map_info_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
         std::stringstream ss(line);
-        unsigned long kfId1, kfId2;
+        std::string key;
+        ss >> key;
+        
+        if (key == "INIT_KF_ID") ss >> init_kf_id;
+        else if (key == "MAX_KF_ID") ss >> max_kf_id;
+    }
+    map_info_file.close();
+    
+    // 1.2 读取keyframe_ids.txt
+    unsigned long loop_kf_id = 0;
+    unsigned long current_kf_id = 0;
+    bool fixed_scale = true;
+    
+    std::ifstream kf_ids_file(data_dir + "/optimization_data/keyframe_ids.txt");
+    if (!kf_ids_file.is_open()) {
+        std::cerr << "Failed to open keyframe_ids.txt" << std::endl;
+        return 1;
+    }
+    
+    while (std::getline(kf_ids_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::stringstream ss(line);
+        std::string key;
+        unsigned long value;
+        ss >> key >> value;
+        
+        if (key == "LOOP_KF_ID") loop_kf_id = value;
+        else if (key == "CURRENT_KF_ID") current_kf_id = value;
+        else if (key == "FIXED_SCALE") fixed_scale = (value == 1);
+    }
+    kf_ids_file.close();
+    
+    // 1.3 读取loop_match.txt
+    // 1.3 读取loop_match.txt
+    Sophus::SE3d loop_relative_pose;  // 从当前KF到回环KF的变换
+    
+    std::ifstream loop_match_file(data_dir + "/optimization_data/loop_match.txt");
+    if (!loop_match_file.is_open()) {
+        std::cerr << "Failed to open loop_match.txt" << std::endl;
+        return 1;
+    }
+    
+    // 跳过注释行
+    while (std::getline(loop_match_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        break;
+    }
+    
+    // 读取KF ID行
+    std::stringstream ss(line);
+    unsigned long cur_id, loop_id;
+    ss >> cur_id >> loop_id;
+    
+    // 确保ID匹配
+    if (cur_id != current_kf_id || loop_id != loop_kf_id) {
+        std::cerr << "Warning: KF IDs in loop_match.txt don't match keyframe_ids.txt" << std::endl;
+    }
+    
+    // 读取相对变换矩阵
+    if (std::getline(loop_match_file, line)) {
+        Eigen::Matrix4d mat;
+        std::stringstream mat_ss(line);
+        
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                mat_ss >> mat(i, j);
+            }
+        }
+        
+        // 提取3x3旋转矩阵
+        Eigen::Matrix3d R = mat.block<3,3>(0,0);
+        
+        // 确保旋转矩阵正交
+        Eigen::JacobiSVD<Eigen::Matrix3d> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
+        Eigen::Matrix3d orthogonal_R = svd.matrixU() * svd.matrixV().transpose();
+        
+        // 确保是右手坐标系（行列式为正）
+        if (orthogonal_R.determinant() < 0) {
+            orthogonal_R = -orthogonal_R;
+        }
+        
+        // 使用正交化后的旋转矩阵和原始平移向量创建SE3
+        Eigen::Vector3d t = mat.block<3,1>(0,3);
+        loop_relative_pose = Sophus::SE3d(orthogonal_R, t);
+    }
+    loop_match_file.close();
+    
+    // 1.4 读取keyframe_poses.txt
+    std::map<unsigned long, KeyFrame> keyframes;
+    
+    std::ifstream poses_file(data_dir + "/optimization_data/keyframe_poses.txt");
+    if (!poses_file.is_open()) {
+        std::cerr << "Failed to open keyframe_poses.txt" << std::endl;
+        return 1;
+    }
+    
+    // 跳过注释行
+    while (std::getline(poses_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        break;
+    }
+    
+    // 处理第一行
+    std::stringstream first_ss(line);
+    processKeyframePose(first_ss, keyframes);
+    
+    // 处理剩余行
+    while (std::getline(poses_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::stringstream ss(line);
+        processKeyframePose(ss, keyframes);
+    }
+    poses_file.close();
+    
+    // 1.5 读取keyframes.txt，设置父关键帧和固定标志
+    std::ifstream kfs_file(data_dir + "/optimization_data/keyframes.txt");
+    if (!kfs_file.is_open()) {
+        std::cerr << "Failed to open keyframes.txt" << std::endl;
+        return 1;
+    }
+    
+    // 跳过注释行
+    while (std::getline(kfs_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        break;
+    }
+    
+    // 处理第一行
+    std::stringstream first_kf_ss(line);
+    processKeyframeInfo(first_kf_ss, keyframes);
+    
+    // 处理剩余行
+    while (std::getline(kfs_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::stringstream ss(line);
+        processKeyframeInfo(ss, keyframes);
+    }
+    kfs_file.close();
+    
+    // 1.6 读取spanning_tree.txt
+    std::map<unsigned long, unsigned long> spanning_tree;  // child -> parent
+    
+    std::ifstream tree_file(data_dir + "/optimization_data/spanning_tree.txt");
+    if (!tree_file.is_open()) {
+        std::cerr << "Failed to open spanning_tree.txt" << std::endl;
+        return 1;
+    }
+    
+    // 跳过注释行
+    while (std::getline(tree_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        break;
+    }
+    
+    // 处理第一行
+    {
+        std::stringstream ss(line);
+        unsigned long child_id, parent_id;
+        ss >> child_id >> parent_id;
+        spanning_tree[child_id] = parent_id;
+    }
+    
+    // 处理剩余行
+    while (std::getline(tree_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::stringstream ss(line);
+        unsigned long child_id, parent_id;
+        ss >> child_id >> parent_id;
+        spanning_tree[child_id] = parent_id;
+    }
+    tree_file.close();
+    
+    // 1.7 读取covisibility.txt
+    std::map<std::pair<unsigned long, unsigned long>, int> covisibility_weights;
+    
+    std::ifstream covis_file(data_dir + "/optimization_data/covisibility.txt");
+    if (!covis_file.is_open()) {
+        std::cerr << "Failed to open covisibility.txt" << std::endl;
+        return 1;
+    }
+    
+    // 跳过注释行
+    while (std::getline(covis_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        break;
+    }
+    
+    // 处理第一行
+    {
+        std::stringstream ss(line);
+        unsigned long kf_id, conn_id;
         int weight;
-        ss >> kfId1 >> kfId2 >> weight;
+        ss >> kf_id >> conn_id >> weight;
         
-        if (weight < minWeight) continue;
-        
-        // 查找KF指针
-        KeyFrame* pKF1 = nullptr;
-        KeyFrame* pKF2 = nullptr;
-        
-        for (auto& pKF : vpKFs) {
-            if (pKF->mnId == kfId1) pKF1 = pKF;
-            if (pKF->mnId == kfId2) pKF2 = pKF;
-            if (pKF1 && pKF2) break;
-        }
-        
-        if (!pKF1 || !pKF2) continue;
-        
-        // 添加到共视图（模拟ORB-SLAM3内部结构）
-        // 检查是否已存在连接
-        bool exists1 = false, exists2 = false;
-        for (auto& pKF : pKF1->mvpOrderedConnectedKeyFrames) {
-            if (pKF == pKF2) {
-                exists1 = true;
-                break;
-            }
-        }
-        
-        for (auto& pKF : pKF2->mvpOrderedConnectedKeyFrames) {
-            if (pKF == pKF1) {
-                exists2 = true;
-                break;
-            }
-        }
-        
-        if (!exists1) {
-            pKF1->mvpOrderedConnectedKeyFrames.push_back(pKF2);
-            pKF1->mvOrderedWeights.push_back(weight);
-        }
-        
-        if (!exists2) {
-            pKF2->mvpOrderedConnectedKeyFrames.push_back(pKF1);
-            pKF2->mvOrderedWeights.push_back(weight);
-        }
-        
-        edgeCount++;
+        std::pair<unsigned long, unsigned long> edge = 
+            (kf_id < conn_id) ? std::make_pair(kf_id, conn_id) : std::make_pair(conn_id, kf_id);
+        covisibility_weights[edge] = weight;
     }
     
-    file.close();
-    std::cout << "Loaded " << edgeCount << " covisibility edges with weight >= " << minWeight << std::endl;
-}
-
-// 加载回环边
-void LoadLoopEdges(const std::string& filename, std::vector<KeyFrame*>& vpKFs) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Cannot open file: " << filename << std::endl;
-        return;
-    }
-    
-    std::string line;
-    // 跳过头部
-    std::getline(file, line);
-    
-    int edgeCount = 0;
-    
-    while (std::getline(file, line)) {
+    // 处理剩余行
+    while (std::getline(covis_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
         std::stringstream ss(line);
-        unsigned long kfId1, kfId2;
-        ss >> kfId1 >> kfId2;
+        unsigned long kf_id, conn_id;
+        int weight;
+        ss >> kf_id >> conn_id >> weight;
         
-        // 查找KF指针
-        KeyFrame* pKF1 = nullptr;
-        KeyFrame* pKF2 = nullptr;
-        
-        for (auto& pKF : vpKFs) {
-            if (pKF->mnId == kfId1) pKF1 = pKF;
-            if (pKF->mnId == kfId2) pKF2 = pKF;
-            if (pKF1 && pKF2) break;
-        }
-        
-        if (!pKF1 || !pKF2) continue;
-        
-        // 添加回环边
-        pKF1->mspLoopEdges.insert(pKF2);
-        pKF2->mspLoopEdges.insert(pKF1);
-        
-        edgeCount++;
+        std::pair<unsigned long, unsigned long> edge = 
+            (kf_id < conn_id) ? std::make_pair(kf_id, conn_id) : std::make_pair(conn_id, kf_id);
+        covisibility_weights[edge] = weight;
+    }
+    covis_file.close();
+    
+    // 1.8 读取loop_connections.txt
+    std::map<unsigned long, std::set<unsigned long>> loop_connections;
+    
+    std::ifstream loop_conn_file(data_dir + "/optimization_data/loop_connections.txt");
+    if (!loop_conn_file.is_open()) {
+        std::cerr << "Failed to open loop_connections.txt" << std::endl;
+        return 1;
     }
     
-    file.close();
-    std::cout << "Loaded " << edgeCount << " loop edges" << std::endl;
-}
-
-// 加载回环连接
-void LoadLoopConnections(const std::string& filename, 
-                        std::map<KeyFrame*, std::set<KeyFrame*>>& loopConnections,
-                        const std::vector<KeyFrame*>& vpKFs) {
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        std::cerr << "Cannot open file: " << filename << std::endl;
-        return;
+    // 跳过注释行
+    while (std::getline(loop_conn_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        break;
     }
     
-    std::string line;
-    // 跳过头部
-    std::getline(file, line);
-    
-    while (std::getline(file, line)) {
+    // 处理第一行
+    {
         std::stringstream ss(line);
-        unsigned long kfId;
-        ss >> kfId;
+        unsigned long kf_id;
+        ss >> kf_id;
         
-        // 查找KF指针
-        KeyFrame* pKF = nullptr;
-        for (auto& pCandidateKF : vpKFs) {
-            if (pCandidateKF->mnId == kfId) {
-                pKF = pCandidateKF;
-                break;
-            }
+        unsigned long conn_id;
+        while (ss >> conn_id) {
+            loop_connections[kf_id].insert(conn_id);
         }
-        
-        if (!pKF) continue;
-        
-        std::set<KeyFrame*> connections;
-        unsigned long connId;
-        while (ss >> connId) {
-            // 查找连接的KF指针
-            for (auto& pConnKF : vpKFs) {
-                if (pConnKF->mnId == connId) {
-                    connections.insert(pConnKF);
-                    break;
-                }
-            }
-        }
-        
-        loopConnections[pKF] = connections;
     }
     
-    file.close();
-    std::cout << "Loaded " << loopConnections.size() << " loop connections" << std::endl;
-}
-
-// 加载SE3/Sim3变换
-void LoadSim3Transformations(const std::string& nonCorrectedFilename,
-                            const std::string& correctedFilename,
-                            KeyFrameAndPose& NonCorrectedSE3,
-                            KeyFrameAndPose& CorrectedSE3,
-                            const std::vector<KeyFrame*>& vpKFs) {
-    // 辅助函数加载Sim3数据
-    auto loadSim3File = [&vpKFs](const std::string& filename, KeyFrameAndPose& se3Map) {
-        std::ifstream file(filename);
-        if (!file.is_open()) {
-            std::cerr << "Cannot open file: " << filename << std::endl;
-            return;
+    // 处理剩余行
+    while (std::getline(loop_conn_file, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        
+        std::stringstream ss(line);
+        unsigned long kf_id;
+        ss >> kf_id;
+        
+        unsigned long conn_id;
+        while (ss >> conn_id) {
+            loop_connections[kf_id].insert(conn_id);
         }
-        
-        std::string line;
-        // 跳过头部
-        std::getline(file, line);
-        
-        while (std::getline(file, line)) {
-            std::stringstream ss(line);
-            unsigned long kfId;
-            double scale, tx, ty, tz, qx, qy, qz, qw;
-            ss >> kfId >> scale >> tx >> ty >> tz >> qx >> qy >> qz >> qw;
-            
-            // 查找KF指针
-            KeyFrame* pKF = nullptr;
-            for (auto& pCandidateKF : vpKFs) {
-                if (pCandidateKF->mnId == kfId) {
-                    pKF = pCandidateKF;
-                    break;
-                }
-            }
-            
-            if (!pKF) continue;
-            
-            // 转换为SE3Pose（忽略尺度因为我们使用SE3）
-            Eigen::Quaterniond q(qw, qx, qy, qz);
-            q.normalize();
-            Eigen::Vector3d t(tx, ty, tz);
-            
-            se3Map[pKF] = std::make_pair(q, t);
-        }
-        
-        file.close();
-        std::cout << "Loaded " << se3Map.size() << " SE3 transformations" << std::endl;
-    };
+    }
+    loop_conn_file.close();
     
-    loadSim3File(nonCorrectedFilename, NonCorrectedSE3);
-    loadSim3File(correctedFilename, CorrectedSE3);
-}
-
-// 修改OptimizeEssentialGraphCeres函数，重点关注这些关键部分
-
-void OptimizeEssentialGraphCeres(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
-                                const KeyFrameAndPose& NonCorrectedSE3,
-                                const KeyFrameAndPose& CorrectedSE3,
-                                const std::map<KeyFrame*, std::set<KeyFrame*>>& LoopConnections,
-                                const bool& /* bFixScale */) {
+    // 2. 设置CERES优化问题
     
-    std::cout << "Starting loop-focused OptimizeEssentialGraphCeres..." << std::endl;
+    // 2.1 备份原始关键帧位姿
+    std::map<unsigned long, Sophus::SE3d> original_poses;
+    for (const auto& kf_pair : keyframes) {
+        original_poses[kf_pair.first] = kf_pair.second.pose;
+    }
     
-    // 输出路径
-    std::string outputDir = "/Datasets/CERES_Work/output/";
-    
-    // 设置CERES优化器
+    // 2.2 配置求解器选项
     ceres::Problem problem;
+    ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
     
-    const std::vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
-    const unsigned int nMaxKFid = pMap->GetMaxKFid();
+    // 2.3 设置参数块
+    std::map<unsigned long, double*> pose_parameters;
     
-    // 1. 首先识别哪些关键帧已经被Sim3直接修正(通常是CorrectedSE3中的帧)
-    std::set<unsigned long> correctedKFIds;
-    for(const auto& entry : CorrectedSE3) {
-        KeyFrame* pKF = entry.first;
-        correctedKFIds.insert(pKF->mnId);
-    }
+    // 使用Ceres内置的欧氏空间和四元数流形组合 - 更适合SE3
+    // 更简洁的方式，使用类型推导
+    auto* product_manifold = new ceres::ProductManifold(
+        ceres::EuclideanManifold<3>{}, 
+        ceres::EigenQuaternionManifold{});
     
-    std::cout << "Found " << correctedKFIds.size() << " keyframes directly corrected by Sim3" << std::endl;
+    const int min_covisibility_weight = 100;  // 最小共视权重阈值
     
-    // 创建向量存储旋转和平移
-    std::vector<Eigen::Quaterniond> vRotations(nMaxKFid+1);
-    std::vector<Eigen::Vector3d> vTranslations(nMaxKFid+1);
-    std::vector<double*> vPoseParams(nMaxKFid+1, nullptr);
-    
-    // 2. 添加参数块，但对于已修正的关键帧，将它们固定
-    ceres::Manifold* se3_manifold = new SE3Manifold();
-    
-    for(KeyFrame* pKF : vpKFs) {
-        if(pKF->isBad()) continue;
+    // 对每个关键帧，添加SE3位姿变量
+    for (const auto& kf_pair : keyframes) {
+        unsigned long kf_id = kf_pair.first;
+        const KeyFrame& kf = kf_pair.second;
         
-        const unsigned long nIDi = pKF->mnId;
-        double* pose_params = new double[6];
+        // 每个SE3变量包含平移(3)和四元数旋转(4)
+        double* param = new double[7];
         
-        // 设置参数初始值
-        Eigen::Matrix3f Rcw;
-        Eigen::Vector3f tcw;
-        pKF->GetPose(Rcw, tcw);
+        // 平移部分
+        param[0] = kf.pose.translation()(0);
+        param[1] = kf.pose.translation()(1);
+        param[2] = kf.pose.translation()(2);
         
-        Eigen::Matrix3d Rcw_d = Rcw.cast<double>();
-        Eigen::Vector3d tcw_d = tcw.cast<double>();
+        // 旋转部分（四元数）
+        Eigen::Quaterniond q = kf.pose.unit_quaternion();
+        param[3] = q.x();
+        param[4] = q.y();
+        param[5] = q.z();
+        param[6] = q.w();
         
-        Eigen::Quaterniond q(Rcw_d);
-        q.normalize();
+        pose_parameters[kf_id] = param;
         
-        vRotations[nIDi] = q;
-        vTranslations[nIDi] = tcw_d;
+        // 添加到优化问题中 - 使用Ceres 2.2的Manifold API
+        problem.AddParameterBlock(param, 7, product_manifold);
         
-        // 转换为角轴
-        Eigen::AngleAxisd aa(q);
-        if(aa.angle() < 1e-10) {
-            pose_params[0] = 0.0;
-            pose_params[1] = 0.0;
-            pose_params[2] = 0.0;
-        } else {
-            pose_params[0] = aa.angle() * aa.axis()[0];
-            pose_params[1] = aa.angle() * aa.axis()[1];
-            pose_params[2] = aa.angle() * aa.axis()[2];
-        }
-        pose_params[3] = tcw_d[0];
-        pose_params[4] = tcw_d[1];
-        pose_params[5] = tcw_d[2];
-        
-        vPoseParams[nIDi] = pose_params;
-        
-        problem.AddParameterBlock(pose_params, 6, se3_manifold);
-        
-        // 3. 固定关键帧
-        // 修改固定策略：固定初始KF和直接被Sim3修正的关键帧
-        bool shouldFix = (pKF->mnId == pMap->GetInitKFid()) || 
-                         (correctedKFIds.count(pKF->mnId) > 0) ||
-                         (pKF->mnId == pLoopKF->mnId) ||  // 固定回环点
-                         (pKF->mnId == pCurKF->mnId);     // 固定当前点
-        
-        if(shouldFix) {
-            problem.SetParameterBlockConstant(pose_params);
-            std::cout << "Fixed keyframe: " << pKF->mnId << std::endl;
+        // 固定初始关键帧或指定为固定的关键帧
+        if (kf.is_fixed) {
+            problem.SetParameterBlockConstant(param);
         }
     }
     
-    // 4. 现在添加约束，但侧重于回环闭合
-    std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
+    // 3. 添加约束
     
-    // 4.1 首先添加强有力的回环约束 - 使用loop_info.txt中的信息
-    // 根据你的文件，回环关系是KF 448 <-> KF 1
-    KeyFrame* pKF448 = nullptr;
-    KeyFrame* pKF1 = nullptr;
-    
-    for(KeyFrame* pKF : vpKFs) {
-        if(pKF->mnId == 448) pKF448 = pKF;
-        if(pKF->mnId == 1) pKF1 = pKF;
-        if(pKF448 && pKF1) break;
+    // 3.1 添加生成树约束
+    for (const auto& tree_edge : spanning_tree) {
+        unsigned long child_id = tree_edge.first;
+        unsigned long parent_id = tree_edge.second;
+        
+        double* child_param = pose_parameters[child_id];
+        double* parent_param = pose_parameters[parent_id];
+        
+        // 计算相对变换
+        const KeyFrame& child_kf = keyframes[child_id];
+        const KeyFrame& parent_kf = keyframes[parent_id];
+        
+        Sophus::SE3d T_parent_world = parent_kf.pose;
+        Sophus::SE3d T_child_world = child_kf.pose;
+        Sophus::SE3d T_parent_child = T_parent_world * T_child_world.inverse();
+        
+        // 添加相对位姿约束
+        ceres::CostFunction* cost_function = 
+            new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
+                new SE3RelativePoseCostFunctor(T_parent_child));
+        
+        problem.AddResidualBlock(
+            cost_function, 
+            loss_function, 
+            parent_param,
+            child_param);
     }
     
-    if(pKF448 && pKF1) {
-        std::cout << "Adding explicit strong loop constraints between KF 448 and KF 1" << std::endl;
+    // 3.2 添加共视图约束
+    std::set<std::pair<unsigned long, unsigned long>> inserted_edges;
+    
+    for (const auto& covis_edge : covisibility_weights) {
+        const std::pair<unsigned long, unsigned long>& edge = covis_edge.first;
+        int weight = covis_edge.second;
         
-        // 获取位姿
-        double* params_448 = vPoseParams[pKF448->mnId];
-        double* params_1 = vPoseParams[pKF1->mnId];
+        // 跳过低权重的共视关系
+        if (weight < min_covisibility_weight) 
+            continue;
         
-        if(params_448 && params_1) {
-            // 添加10个额外的超强约束以确保这两个关键帧正确对齐
-            for(int i = 0; i < 10; i++) {
-                Eigen::Matrix3f Rcw_448, Rcw_1;
-                Eigen::Vector3f tcw_448, tcw_1;
-                pKF448->GetPose(Rcw_448, tcw_448);
-                pKF1->GetPose(Rcw_1, tcw_1);
+        unsigned long id1 = edge.first;
+        unsigned long id2 = edge.second;
+        
+        // 避免已经添加过的边（如生成树边）
+        if (spanning_tree[id1] == id2 || spanning_tree[id2] == id1)
+            continue;
+        
+        // 标记已插入边
+        inserted_edges.insert(edge);
+        
+        double* param1 = pose_parameters[id1];
+        double* param2 = pose_parameters[id2];
+        
+        // 计算相对变换
+        const KeyFrame& kf1 = keyframes[id1];
+        const KeyFrame& kf2 = keyframes[id2];
+        
+        Sophus::SE3d T_kf1_world = kf1.pose;
+        Sophus::SE3d T_kf2_world = kf2.pose;
+        Sophus::SE3d T_kf1_kf2 = T_kf1_world * T_kf2_world.inverse();
+        
+        // 添加相对位姿约束
+        ceres::CostFunction* cost_function = 
+            new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
+                new SE3RelativePoseCostFunctor(T_kf1_kf2));
+        
+        // 根据共视权重调整信息矩阵
+        double information_scale = weight / static_cast<double>(min_covisibility_weight);
+        if (information_scale > 1.0) information_scale = 1.0;
+        
+        ceres::LossFunction* scaled_loss = 
+            new ceres::ScaledLoss(loss_function, information_scale, ceres::TAKE_OWNERSHIP);
+        
+        problem.AddResidualBlock(
+            cost_function, 
+            scaled_loss, 
+            param1,
+            param2);
+    }
+    
+    // 3.3 添加回环约束
+    
+    // 3.3.1 首先添加来自loop_connections的约束
+    for (const auto& lc_pair : loop_connections) {
+        unsigned long kf_id = lc_pair.first;
+        const std::set<unsigned long>& connections = lc_pair.second;
+        
+        double* kf_param = pose_parameters[kf_id];
+        
+        for (unsigned long conn_id : connections) {
+            // 避免重复添加边
+            std::pair<unsigned long, unsigned long> edge = 
+                (kf_id < conn_id) ? std::make_pair(kf_id, conn_id) : std::make_pair(conn_id, kf_id);
                 
-                // 计算相对位姿
-                Eigen::Matrix3f Rwc_448 = Rcw_448.transpose();
-                Eigen::Vector3f twc_448 = -Rwc_448 * tcw_448;
+            if (inserted_edges.count(edge))
+                continue;
                 
-                Eigen::Matrix3f Rwc_1 = Rcw_1.transpose();
-                Eigen::Vector3f twc_1 = -Rwc_1 * tcw_1;
-                
-                // 计算相对变换
-                Eigen::Matrix3d R_rel = (Rwc_448 * Rwc_1.transpose()).cast<double>();
-                Eigen::Vector3d t_rel = (twc_448 - R_rel * twc_1).cast<double>();
-                
-                // 添加超强约束 - 权重5000
-                ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_rel, t_rel, 5000.0);
-                ceres::LossFunction* loss_function = new ceres::HuberLoss(0.1); // 小阈值更强调精确对齐
-                problem.AddResidualBlock(edge_se3, loss_function, params_1, params_448);
-            }
+            // 标记已插入边
+            inserted_edges.insert(edge);
             
-            // 也添加他们附近关键帧之间的回环约束
-            const int numNeighborsToConnect = 5;
+            double* conn_param = pose_parameters[conn_id];
             
-            for(int i = 1; i <= numNeighborsToConnect; i++) {
-                for(int j = 1; j <= numNeighborsToConnect; j++) {
-                    if(pKF448->mnId - i >= 0 && pKF1->mnId + j < vpKFs.size()) {
-                        KeyFrame* pKFnear448 = nullptr;
-                        KeyFrame* pKFnear1 = nullptr;
-                        
-                        for(KeyFrame* pKF : vpKFs) {
-                            if(pKF->mnId == pKF448->mnId - i) pKFnear448 = pKF;
-                            if(pKF->mnId == pKF1->mnId + j) pKFnear1 = pKF;
-                            if(pKFnear448 && pKFnear1) break;
-                        }
-                        
-                        if(pKFnear448 && pKFnear1) {
-                            double* params_near448 = vPoseParams[pKFnear448->mnId];
-                            double* params_near1 = vPoseParams[pKFnear1->mnId];
-                            
-                            if(params_near448 && params_near1) {
-                                // 计算相对位姿...（类似上面的代码）
-                                Eigen::Matrix3f Rcw_near448, Rcw_near1;
-                                Eigen::Vector3f tcw_near448, tcw_near1;
-                                pKFnear448->GetPose(Rcw_near448, tcw_near448);
-                                pKFnear1->GetPose(Rcw_near1, tcw_near1);
-                                
-                                // 计算...
-                                Eigen::Matrix3d R_rel = Eigen::Matrix3d::Identity(); // 简化这里的计算
-                                Eigen::Vector3d t_rel = Eigen::Vector3d::Zero();
-                                
-                                // 权重随距离衰减
-                                double weight = 3000.0 / (i + j);
-                                ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_rel, t_rel, weight);
-                                ceres::LossFunction* loss_function = new ceres::HuberLoss(0.5);
-                                problem.AddResidualBlock(edge_se3, loss_function, params_near1, params_near448);
-                            }
-                        }
-                    }
-                }
-            }
+            // 计算相对变换
+            const KeyFrame& kf = keyframes[kf_id];
+            const KeyFrame& conn_kf = keyframes[conn_id];
+            
+            Sophus::SE3d T_kf_world = kf.pose;
+            Sophus::SE3d T_conn_world = conn_kf.pose;
+            Sophus::SE3d T_kf_conn = T_kf_world * T_conn_world.inverse();
+            
+            // 添加相对位姿约束，高权重
+            ceres::CostFunction* cost_function = 
+                new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
+                    new SE3RelativePoseCostFunctor(T_kf_conn));
+            
+            // 回环约束使用更高的权重
+            ceres::LossFunction* loop_loss = 
+                new ceres::ScaledLoss(loss_function, 10.0, ceres::TAKE_OWNERSHIP);
+            
+            problem.AddResidualBlock(
+                cost_function, 
+                loop_loss, 
+                kf_param,
+                conn_param);
         }
     }
     
-    // 4.2 现在添加其他约束，但降低它们的权重
+    // 3.3.2 添加当前回环约束
+    double* current_param = pose_parameters[current_kf_id];
+    double* loop_param = pose_parameters[loop_kf_id];
     
-    // 先添加生成树约束 - 权重300（比回环小）
-    int spanningEdgeCount = 0;
-    for(KeyFrame* pKF : vpKFs) {
-        if(pKF->isBad()) continue;
-        
-        KeyFrame* pParentKF = pKF->GetParent();
-        if(pParentKF && !pParentKF->isBad()) {
-            double* poseParams_i = vPoseParams[pKF->mnId];
-            double* poseParams_j = vPoseParams[pParentKF->mnId];
-            
-            if(!poseParams_i || !poseParams_j) continue;
-            
-            // 计算相对变换...（代码略）
-            Eigen::Matrix3f Rcw_i, Rcw_j;
-            Eigen::Vector3f tcw_i, tcw_j;
-            pKF->GetPose(Rcw_i, tcw_i);
-            pParentKF->GetPose(Rcw_j, tcw_j);
-            
-            // 简化 - 只是添加原始相对约束
-            Eigen::Matrix3d R_ji = Eigen::Matrix3d::Identity(); // 简化
-            Eigen::Vector3d t_ji = Eigen::Vector3d::Zero();     // 简化
-            
-            // 修改生成树边的权重为300
-            ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(R_ji, t_ji, 300.0);
-            ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
-            problem.AddResidualBlock(edge_se3, loss_function, poseParams_i, poseParams_j);
-            
-            spanningEdgeCount++;
-            sInsertedEdges.insert(std::make_pair(std::min(pKF->mnId, pParentKF->mnId),
-                                         std::max(pKF->mnId, pParentKF->mnId)));
-        }
-    }
+    // 添加回环约束，这是最重要的约束，使用较高的权重
+    ceres::CostFunction* loop_cost_function = 
+        new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
+            new SE3RelativePoseCostFunctor(loop_relative_pose));
     
-    // 添加共视图约束 - 低权重（50-100之间）
-    int covisibilityEdgeCount = 0;
-    const int minFeat = 30; // 阈值30
+    // 回环约束使用更高的权重
+    ceres::LossFunction* direct_loop_loss = 
+        new ceres::ScaledLoss(loss_function, 10.0, ceres::TAKE_OWNERSHIP);
     
-    for(KeyFrame* pKF : vpKFs) {
-        if(pKF->isBad()) continue;
-        
-        const std::vector<KeyFrame*> vpConnectedKFs = pKF->GetCovisiblesByWeight(minFeat);
-        for(KeyFrame* pKFn : vpConnectedKFs) {
-            if(pKFn && pKFn != pKF->GetParent() && !pKF->hasChild(pKFn)) {
-                if(!pKFn->isBad() && pKFn->mnId < pKF->mnId) {
-                    if(sInsertedEdges.count(std::make_pair(std::min(pKF->mnId, pKFn->mnId), 
-                                               std::max(pKF->mnId, pKFn->mnId))))
-                        continue;
-                        
-                    double* poseParams_i = vPoseParams[pKF->mnId];
-                    double* poseParams_n = vPoseParams[pKFn->mnId];
-                    
-                    if(!poseParams_i || !poseParams_n) continue;
-                    
-                    // 计算相对变换...（简化）
-                    
-                    // 主要修改：降低共视约束的权重，让回环约束主导
-                    double weight = std::min(50.0, (double)pKF->GetWeight(pKFn) * 0.5);
-                    
-                    ceres::CostFunction* edge_se3 = SE3EdgeCostFunction::Create(
-                        Eigen::Matrix3d::Identity(), Eigen::Vector3d::Zero(), weight);
-                    ceres::LossFunction* loss_function = new ceres::HuberLoss(5.0); // 大阈值
-                    problem.AddResidualBlock(edge_se3, loss_function, poseParams_i, poseParams_n);
-                    
-                    covisibilityEdgeCount++;
-                    sInsertedEdges.insert(std::make_pair(std::min(pKF->mnId, pKFn->mnId), 
-                                             std::max(pKF->mnId, pKFn->mnId)));
-                }
-            }
-        }
-    }
+    problem.AddResidualBlock(
+        loop_cost_function, 
+        direct_loop_loss, 
+        loop_param,      // 回环KF参数
+        current_param);  // 当前KF参数
     
-    // 保存优化前状态
-    SaveTrajectory(outputDir + "step0_before_optimization.txt", vpKFs, vPoseParams);
+    // 4. 执行优化
     
-    // 5. 配置求解器选项
+    // 4.1 配置求解器选项
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.max_num_iterations = 20;  // 与原始ORB-SLAM3保持一致
     options.minimizer_progress_to_stdout = true;
-    options.max_num_iterations = 100;  // 增加迭代次数
-    options.function_tolerance = 1e-6;
-    options.gradient_tolerance = 1e-8;
-    options.parameter_tolerance = 1e-6;
+    options.num_threads = 8;  // 多线程优化
     
-    options.initial_trust_region_radius = 10.0;  // 小初始半径，更精细的搜索
-    options.max_trust_region_radius = 1e4;
-    options.min_trust_region_radius = 1e-4;
-    
-    // 6. 执行优化
     ceres::Solver::Summary summary;
+    std::cout << "Starting optimization..." << std::endl;
     ceres::Solve(options, &problem, &summary);
     
-    // 7. 处理结果
-    std::cout << "\n=== Optimization Report ===" << std::endl;
-    std::cout << summary.BriefReport() << std::endl;
+    std::cout << summary.FullReport() << std::endl;
     
-    // 保存优化后的轨迹
-    SaveTrajectory(outputDir + "step1_after_optimization.txt", vpKFs, vPoseParams);
+    // 5. 更新关键帧位姿
     
-    // 8. 更新关键帧位姿 - 只更新那些没被固定的位姿
-    std::cout << "\n=== Updating KeyFrame poses ===" << std::endl;
-    {
-        std::unique_lock<std::mutex> lock(pMap->mMutexMapUpdate);
+    // 5.1 获取优化后的位姿
+    for (const auto& param_pair : pose_parameters) {
+        unsigned long kf_id = param_pair.first;
+        const double* param = param_pair.second;
         
-        int updatedCount = 0;
-        for(KeyFrame* pKFi : vpKFs) {
-            if(pKFi->isBad()) continue;
-            
-            const unsigned long nIDi = pKFi->mnId;
-            
-            // 跳过固定的关键帧
-            if((pKFi->mnId == pMap->GetInitKFid()) || 
-               (correctedKFIds.count(pKFi->mnId) > 0) ||
-               (pKFi->mnId == pLoopKF->mnId) ||
-               (pKFi->mnId == pCurKF->mnId)) {
-                continue;
-            }
-            
-            double* params = vPoseParams[nIDi];
-            if(!params) continue;
-            
-            // 更新非固定的关键帧位姿
-            Eigen::Vector3d rot(params[0], params[1], params[2]);
-            Eigen::Vector3d trans(params[3], params[4], params[5]);
-            
-            double angle = rot.norm();
-            if(angle > 1e-10) {
-                Eigen::AngleAxisd aa(angle, rot.normalized());
-                Eigen::Matrix3d R = aa.toRotationMatrix();
-                
-                Eigen::Matrix3f Rf = R.cast<float>();
-                Eigen::Vector3f tf = trans.cast<float>();
-                
-                pKFi->SetPose(Rf, tf);
-                updatedCount++;
-            } else {
-                pKFi->SetPose(Eigen::Matrix3f::Identity(), trans.cast<float>());
-                updatedCount++;
-            }
-        }
+        Eigen::Vector3d t(param[0], param[1], param[2]);
+        Eigen::Quaterniond q(param[6], param[3], param[4], param[5]); // w,x,y,z
+        q.normalize();
         
-        std::cout << "Updated " << updatedCount << " keyframe poses (fixed keyframes untouched)" << std::endl;
+        // 更新关键帧位姿
+        keyframes[kf_id].pose = Sophus::SE3d(q, t);
     }
     
-    // 保存最终优化后的轨迹
-    SaveTrajectory(outputDir + "final_optimized_trajectory.txt", vpKFs);
+    // 6. 保存优化结果
     
-    // 跳过MapPoints更新
-    std::cout << "\n=== Skipping MapPoints update ===" << std::endl;
+    std::string output_dir = data_dir + "/../output";
+    
+    // 创建输出目录
+    struct stat st = {0};
+    if (stat(output_dir.c_str(), &st) == -1) {
+#ifdef _WIN32
+        _mkdir(output_dir.c_str());
+#else
+        mkdir(output_dir.c_str(), 0755);
+#endif
+    }
+    
+    // 保存TUM格式轨迹
+    saveTUMTrajectory(output_dir + "/trajectory.txt", keyframes);
+    
+    std::cout << "Optimization completed successfully!" << std::endl;
+    std::cout << "Results saved to: " << output_dir << "/trajectory.txt (TUM format)" << std::endl;
     
     // 释放内存
-    for(double* params : vPoseParams) {
-        if(params) delete[] params;
+    for (auto& param_pair : pose_parameters) {
+        delete[] param_pair.second;
     }
     
-    delete se3_manifold;
-    
-    // 增加变更索引
-    pMap->IncreaseChangeIndex();
-}
-
-// 主函数
-int main(int /* argc */, char** /* argv */) {
-    // 输入和输出目录
-    std::string inputDir = "/Datasets/CERES_Work/input";
-    std::string optimDataDir = inputDir + "/optimization_data/";
-    std::string outputDir = "/Datasets/CERES_Work/output";
-    system(("mkdir -p " + outputDir).c_str());
-    
-    // 使用TUM格式轨迹文件
-    std::string tumFile = "/Datasets/CERES_Work/input/transformed/standard_trajectory_sim3_transformed.txt";
-    
-    std::cout << "Loading trajectory from TUM format file..." << std::endl;
-    
-    // 加载轨迹
-    std::vector<KeyFrame*> vpKFs = LoadTUMTrajectory(tumFile);
-    
-    if(vpKFs.empty()) {
-        std::cerr << "Failed to load trajectory." << std::endl;
-        return -1;
-    }
-    
-    // 加载共视图
-    LoadCovisibilityGraph(optimDataDir + "covisibility.txt", vpKFs, 30); // 降低阈值到30
-    
-    // 加载显式回环边
-    LoadLoopEdges(optimDataDir + "loop_edges.txt", vpKFs);
-    
-    // 创建一个新的Map对象
-    Map* pMap = new Map();
-    pMap->mnId = 0;
-    pMap->mnInitKFid = 0;
-    pMap->mnMaxKFid = vpKFs.size() - 1;
-    pMap->SetKeyFrames(vpKFs);
-    
-    // 创建空的MapPoints向量
-    std::vector<MapPoint*> vpMPs;
-    pMap->SetMapPoints(vpMPs);
-    
-    // 加载NonCorrectedSE3和CorrectedSE3映射
-    KeyFrameAndPose NonCorrectedSE3;
-    KeyFrameAndPose CorrectedSE3;
-    LoadSim3Transformations(optimDataDir + "non_corrected_sim3.txt", 
-                          optimDataDir + "corrected_sim3.txt",
-                          NonCorrectedSE3, CorrectedSE3, vpKFs);
-    
-    // 加载回环连接
-    std::map<KeyFrame*, std::set<KeyFrame*>> LoopConnections;
-    LoadLoopConnections(optimDataDir + "loop_connections.txt", LoopConnections, vpKFs);
-    
-    // 如果回环连接为空，创建基本连接
-    if(LoopConnections.empty() && vpKFs.size() > 10) {
-        // 从文件读取回环KF IDs
-        std::ifstream kfidsFile(optimDataDir + "keyframe_ids.txt");
-        unsigned long loopKFId = 0, curKFId = 0;
-        bool bFixedScale = true;
-        
-        if(kfidsFile.is_open()) {
-            std::string line;
-            while(std::getline(kfidsFile, line)) {
-                std::stringstream ss(line);
-                std::string key;
-                ss >> key;
-                
-                if(key == "LOOP_KF_ID") ss >> loopKFId;
-                else if(key == "CURRENT_KF_ID") ss >> curKFId;
-                else if(key == "FIXED_SCALE") {
-                    int fixedScale;
-                    ss >> fixedScale;
-                    bFixedScale = (fixedScale == 1);
-                }
-            }
-            kfidsFile.close();
-        } else {
-            // 回退：假设第一帧和最后一帧
-            loopKFId = vpKFs.front()->mnId;
-            curKFId = vpKFs.back()->mnId;
-        }
-        
-        // 查找KF指针
-        KeyFrame* pLoopKF = nullptr;
-        KeyFrame* pCurKF = nullptr;
-        
-        for(auto& pKF : vpKFs) {
-            if(pKF->mnId == loopKFId) pLoopKF = pKF;
-            if(pKF->mnId == curKFId) pCurKF = pKF;
-            if(pLoopKF && pCurKF) break;
-        }
-        
-        if(pLoopKF && pCurKF) {
-            // 添加显式回环连接
-            std::set<KeyFrame*> connectedKFs;
-            
-            // 添加回环KF和附近的KFs（更好的共视建模）
-            connectedKFs.insert(pLoopKF);
-            
-            // 添加几个回环KF的邻居以加强回环约束
-            const std::vector<KeyFrame*>& vpLoopNeighbors = pLoopKF->mvpOrderedConnectedKeyFrames;
-            for(size_t i = 0; i < std::min(size_t(5), vpLoopNeighbors.size()); i++) {
-                connectedKFs.insert(vpLoopNeighbors[i]);
-            }
-            
-            LoopConnections[pCurKF] = connectedKFs;
-            
-            // 添加互惠连接以获得更好的约束
-            for(KeyFrame* pConnKF : connectedKFs) {
-                std::set<KeyFrame*> reverseConn;
-                reverseConn.insert(pCurKF);
-                LoopConnections[pConnKF] = reverseConn;
-            }
-            
-            // 为所有连接添加显式回环边
-            for(KeyFrame* pConnKF : connectedKFs) {
-                pCurKF->mspLoopEdges.insert(pConnKF);
-                pConnKF->mspLoopEdges.insert(pCurKF);
-            }
-            
-            std::cout << "Created " << connectedKFs.size() << " loop connections between KF " 
-                      << pCurKF->mnId << " and KF " << pLoopKF->mnId << " (and neighbors)" << std::endl;
-        }
-    }
-    
-    // 保存优化前轨迹
-    SaveTrajectory(outputDir + "/trajectory_before_optimization.txt", vpKFs);
-    
-    // 查找回环和当前KF
-    KeyFrame* pLoopKF = nullptr;
-    KeyFrame* pCurKF = nullptr;
-    
-    if(!LoopConnections.empty()) {
-        // 从第一个回环连接取得
-        pCurKF = LoopConnections.begin()->first;
-        pLoopKF = *LoopConnections.begin()->second.begin();
-    } else if(vpKFs.size() > 1) {
-        // 回退
-        pLoopKF = vpKFs.front();
-        pCurKF = vpKFs.back();
-    }
-    
-    if(pLoopKF && pCurKF) {
-        std::cout << "Setting LoopKF to KF " << pLoopKF->mnId 
-                  << " and CurKF to KF " << pCurKF->mnId << std::endl;
-        
-        // 运行改进的优化
-        bool bFixScale = true;  // 对于RGBD/双目系统
-        OptimizeEssentialGraphCeres(pMap, pLoopKF, pCurKF, NonCorrectedSE3, 
-                                   CorrectedSE3, LoopConnections, bFixScale);
-    } else {
-        std::cerr << "Could not find valid loop and current keyframes." << std::endl;
-    }
-    
-    // 清理内存
-    delete pMap;
-    for(KeyFrame* pKF : vpKFs)
-        delete pKF;
-    
-    std::cout << "Optimization completed successfully." << std::endl;
     return 0;
 }
