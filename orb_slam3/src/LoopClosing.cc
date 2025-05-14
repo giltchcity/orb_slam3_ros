@@ -191,13 +191,12 @@ void LoopClosing::SaveOptimizationData(const string& baseDir,
     for(KeyFrame* pKF : vpKFs) {
         if(pKF->isBad()) continue;
         
-        // Sophus::SE3f Tcw = pKF->GetPose();
-        Sophus::SE3f Twc = pKF->GetPoseInverse();  // Use GetPoseInverse instead of GetPose
-        Eigen::Quaternionf q = Twc.unit_quaternion();
-        Eigen::Vector3f t = Twc.translation();
+        Sophus::SE3f Tcw = pKF->GetPose();
+        Eigen::Quaternionf q = Tcw.unit_quaternion();
+        Eigen::Vector3f t = Tcw.translation();
         
         posesFile << pKF->mnId << " "
-                  << fixed << setprecision(9) << pKF->mTimeStamp * 1e9 << " "  // Convert to nanoseconds
+                  << fixed << setprecision(9) << pKF->mTimeStamp << " " // 添加时间戳
                   << t.x() << " " << t.y() << " " << t.z() << " "
                   << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << endl;
     }
