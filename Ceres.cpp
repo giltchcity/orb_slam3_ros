@@ -10,6 +10,87 @@
 #include <ceres/ceres.h>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <algorithm> // For std::sort and std::min
+
+// Structure to store pose data for comparison
+struct PoseData {
+    double timestamp;
+    Eigen::Vector3d position;
+    Eigen::Quaterniond rotation;
+};
+
+// Function to read a trajectory file in TUM format
+std::vector<PoseData> readTrajectory(const std::string& filename) {
+    std::vector<PoseData> trajectory;
+    std::ifstream file(filename);
+    
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open file " << filename << std::endl;
+        return trajectory;
+    }
+    
+    std::string line;
+    while (std::getline(file, line)) {
+        // Skip comment or empty lines
+        if (line.empty() || line[0] == '#') {
+            continue;
+        }
+        
+        std::istringstream iss(line);
+        PoseData pose;
+        double tx, ty, tz, qx, qy, qz, qw;
+        
+        if (!(iss >> pose.timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw)) {
+            continue; // Skip malformed lines
+        }
+        
+        pose.position = Eigen::Vector3d(tx, ty, tz);
+        pose.rotation = Eigen::Quaterniond(qw, qx, qy, qz); // Note: Eigen uses w, x, y, z order
+        pose.rotation.normalize();
+        
+        trajectory.push_back(pose);
+    }
+    
+    std::cout << "Read " << trajectory.size() << " poses from " << filename << std::endl;
+    return trajectory;
+}
+
+// Function to find the closest pose by timestamp
+int findClosestPose(const std::vector<PoseData>& trajectory, double timestamp, double max_diff = 0.02) {
+    int closest_idx = -1;
+    double min_diff = max_diff;
+    
+    for (size_t i = 0; i < trajectory.size(); ++i) {
+        double diff = std::abs(trajectory[i].timestamp - timestamp);
+        if (diff < min_diff) {
+            min_diff = diff;
+            closest_idx = i;
+        }
+    }
+    
+    return closest_idx;
+}
+
+// Function to calculate translation error between two poses
+double calculateTranslationError(const Eigen::Vector3d& p1, const Eigen::Vector3d& p2) {
+    return (p1 - p2).norm();
+}
+
+// Function to calculate rotation error between two quaternions (in degrees)
+double calculateRotationError(const Eigen::Quaterniond& q1, const Eigen::Quaterniond& q2) {
+    // Make sure the quaternions are normalized
+    Eigen::Quaterniond q1_norm = q1.normalized();
+    Eigen::Quaterniond q2_norm = q2.normalized();
+    
+    // Calculate the angular distance
+    double dot_product = std::abs(q1_norm.dot(q2_norm));
+    if (dot_product > 1.0) dot_product = 1.0; // Clamp to prevent numerical issues
+    
+    double angle_rad = 2.0 * std::acos(dot_product);
+    double angle_deg = angle_rad * 180.0 / M_PI;
+    
+    return angle_deg;
+}
 
 // Implementation of the SE3 Manifold for Ceres 2.2
 class SE3Manifold : public ceres::Manifold {
@@ -975,6 +1056,7 @@ int main(int argc, char** argv) {
     std::sort(timestamps_kfids.begin(), timestamps_kfids.end());
     
     // Write in TUM format: timestamp tx ty tz qx qy qz qw
+    // Write in ORB-SLAM3 format: timestamp tx ty tz qx qy qz qw (Camera to World)
     for (const auto& ts_kf : timestamps_kfids) {
         double timestamp = ts_kf.first;
         int kf_id = ts_kf.second;
@@ -982,10 +1064,18 @@ int main(int argc, char** argv) {
         if (optimized_poses.find(kf_id) != optimized_poses.end()) {
             const double* pose = optimized_poses[kf_id];
             
-            // TUM format: timestamp tx ty tz qx qy qz qw
-            out_file << std::fixed << std::setprecision(9) << timestamp << " "
-                    << pose[4] << " " << pose[5] << " " << pose[6] << " "
-                    << pose[0] << " " << pose[1] << " " << pose[2] << " " << pose[3] << std::endl;
+            // Extract the World-to-Camera transform (Tcw)
+            Eigen::Quaterniond q_tcw(pose[3], pose[0], pose[1], pose[2]);  // w, x, y, z
+            Eigen::Vector3d t_tcw(pose[4], pose[5], pose[6]);
+            
+            // Convert to Camera-to-World transform (Twc = inverse of Tcw)
+            Eigen::Quaterniond q_twc = q_tcw.conjugate();
+            Eigen::Vector3d t_twc = -(q_twc.toRotationMatrix() * t_tcw);
+            
+            // ORB-SLAM3 format: timestamp(ns) tx ty tz qx qy qz qw
+            out_file << std::fixed << std::setprecision(0) << timestamp * 1e9 << " "
+                    << t_twc.x() << " " << t_twc.y() << " " << t_twc.z() << " "
+                    << q_twc.x() << " " << q_twc.y() << " " << q_twc.z() << " " << q_twc.w() << std::endl;
         }
     }
     
@@ -993,12 +1083,107 @@ int main(int argc, char** argv) {
     
     std::cout << "Optimized poses saved to: " << output_file << std::endl;
     
-    // Clean up
-    for (auto& pose : optimized_poses) {
-        delete[] pose.second;
+
+
+    std::cout << "\n=== Comparing trajectories ===" << std::endl;
+    
+    // File paths
+    std::string groundtruth_file = "/Datasets/CERES_Work/Vis_Result/standard_trajectory_with_loop.txt";
+    
+    // Read trajectories
+    std::vector<PoseData> optimized_traj = readTrajectory(output_file);
+    std::vector<PoseData> groundtruth_traj = readTrajectory(groundtruth_file);
+    
+    if (optimized_traj.empty() || groundtruth_traj.empty()) {
+        std::cerr << "Error: One or both trajectory files could not be read." << std::endl;
+        return -1;
     }
     
-    delete se3_manifold;
+    // Make sure trajectories are sorted by timestamp
+    std::sort(optimized_traj.begin(), optimized_traj.end(), 
+              [](const PoseData& a, const PoseData& b) { return a.timestamp < b.timestamp; });
+    
+    std::sort(groundtruth_traj.begin(), groundtruth_traj.end(), 
+              [](const PoseData& a, const PoseData& b) { return a.timestamp < b.timestamp; });
+    
+    // Vector to store errors for each associated pose
+    std::vector<std::pair<double, double>> errors; // (translation_error, rotation_error)
+    
+    // Associate poses and calculate errors
+    for (const auto& opt_pose : optimized_traj) {
+        int gt_idx = findClosestPose(groundtruth_traj, opt_pose.timestamp);
+        
+        if (gt_idx != -1) {
+            double trans_error = calculateTranslationError(opt_pose.position, groundtruth_traj[gt_idx].position);
+            double rot_error = calculateRotationError(opt_pose.rotation, groundtruth_traj[gt_idx].rotation);
+            
+            errors.push_back(std::make_pair(trans_error, rot_error));
+        }
+    }
+    
+    // Calculate average error for every 5 keyframes
+    std::cout << "\n=== Error Analysis (Average Every 5 KFs) ===" << std::endl;
+    std::cout << std::fixed << std::setprecision(4);
+    
+    const int group_size = 5;
+    int num_groups = (errors.size() + group_size - 1) / group_size; // Ceiling division
+    
+    std::cout << "+-------------+------------------+------------------+" << std::endl;
+    std::cout << "| KF Group    | Translation (m)  | Rotation (deg)   |" << std::endl;
+    std::cout << "+-------------+------------------+------------------+" << std::endl;
+    
+    double total_trans_error = 0.0;
+    double total_rot_error = 0.0;
+    
+    for (int i = 0; i < num_groups; ++i) {
+        int start_idx = i * group_size;
+        int end_idx = std::min<int>(start_idx + group_size, errors.size());
+        
+        double avg_trans_error = 0.0;
+        double avg_rot_error = 0.0;
+        int count = 0;
+        
+        for (int j = start_idx; j < end_idx; ++j) {
+            avg_trans_error += errors[j].first;
+            avg_rot_error += errors[j].second;
+            count++;
+        }
+        
+        avg_trans_error /= count;
+        avg_rot_error /= count;
+        
+        total_trans_error += avg_trans_error;
+        total_rot_error += avg_rot_error;
+        
+        std::cout << "| " << std::setw(5) << start_idx << "-" << std::setw(5) << end_idx - 1 
+                  << " | " << std::setw(16) << avg_trans_error 
+                  << " | " << std::setw(16) << avg_rot_error << " |" << std::endl;
+    }
+    
+    double overall_avg_trans_error = total_trans_error / num_groups;
+    double overall_avg_rot_error = total_rot_error / num_groups;
+    
+    std::cout << "+-------------+------------------+------------------+" << std::endl;
+    std::cout << "| Overall     | " << std::setw(16) << overall_avg_trans_error 
+              << " | " << std::setw(16) << overall_avg_rot_error << " |" << std::endl;
+    std::cout << "+-------------+------------------+------------------+" << std::endl;
+    
+    // Calculate RMSE
+    double rmse_trans = 0.0;
+    double rmse_rot = 0.0;
+    
+    for (const auto& error : errors) {
+        rmse_trans += error.first * error.first;
+        rmse_rot += error.second * error.second;
+    }
+    
+    rmse_trans = std::sqrt(rmse_trans / errors.size());
+    rmse_rot = std::sqrt(rmse_rot / errors.size());
+    
+    std::cout << "\n=== Overall Error Statistics ===" << std::endl;
+    std::cout << "Number of matched poses: " << errors.size() << std::endl;
+    std::cout << "RMSE Translation: " << rmse_trans << " m" << std::endl;
+    std::cout << "RMSE Rotation: " << rmse_rot << " deg" << std::endl;
     
     return 0;
 }
