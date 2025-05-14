@@ -61,7 +61,7 @@ struct PoseData {
     Eigen::Quaterniond rotation;
 };
 
-// Function to read a trajectory file in TUM format
+// Function to read a trajectory file without timestamp matching
 std::vector<PoseData> readTrajectory(const std::string& filename) {
     std::vector<PoseData> trajectory;
     std::ifstream file(filename);
@@ -82,6 +82,7 @@ std::vector<PoseData> readTrajectory(const std::string& filename) {
         PoseData pose;
         double tx, ty, tz, qx, qy, qz, qw;
         
+        // Read timestamp but don't use it for matching
         if (!(iss >> pose.timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw)) {
             continue; // Skip malformed lines
         }
@@ -96,6 +97,7 @@ std::vector<PoseData> readTrajectory(const std::string& filename) {
     std::cout << "Read " << trajectory.size() << " poses from " << filename << std::endl;
     return trajectory;
 }
+
 
 // Function to find the closest pose by timestamp
 int findClosestPose(const std::vector<PoseData>& trajectory, double timestamp, double max_diff = 0.02) {
@@ -1112,8 +1114,7 @@ int main(int argc, char** argv) {
     
 
 
-    std::cout << "\n=== Comparing trajectories ===" << std::endl;
-    
+        std::cout << "\n=== Comparing trajectories ===" << std::endl;
     // File paths
     std::string groundtruth_file = "/Datasets/CERES_Work/Vis_Result/standard_trajectory_with_loop.txt";
     
@@ -1126,27 +1127,25 @@ int main(int argc, char** argv) {
         return -1;
     }
     
-    // Make sure trajectories are sorted by timestamp
-    std::sort(optimized_traj.begin(), optimized_traj.end(), 
-              [](const PoseData& a, const PoseData& b) { return a.timestamp < b.timestamp; });
-    
-    std::sort(groundtruth_traj.begin(), groundtruth_traj.end(), 
-              [](const PoseData& a, const PoseData& b) { return a.timestamp < b.timestamp; });
+    // Check if trajectories have the same number of poses
+    if (optimized_traj.size() != groundtruth_traj.size()) {
+        std::cerr << "Warning: Trajectories have different numbers of poses. Using the smaller size." << std::endl;
+    }
     
     // Vector to store errors for each associated pose
     std::vector<std::pair<double, double>> errors; // (translation_error, rotation_error)
     
-    // Associate poses and calculate errors
-    for (const auto& opt_pose : optimized_traj) {
-        int gt_idx = findClosestPose(groundtruth_traj, opt_pose.timestamp);
+    // Compare poses directly by index (keyframe-to-keyframe)
+    size_t min_size = std::min(optimized_traj.size(), groundtruth_traj.size());
+    for (size_t i = 0; i < min_size; i++) {
+        double trans_error = calculateTranslationError(optimized_traj[i].position, groundtruth_traj[i].position);
+        double rot_error = calculateRotationError(optimized_traj[i].rotation, groundtruth_traj[i].rotation);
         
-        if (gt_idx != -1) {
-            double trans_error = calculateTranslationError(opt_pose.position, groundtruth_traj[gt_idx].position);
-            double rot_error = calculateRotationError(opt_pose.rotation, groundtruth_traj[gt_idx].rotation);
-            
-            errors.push_back(std::make_pair(trans_error, rot_error));
-        }
+        errors.push_back(std::make_pair(trans_error, rot_error));
     }
+    
+    std::cout << "Directly compared " << errors.size() << " poses by keyframe order" << std::endl;
+    
     
     // Calculate average error for every 5 keyframes
     std::cout << "\n=== Error Analysis (Average Every 5 KFs) ===" << std::endl;
