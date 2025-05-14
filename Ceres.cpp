@@ -11,6 +11,48 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <algorithm> // For std::sort and std::min
+#include <sophus/se3.hpp>
+
+// Function to convert pose from Tcw to Twc format
+// Convert from parameter array to Sophus::SE3d (Tcw format)
+Sophus::SE3d GetSE3FromArray(const double* pose) {
+    // Extract quaternion and translation
+    Eigen::Quaterniond q(pose[3], pose[0], pose[1], pose[2]); // w, x, y, z
+    Eigen::Vector3d t(pose[4], pose[5], pose[6]);
+    
+    // Create and return the SE3 transformation
+    return Sophus::SE3d(q, t);
+}
+
+// Convert from Sophus::SE3d to parameter array
+void StoreArrayFromSE3(const Sophus::SE3d& se3, double* pose) {
+    // Extract quaternion and translation
+    Eigen::Quaterniond q = se3.unit_quaternion();
+    Eigen::Vector3d t = se3.translation();
+    
+    // Store in array format [qx, qy, qz, qw, tx, ty, tz]
+    pose[0] = q.x();
+    pose[1] = q.y();
+    pose[2] = q.z();
+    pose[3] = q.w();
+    pose[4] = t.x();
+    pose[5] = t.y();
+    pose[6] = t.z();
+}
+
+// Convert from Tcw to Twc format using Sophus
+void convertTcwToTwc(const double* tcw_pose, double* twc_pose) {
+    // Convert array to Sophus::SE3d
+    Sophus::SE3d Tcw = GetSE3FromArray(tcw_pose);
+    
+    // Compute the inverse (Twc = Tcw^(-1))
+    Sophus::SE3d Twc = Tcw.inverse();
+    
+    // Convert back to array format
+    StoreArrayFromSE3(Twc, twc_pose);
+}
+
+
 
 // Structure to store pose data for comparison
 struct PoseData {
@@ -833,18 +875,7 @@ int main(int argc, char** argv) {
                 }
             }
             
-            // Print detailed pose information
-            printDetailedRelativePose(
-                parent_id, child_id, 
-                optimized_poses[parent_id], optimized_poses[child_id],
-                keyframe_poses, corrected_poses, non_corrected_poses,
-                is_boundary,
-                print_counter,
-                true // before optimization
-            );
-            
-            print_counter++;
-            
+                  
             // Setup the correct constraint depending on the region
             Eigen::Matrix4d T_parent_child = Eigen::Matrix4d::Identity();
             
@@ -1021,7 +1052,8 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Write the optimized results to a TUM format file
+
+    // Write the optimized results to a TUM format file (in Twc format for visualization)
     std::string output_file = "/Datasets/CERES_Work/output/optimized_poses.txt";
     std::ofstream out_file(output_file);
     
@@ -1056,32 +1088,27 @@ int main(int argc, char** argv) {
     std::sort(timestamps_kfids.begin(), timestamps_kfids.end());
     
     // Write in TUM format: timestamp tx ty tz qx qy qz qw
-    // Write in ORB-SLAM3 format: timestamp tx ty tz qx qy qz qw (Camera to World)
     for (const auto& ts_kf : timestamps_kfids) {
         double timestamp = ts_kf.first;
         int kf_id = ts_kf.second;
         
         if (optimized_poses.find(kf_id) != optimized_poses.end()) {
-            const double* pose = optimized_poses[kf_id];
+            const double* tcw_pose = optimized_poses[kf_id];
+            double twc_pose[7]; // Temporary storage for Twc pose
             
-            // Extract the World-to-Camera transform (Tcw)
-            Eigen::Quaterniond q_tcw(pose[3], pose[0], pose[1], pose[2]);  // w, x, y, z
-            Eigen::Vector3d t_tcw(pose[4], pose[5], pose[6]);
+            // Convert from Tcw to Twc format using Sophus
+            convertTcwToTwc(tcw_pose, twc_pose);
             
-            // Convert to Camera-to-World transform (Twc = inverse of Tcw)
-            Eigen::Quaterniond q_twc = q_tcw.conjugate();
-            Eigen::Vector3d t_twc = -(q_twc.toRotationMatrix() * t_tcw);
-            
-            // ORB-SLAM3 format: timestamp(ns) tx ty tz qx qy qz qw
-            out_file << std::fixed << std::setprecision(0) << timestamp * 1e9 << " "
-                    << t_twc.x() << " " << t_twc.y() << " " << t_twc.z() << " "
-                    << q_twc.x() << " " << q_twc.y() << " " << q_twc.z() << " " << q_twc.w() << std::endl;
+            // TUM format: timestamp tx ty tz qx qy qz qw
+            out_file << std::fixed << std::setprecision(9) << timestamp << " "
+                    << twc_pose[4] << " " << twc_pose[5] << " " << twc_pose[6] << " "
+                    << twc_pose[0] << " " << twc_pose[1] << " " << twc_pose[2] << " " << twc_pose[3] << std::endl;
         }
     }
     
     out_file.close();
     
-    std::cout << "Optimized poses saved to: " << output_file << std::endl;
+    std::cout << "Optimized poses saved to: " << output_file << " (in Twc format for visualization)" << std::endl;
     
 
 
