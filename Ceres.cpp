@@ -1,670 +1,902 @@
 #include <iostream>
 #include <fstream>
-#include <string>
 #include <vector>
 #include <map>
 #include <set>
-#include <unordered_map>
+#include <string>
+#include <sstream>
 #include <algorithm>
-#include <iomanip>  // For std::setprecision
+#include <iomanip>
+#include <ceres/ceres.h>
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include <sophus/se3.hpp>
-#include <ceres/ceres.h>
-#include <sys/stat.h>
 
-// 定义关键帧结构
-struct KeyFrame {
-    unsigned long id;
-    unsigned long parent_id;
-    double timestamp;
-    bool is_fixed;
-    Sophus::SE3d pose;  // 世界坐标系到相机坐标系的变换
+// Implementation of the SE3 Manifold for Ceres 2.2
+class SE3Manifold : public ceres::Manifold {
+public:
+    virtual ~SE3Manifold() {}
+
+    // Ambient space: 7D for quaternion + translation (qx, qy, qz, qw, tx, ty, tz)
+    virtual int AmbientSize() const override { return 7; }
+    
+    // Tangent space: 6D for rotation + translation
+    virtual int TangentSize() const override { return 6; }
+
+    // Plus operation: x_plus_delta = [q * exp(delta_rot), t + delta_trans]
+    virtual bool Plus(const double* x, const double* delta, double* x_plus_delta) const override {
+        // Extract the quaternion and translation from x
+        Eigen::Quaterniond q(x[3], x[0], x[1], x[2]); // w, x, y, z
+        Eigen::Vector3d t(x[4], x[5], x[6]);
+
+        // Map delta rotation (first 3 elements) to a quaternion using exponential map
+        Eigen::Vector3d delta_rot(delta[0], delta[1], delta[2]);
+        double norm_delta = delta_rot.norm();
+        
+        Eigen::Quaterniond delta_q;
+        if (norm_delta > 1e-10) {
+            double half_angle = norm_delta / 2.0;
+            delta_q = Eigen::Quaterniond(
+                cos(half_angle),
+                delta_rot[0] / norm_delta * sin(half_angle),
+                delta_rot[1] / norm_delta * sin(half_angle),
+                delta_rot[2] / norm_delta * sin(half_angle)
+            );
+        } else {
+            // Small rotation approximation
+            delta_q = Eigen::Quaterniond(1.0, delta_rot[0]/2.0, delta_rot[1]/2.0, delta_rot[2]/2.0);
+            delta_q.normalize();
+        }
+
+        // Apply delta rotation to the original rotation
+        Eigen::Quaterniond q_plus = q * delta_q;
+        q_plus.normalize();
+
+        // Apply delta translation
+        Eigen::Vector3d t_plus = t + Eigen::Vector3d(delta[3], delta[4], delta[5]);
+
+        // Store the result in x_plus_delta
+        x_plus_delta[0] = q_plus.x();
+        x_plus_delta[1] = q_plus.y();
+        x_plus_delta[2] = q_plus.z();
+        x_plus_delta[3] = q_plus.w();
+        x_plus_delta[4] = t_plus[0];
+        x_plus_delta[5] = t_plus[1];
+        x_plus_delta[6] = t_plus[2];
+
+        return true;
+    }
+
+    // Compute the Jacobian of the Plus operation
+    virtual bool PlusJacobian(const double* x, double* jacobian) const override {
+        // Initialize Jacobian to zero
+        Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor>> J(jacobian);
+        J.setZero();
+
+        // For small rotations, the Jacobian of the rotation part
+        // has a 3x3 block for the quaternion part (x,y,z)
+        J.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * 0.5;
+        
+        // The translation part has a 3x3 identity block
+        J.block<3, 3>(4, 3) = Eigen::Matrix3d::Identity();
+
+        return true;
+    }
+
+    // Minus operation: y_minus_x computes the delta that takes x to y
+    virtual bool Minus(const double* y, const double* x, double* y_minus_x) const override {
+        // Extract the quaternions and translations
+        Eigen::Quaterniond q_x(x[3], x[0], x[1], x[2]); // w, x, y, z
+        Eigen::Vector3d t_x(x[4], x[5], x[6]);
+        
+        Eigen::Quaterniond q_y(y[3], y[0], y[1], y[2]); // w, x, y, z
+        Eigen::Vector3d t_y(y[4], y[5], y[6]);
+
+        // Compute the rotation difference: q_diff = q_y * q_x^(-1)
+        Eigen::Quaterniond q_diff = q_y * q_x.conjugate();
+        
+        // Convert to axis-angle representation (logarithmic map)
+        Eigen::AngleAxisd angle_axis(q_diff);
+        double angle = angle_axis.angle();
+        Eigen::Vector3d axis = angle_axis.axis();
+        
+        // The rotation part of y_minus_x
+        Eigen::Vector3d delta_rot = axis * angle;
+        
+        // The translation part of y_minus_x
+        Eigen::Vector3d delta_trans = t_y - t_x;
+
+        // Store the result
+        y_minus_x[0] = delta_rot[0];
+        y_minus_x[1] = delta_rot[1];
+        y_minus_x[2] = delta_rot[2];
+        y_minus_x[3] = delta_trans[0];
+        y_minus_x[4] = delta_trans[1];
+        y_minus_x[5] = delta_trans[2];
+
+        return true;
+    }
+
+    // Compute the Jacobian of the Minus operation with respect to x
+    virtual bool MinusJacobian(const double* x, double* jacobian) const override {
+        // Initialize Jacobian to zero
+        Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J(jacobian);
+        J.setZero();
+
+        // For small rotations, the Jacobian of the rotation part
+        // has a 3x3 block for the quaternion part (x,y,z)
+        J.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity() * 2.0;
+        
+        // The translation part has a -I block
+        J.block<3, 3>(3, 4) = -Eigen::Matrix3d::Identity();
+
+        return true;
+    }
 };
 
-// SE3相对位姿代价函数
-struct SE3RelativePoseCostFunctor {
-    SE3RelativePoseCostFunctor(const Sophus::SE3d& T_ab) : T_ab_(T_ab) {}
-    
-    template <typename T>
-    bool operator()(
-        const T* const pose_a,  // 7参数：[tx,ty,tz,qx,qy,qz,qw]
-        const T* const pose_b,
-        T* residuals) const {
+// Cost function for SE3 relative pose constraints
+class SE3RelativePoseCostFunction : public ceres::CostFunction {
+public:
+    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    SE3RelativePoseCostFunction(const Eigen::Matrix4d& T_ij, double weight = 1.0)
+        : m_T_ij(T_ij), m_weight(weight) {
         
-        // 提取位姿A（世界坐标系到A相机坐标系的变换）
-        Eigen::Map<const Eigen::Matrix<T,3,1>> t_a(pose_a);
-        Eigen::Map<const Eigen::Quaternion<T>> q_a(pose_a + 3);
+        // Extract the rotation and translation from T_ij
+        m_R_ij = m_T_ij.block<3, 3>(0, 0);
+        m_t_ij = m_T_ij.block<3, 1>(0, 3);
         
-        // 提取位姿B（世界坐标系到B相机坐标系的变换）
-        Eigen::Map<const Eigen::Matrix<T,3,1>> t_b(pose_b);
-        Eigen::Map<const Eigen::Quaternion<T>> q_b(pose_b + 3);
+        // This cost function has 6 residuals and takes two SE3 poses
+        set_num_residuals(6);
+        mutable_parameter_block_sizes()->push_back(7);  // First SE3 pose
+        mutable_parameter_block_sizes()->push_back(7);  // Second SE3 pose
+    }
+
+    virtual ~SE3RelativePoseCostFunction() {}
+
+    bool Evaluate(double const* const* parameters,
+                  double* residuals,
+                  double** jacobians) const {
         
-        // 计算相对位姿：从B相机坐标系到A相机坐标系的变换
-        Sophus::SE3<T> T_a_w(q_a, t_a);
-        Sophus::SE3<T> T_b_w(q_b, t_b);
-        Sophus::SE3<T> T_a_b = T_a_w * T_b_w.inverse();
+        // Extract SE3 parameters (vertex i and j)
+        const double* pose_i = parameters[0];
+        const double* pose_j = parameters[1];
         
-        // 计算与测量值的差异
-        Sophus::SE3<T> T_a_b_measured(
-            Eigen::Quaternion<T>(T_ab_.unit_quaternion().cast<T>()),
-            T_ab_.translation().cast<T>());
+        // Extract quaternions and translations
+        Eigen::Quaterniond q_i(pose_i[3], pose_i[0], pose_i[1], pose_i[2]); // w, x, y, z
+        Eigen::Vector3d t_i(pose_i[4], pose_i[5], pose_i[6]);
         
-        // 计算误差（SE3的李代数表示）
-        Eigen::Matrix<T,6,1> error = (T_a_b_measured.inverse() * T_a_b).log();
+        Eigen::Quaterniond q_j(pose_j[3], pose_j[0], pose_j[1], pose_j[2]); // w, x, y, z
+        Eigen::Vector3d t_j(pose_j[4], pose_j[5], pose_j[6]);
+
+        // Compute the predicted relative transformation
+        Eigen::Matrix3d R_i = q_i.toRotationMatrix();
+        Eigen::Matrix3d R_j = q_j.toRotationMatrix();
         
-        // 填充残差
-        for (int i = 0; i < 6; ++i) {
-            residuals[i] = error[i];
+        // Predicted relative rotation: R_ij_pred = R_i.transpose() * R_j
+        Eigen::Matrix3d R_ij_pred = R_i.transpose() * R_j;
+        
+        // Predicted relative translation: t_ij_pred = R_i.transpose() * (t_j - t_i)
+        Eigen::Vector3d t_ij_pred = R_i.transpose() * (t_j - t_i);
+        
+        // Compute the error between measured and predicted
+        // Rotation error: R_error = R_ij.transpose() * R_ij_pred
+        Eigen::Matrix3d R_error = m_R_ij.transpose() * R_ij_pred;
+        
+        // Convert rotation error to angle-axis representation
+        Eigen::AngleAxisd angle_axis_error(R_error);
+        Eigen::Vector3d rot_error = angle_axis_error.angle() * angle_axis_error.axis();
+        
+        // Translation error: t_error = t_ij_pred - t_ij
+        Eigen::Vector3d trans_error = t_ij_pred - m_t_ij;
+        
+        // Apply weight and fill in residuals
+        for (int i = 0; i < 3; ++i) {
+            residuals[i] = rot_error[i] * m_weight;
+            residuals[i + 3] = trans_error[i] * m_weight;
+        }
+        
+        // Compute jacobians if requested
+        if (jacobians) {
+            if (jacobians[0]) {
+                // Jacobian with respect to pose_i
+                Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J_i(jacobians[0]);
+                J_i.setZero();
+                
+                // The Jacobian blocks are complex for SE3 relative pose errors
+                // For a production system, use automatic differentiation instead
+                
+                // For rotation error w.r.t. pose_i (simplified approximation)
+                J_i.block<3, 3>(0, 0) = -Eigen::Matrix3d::Identity();
+                
+                // For translation error w.r.t. pose_i
+                J_i.block<3, 3>(3, 4) = -R_i.transpose();
+                
+                // Apply weight
+                J_i *= m_weight;
+            }
+            
+            if (jacobians[1]) {
+                // Jacobian with respect to pose_j
+                Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J_j(jacobians[1]);
+                J_j.setZero();
+                
+                // For rotation error w.r.t. pose_j (simplified approximation)
+                J_j.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+                
+                // For translation error w.r.t. pose_j
+                J_j.block<3, 3>(3, 4) = R_i.transpose();
+                
+                // Apply weight
+                J_j *= m_weight;
+            }
         }
         
         return true;
     }
-    
+
 private:
-    Sophus::SE3d T_ab_; // 测量的相对位姿
+    Eigen::Matrix4d m_T_ij;
+    Eigen::Matrix3d m_R_ij;
+    Eigen::Vector3d m_t_ij;
+    double m_weight;
 };
 
-// 处理关键帧位姿
-void processKeyframePose(std::stringstream& ss, std::map<unsigned long, KeyFrame>& keyframes) {
-    unsigned long kf_id;
-    double timestamp, tx, ty, tz, qx, qy, qz, qw;
-    
-    ss >> kf_id >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw;
-    
-    KeyFrame& kf = keyframes[kf_id];
-    kf.id = kf_id;
-    kf.timestamp = timestamp;
-    kf.pose = Sophus::SE3d(Eigen::Quaterniond(qw, qx, qy, qz), Eigen::Vector3d(tx, ty, tz));
+// Helper function to convert quaternion and translation to 4x4 transformation matrix
+Eigen::Matrix4d QuaternionTranslationToMatrix4d(const Eigen::Quaterniond& q, const Eigen::Vector3d& t) {
+    Eigen::Matrix4d mat = Eigen::Matrix4d::Identity();
+    mat.block<3, 3>(0, 0) = q.toRotationMatrix();
+    mat.block<3, 1>(0, 3) = t;
+    return mat;
 }
 
-// 处理关键帧信息
-void processKeyframeInfo(std::stringstream& ss, std::map<unsigned long, KeyFrame>& keyframes) {
-    unsigned long kf_id, parent_id;
-    int has_velocity, is_fixed, is_bad, is_inertial, is_virtual;
+// Helper function to convert a vector of values to a 4x4 matrix
+Eigen::Matrix4d convertToMatrix4d(const std::vector<double>& values) {
+    Eigen::Matrix4d mat = Eigen::Matrix4d::Identity();
     
-    ss >> kf_id >> parent_id >> has_velocity >> is_fixed >> is_bad >> is_inertial >> is_virtual;
+    // Check if we have 16 values for a 4x4 matrix
+    if (values.size() == 16) {
+        for (int i = 0; i < 4; i++) {
+            for (int j = 0; j < 4; j++) {
+                mat(i, j) = values[i * 4 + j];
+            }
+        }
+    } else if (values.size() == 12) {
+        // If we have 12 values (just 3x4 part)
+        for (int i = 0; i < 3; i++) {
+            for (int j = 0; j < 4; j++) {
+                mat(i, j) = values[i * 4 + j];
+            }
+        }
+    }
     
-    // 确保关键帧存在
-    if (keyframes.find(kf_id) == keyframes.end()) {
-        std::cerr << "Warning: keyframe " << kf_id << " not found in poses file" << std::endl;
+    return mat;
+}
+
+// Helper function to convert a 4x4 matrix stored in row-major order as a string to an Eigen::Matrix4d
+Eigen::Matrix4d parseMatrix4d(const std::string& matrix_str) {
+    std::istringstream iss(matrix_str);
+    std::vector<double> values;
+    double value;
+    
+    while (iss >> value) {
+        values.push_back(value);
+    }
+    
+    return convertToMatrix4d(values);
+}
+
+// Helper function to print the 3D position of a keyframe
+void print3DPosition(const std::string& label, const Eigen::Vector3d& position) {
+    std::cout << "    " << label << ": [" 
+              << position.x() << ", " 
+              << position.y() << ", " 
+              << position.z() << "]" << std::endl;
+}
+
+// Helper function to print a rotation in angle-axis format
+void printRotation(const std::string& label, const Eigen::Matrix3d& rotation) {
+    Eigen::AngleAxisd aa(rotation);
+    double angle_deg = aa.angle() * 180.0 / M_PI;
+    
+    std::cout << "    " << label << ": " << angle_deg << " deg around [" 
+              << aa.axis().x() << ", " << aa.axis().y() << ", " << aa.axis().z() << "]" << std::endl;
+}
+
+// Helper function to print a translation
+void printTranslation(const std::string& label, const Eigen::Vector3d& translation) {
+    std::cout << "    " << label << ": [" << translation.x() << ", " 
+              << translation.y() << ", " << translation.z() 
+              << "], norm: " << translation.norm() << std::endl;
+}
+
+// Helper function to create quaternion from pose data
+Eigen::Quaterniond getQuaternionFromPose(const std::vector<double>& pose) {
+    return Eigen::Quaterniond(pose[3], pose[0], pose[1], pose[2]); // w, x, y, z
+}
+
+// Helper function to create translation from pose data
+Eigen::Vector3d getTranslationFromPose(const std::vector<double>& pose) {
+    return Eigen::Vector3d(pose[4], pose[5], pose[6]);
+}
+
+// Function to compute and print relative pose with detailed information
+void printDetailedRelativePose(
+    int parent_id, int child_id,
+    const double* parent_opt_pose, const double* child_opt_pose,
+    const std::map<int, std::vector<double>>& keyframe_poses,
+    const std::map<int, std::vector<double>>& corrected_poses,
+    const std::map<int, std::vector<double>>& non_corrected_poses,
+    bool is_boundary,
+    int counter,
+    bool is_before_optimization) {
+    
+    // Only print every 10 keyframes unless it's a boundary
+    if (counter % 10 != 0 && !is_boundary) {
         return;
     }
     
-    KeyFrame& kf = keyframes[kf_id];
-    kf.parent_id = parent_id;
-    kf.is_fixed = (is_fixed == 1);
-}
-
-// 保存轨迹为TUM格式
-void saveTUMTrajectory(const std::string& filename, const std::map<unsigned long, KeyFrame>& keyframes) {
-    std::ofstream file(filename);
-    file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
-    
-    // 创建按时间戳排序的关键帧向量
-    std::vector<std::pair<double, unsigned long>> sorted_timestamps;
-    for (const auto& kf_pair : keyframes) {
-        sorted_timestamps.push_back({kf_pair.second.timestamp, kf_pair.first});
+    std::cout << "\n======================================================" << std::endl;
+    std::cout << "  Relative pose KF " << parent_id << " -> KF " << child_id;
+    if (is_before_optimization) {
+        std::cout << " (BEFORE optimization)" << std::endl;
+    } else {
+        std::cout << " (AFTER optimization)" << std::endl;
     }
+    std::cout << "======================================================" << std::endl;
     
-    // 按时间戳排序
-    std::sort(sorted_timestamps.begin(), sorted_timestamps.end());
+    // Determine whether this is a boundary between corrected and uncorrected regions
+    bool parent_corrected = (corrected_poses.find(parent_id) != corrected_poses.end());
+    bool child_corrected = (corrected_poses.find(child_id) != corrected_poses.end());
     
-    // 保存排序后的轨迹
-    for (const auto& ts_pair : sorted_timestamps) {
-        const KeyFrame& kf = keyframes.at(ts_pair.second);
-        Eigen::Vector3d t = kf.pose.translation();
-        Eigen::Quaterniond q = kf.pose.unit_quaternion();
+    // CASE 1: Non-boundary keyframes
+    if (!is_boundary) {
+        // Extract original poses from keyframe_poses.txt
+        Eigen::Quaterniond q_parent_orig = getQuaternionFromPose(keyframe_poses.at(parent_id));
+        Eigen::Vector3d t_parent_orig = getTranslationFromPose(keyframe_poses.at(parent_id));
         
-        file << std::fixed << std::setprecision(9) 
-             << kf.timestamp << " "
-             << t.x() << " " << t.y() << " " << t.z() << " "
-             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
+        Eigen::Quaterniond q_child_orig = getQuaternionFromPose(keyframe_poses.at(child_id));
+        Eigen::Vector3d t_child_orig = getTranslationFromPose(keyframe_poses.at(child_id));
+        
+        // Compute original relative transform
+        Eigen::Matrix3d R_parent_orig = q_parent_orig.toRotationMatrix();
+        Eigen::Matrix3d R_child_orig = q_child_orig.toRotationMatrix();
+        Eigen::Matrix3d R_rel_orig = R_parent_orig.transpose() * R_child_orig;
+        Eigen::Vector3d t_rel_orig = R_parent_orig.transpose() * (t_child_orig - t_parent_orig);
+        
+        // Print original keyframe poses
+        std::cout << "  ORIGINAL POSES (from keyframe_poses.txt):" << std::endl;
+        std::cout << "  KF " << parent_id << ":" << std::endl;
+        print3DPosition("Position", t_parent_orig);
+        std::cout << "  KF " << child_id << ":" << std::endl;
+        print3DPosition("Position", t_child_orig);
+        
+        // Print original relative pose
+        std::cout << "  ORIGINAL RELATIVE POSE:" << std::endl;
+        printRotation("Rotation", R_rel_orig);
+        printTranslation("Translation", t_rel_orig);
+        
+        // Extract optimized poses
+        Eigen::Quaterniond q_parent_opt(parent_opt_pose[3], parent_opt_pose[0], parent_opt_pose[1], parent_opt_pose[2]);
+        Eigen::Vector3d t_parent_opt(parent_opt_pose[4], parent_opt_pose[5], parent_opt_pose[6]);
+        
+        Eigen::Quaterniond q_child_opt(child_opt_pose[3], child_opt_pose[0], child_opt_pose[1], child_opt_pose[2]);
+        Eigen::Vector3d t_child_opt(child_opt_pose[4], child_opt_pose[5], child_opt_pose[6]);
+        
+        // Compute optimized relative transform
+        Eigen::Matrix3d R_parent_opt = q_parent_opt.toRotationMatrix();
+        Eigen::Matrix3d R_child_opt = q_child_opt.toRotationMatrix();
+        Eigen::Matrix3d R_rel_opt = R_parent_opt.transpose() * R_child_opt;
+        Eigen::Vector3d t_rel_opt = R_parent_opt.transpose() * (t_child_opt - t_parent_opt);
+        
+        // Print optimized keyframe poses
+        if (is_before_optimization) {
+            std::cout << "  INITIAL POSES (for optimization):" << std::endl;
+        } else {
+            std::cout << "  OPTIMIZED POSES:" << std::endl;
+        }
+        std::cout << "  KF " << parent_id << ":" << std::endl;
+        print3DPosition("Position", t_parent_opt);
+        std::cout << "  KF " << child_id << ":" << std::endl;
+        print3DPosition("Position", t_child_opt);
+        
+        // Print optimized relative pose
+        if (is_before_optimization) {
+            std::cout << "  INITIAL RELATIVE POSE:" << std::endl;
+        } else {
+            std::cout << "  OPTIMIZED RELATIVE POSE:" << std::endl;
+        }
+        printRotation("Rotation", R_rel_opt);
+        printTranslation("Translation", t_rel_opt);
+    }
+    // CASE 2: Boundary keyframes
+    else {
+        std::cout << "  *** BOUNDARY NODE BETWEEN CORRECTED AND UNCORRECTED REGIONS ***" << std::endl;
+        
+        // Determine which node is corrected/uncorrected
+        int corrected_id = parent_corrected ? parent_id : child_id;
+        int uncorrected_id = parent_corrected ? child_id : parent_id;
+        
+        std::cout << "  KF " << corrected_id << " (corrected) and KF " << uncorrected_id << " (uncorrected)" << std::endl;
+        
+        // Extract poses for corrected keyframe
+        if (non_corrected_poses.find(corrected_id) != non_corrected_poses.end()) {
+            // If we have pre-correction data for this keyframe
+            Eigen::Quaterniond q_pre_correction = getQuaternionFromPose(non_corrected_poses.at(corrected_id));
+            Eigen::Vector3d t_pre_correction = getTranslationFromPose(non_corrected_poses.at(corrected_id));
+            
+            std::cout << "  CORRECTED KF " << corrected_id << " (PRE-CORRECTION from non_corrected_sim3.txt):" << std::endl;
+            print3DPosition("Position", t_pre_correction);
+            
+            Eigen::Quaterniond q_post_correction = getQuaternionFromPose(corrected_poses.at(corrected_id));
+            Eigen::Vector3d t_post_correction = getTranslationFromPose(corrected_poses.at(corrected_id));
+            
+            std::cout << "  CORRECTED KF " << corrected_id << " (POST-CORRECTION from corrected_sim3.txt):" << std::endl;
+            print3DPosition("Position", t_post_correction);
+        } else {
+            std::cout << "  WARNING: No pre-correction data found for KF " << corrected_id << std::endl;
+        }
+        
+        // Extract pose for uncorrected keyframe
+        Eigen::Quaterniond q_uncorrected = getQuaternionFromPose(keyframe_poses.at(uncorrected_id));
+        Eigen::Vector3d t_uncorrected = getTranslationFromPose(keyframe_poses.at(uncorrected_id));
+        
+        std::cout << "  UNCORRECTED KF " << uncorrected_id << " (from keyframe_poses.txt):" << std::endl;
+        print3DPosition("Position", t_uncorrected);
+        
+        // Compute and print the "true" relative pose at boundary
+        // (using non_corrected pose for corrected node and original pose for uncorrected node)
+        if (non_corrected_poses.find(corrected_id) != non_corrected_poses.end()) {
+            Eigen::Quaterniond q_corrected_pre = getQuaternionFromPose(non_corrected_poses.at(corrected_id));
+            Eigen::Vector3d t_corrected_pre = getTranslationFromPose(non_corrected_poses.at(corrected_id));
+            
+            Eigen::Matrix3d R_corrected_pre = q_corrected_pre.toRotationMatrix();
+            Eigen::Matrix3d R_uncorrected = q_uncorrected.toRotationMatrix();
+            
+            Eigen::Matrix3d R_rel_true;
+            Eigen::Vector3d t_rel_true;
+            
+            if (corrected_id == parent_id) {
+                // Parent is corrected, child is uncorrected
+                R_rel_true = R_corrected_pre.transpose() * R_uncorrected;
+                t_rel_true = R_corrected_pre.transpose() * (t_uncorrected - t_corrected_pre);
+            } else {
+                // Child is corrected, parent is uncorrected
+                R_rel_true = R_uncorrected.transpose() * R_corrected_pre;
+                t_rel_true = R_uncorrected.transpose() * (t_corrected_pre - t_uncorrected);
+            }
+            
+            std::cout << "  TRUE BOUNDARY RELATIVE POSE (using pre-correction and original poses):" << std::endl;
+            printRotation("Rotation", R_rel_true);
+            printTranslation("Translation", t_rel_true);
+        }
+        
+        // Extract optimized poses
+        Eigen::Quaterniond q_parent_opt(parent_opt_pose[3], parent_opt_pose[0], parent_opt_pose[1], parent_opt_pose[2]);
+        Eigen::Vector3d t_parent_opt(parent_opt_pose[4], parent_opt_pose[5], parent_opt_pose[6]);
+        
+        Eigen::Quaterniond q_child_opt(child_opt_pose[3], child_opt_pose[0], child_opt_pose[1], child_opt_pose[2]);
+        Eigen::Vector3d t_child_opt(child_opt_pose[4], child_opt_pose[5], child_opt_pose[6]);
+        
+        // Compute optimized relative transform
+        Eigen::Matrix3d R_parent_opt = q_parent_opt.toRotationMatrix();
+        Eigen::Matrix3d R_child_opt = q_child_opt.toRotationMatrix();
+        Eigen::Matrix3d R_rel_opt = R_parent_opt.transpose() * R_child_opt;
+        Eigen::Vector3d t_rel_opt = R_parent_opt.transpose() * (t_child_opt - t_parent_opt);
+        
+        // Print optimized keyframe poses
+        if (is_before_optimization) {
+            std::cout << "  INITIAL POSES (for optimization):" << std::endl;
+        } else {
+            std::cout << "  OPTIMIZED POSES:" << std::endl;
+        }
+        std::cout << "  KF " << parent_id << ":" << std::endl;
+        print3DPosition("Position", t_parent_opt);
+        std::cout << "  KF " << child_id << ":" << std::endl;
+        print3DPosition("Position", t_child_opt);
+        
+        // Print optimized relative pose
+        if (is_before_optimization) {
+            std::cout << "  INITIAL RELATIVE POSE:" << std::endl;
+        } else {
+            std::cout << "  OPTIMIZED RELATIVE POSE:" << std::endl;
+        }
+        printRotation("Rotation", R_rel_opt);
+        printTranslation("Translation", t_rel_opt);
     }
     
-    file.close();
+    std::cout << "======================================================" << std::endl;
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <data_dir>" << std::endl;
-        return 1;
-    }
+    std::string data_dir = "/Datasets/CERES_Work/input/optimization_data/";
     
-    std::string data_dir = argv[1];
-    
-    // 1. 读取输入文件
-    
-    // 1.1 读取map_info.txt
-    unsigned long init_kf_id = 0;
-    unsigned long max_kf_id = 0;
-    
-    std::ifstream map_info_file(data_dir + "/optimization_data/map_info.txt");
-    if (!map_info_file.is_open()) {
-        std::cerr << "Failed to open map_info.txt" << std::endl;
-        return 1;
-    }
-    
-    std::string line;
-    while (std::getline(map_info_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        
-        std::stringstream ss(line);
-        std::string key;
-        ss >> key;
-        
-        if (key == "INIT_KF_ID") ss >> init_kf_id;
-        else if (key == "MAX_KF_ID") ss >> max_kf_id;
-    }
-    map_info_file.close();
-    
-    // 1.2 读取keyframe_ids.txt
-    unsigned long loop_kf_id = 0;
-    unsigned long current_kf_id = 0;
-    bool fixed_scale = true;
-    
-    std::ifstream kf_ids_file(data_dir + "/optimization_data/keyframe_ids.txt");
-    if (!kf_ids_file.is_open()) {
-        std::cerr << "Failed to open keyframe_ids.txt" << std::endl;
-        return 1;
-    }
-    
-    while (std::getline(kf_ids_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        
-        std::stringstream ss(line);
-        std::string key;
-        unsigned long value;
-        ss >> key >> value;
-        
-        if (key == "LOOP_KF_ID") loop_kf_id = value;
-        else if (key == "CURRENT_KF_ID") current_kf_id = value;
-        else if (key == "FIXED_SCALE") fixed_scale = (value == 1);
-    }
-    kf_ids_file.close();
-    
-    // 1.3 读取loop_match.txt
-    // 1.3 读取loop_match.txt
-    Sophus::SE3d loop_relative_pose;  // 从当前KF到回环KF的变换
-    
-    std::ifstream loop_match_file(data_dir + "/optimization_data/loop_match.txt");
+    // 1. Read loop match information
+    std::ifstream loop_match_file(data_dir + "loop_match.txt");
     if (!loop_match_file.is_open()) {
-        std::cerr << "Failed to open loop_match.txt" << std::endl;
-        return 1;
+        std::cerr << "Error: Could not open loop_match.txt" << std::endl;
+        return -1;
     }
     
-    // 跳过注释行
-    while (std::getline(loop_match_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        break;
+    int current_kf_id, loop_kf_id;
+    std::string line;
+    
+    // Skip header lines
+    std::getline(loop_match_file, line); // Skip first line (header)
+    std::getline(loop_match_file, line); // Skip second line (comment)
+    
+    // Read current KF and loop KF IDs
+    loop_match_file >> current_kf_id >> loop_kf_id;
+    
+    // Read the transformation matrix
+    std::string matrix_line;
+    std::getline(loop_match_file, matrix_line); // Clear the newline after reading IDs
+    std::getline(loop_match_file, matrix_line); // Read the actual matrix line
+    Eigen::Matrix4d loop_constraint = parseMatrix4d(matrix_line);
+    
+    std::cout << "Loop constraint between KF " << current_kf_id << " and KF " << loop_kf_id << std::endl;
+    std::cout << "Loop constraint matrix:\n" << loop_constraint << std::endl;
+    
+    // 2. Read keyframe poses
+    std::map<int, std::vector<double>> keyframe_poses;
+    std::ifstream kf_poses_file(data_dir + "keyframe_poses.txt");
+    if (!kf_poses_file.is_open()) {
+        std::cerr << "Error: Could not open keyframe_poses.txt" << std::endl;
+        return -1;
     }
     
-    // 读取KF ID行
-    std::stringstream ss(line);
-    unsigned long cur_id, loop_id;
-    ss >> cur_id >> loop_id;
+    std::getline(kf_poses_file, line); // Skip the header line
+    int kf_id;
+    double timestamp, tx, ty, tz, qx, qy, qz, qw;
     
-    // 确保ID匹配
-    if (cur_id != current_kf_id || loop_id != loop_kf_id) {
-        std::cerr << "Warning: KF IDs in loop_match.txt don't match keyframe_ids.txt" << std::endl;
+    while (kf_poses_file >> kf_id >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw) {
+        std::vector<double> pose = {qx, qy, qz, qw, tx, ty, tz}; // qx, qy, qz, qw, tx, ty, tz format
+        keyframe_poses[kf_id] = pose;
     }
     
-    // 读取相对变换矩阵
-    if (std::getline(loop_match_file, line)) {
-        Eigen::Matrix4d mat;
-        std::stringstream mat_ss(line);
+    std::cout << "Read poses for " << keyframe_poses.size() << " keyframes" << std::endl;
+    
+    // 3. Read corrected Sim3 poses (SE3 for RGBD/stereo)
+    std::map<int, std::vector<double>> corrected_poses;
+    std::ifstream corrected_file(data_dir + "corrected_sim3.txt");
+    if (corrected_file.is_open()) {
+        std::getline(corrected_file, line); // Skip the header line
+        int kf_id;
+        double scale, tx, ty, tz, qx, qy, qz, qw;
         
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                mat_ss >> mat(i, j);
-            }
+        while (corrected_file >> kf_id >> scale >> tx >> ty >> tz >> qx >> qy >> qz >> qw) {
+            std::vector<double> pose = {qx, qy, qz, qw, tx, ty, tz}; // qx, qy, qz, qw, tx, ty, tz format
+            corrected_poses[kf_id] = pose;
         }
         
-        // 提取3x3旋转矩阵
-        Eigen::Matrix3d R = mat.block<3,3>(0,0);
+        std::cout << "Read corrected poses for " << corrected_poses.size() << " keyframes" << std::endl;
+    }
+    
+    // 4. Read non-corrected Sim3 poses (original poses for corrected keyframes)
+    std::map<int, std::vector<double>> non_corrected_poses;
+    std::ifstream non_corrected_file(data_dir + "non_corrected_sim3.txt");
+    if (non_corrected_file.is_open()) {
+        std::getline(non_corrected_file, line); // Skip the header line
+        int kf_id;
+        double scale, tx, ty, tz, qx, qy, qz, qw;
         
-        // 确保旋转矩阵正交
-        Eigen::JacobiSVD<Eigen::Matrix3d> svd(R, Eigen::ComputeFullU | Eigen::ComputeFullV);
-        Eigen::Matrix3d orthogonal_R = svd.matrixU() * svd.matrixV().transpose();
-        
-        // 确保是右手坐标系（行列式为正）
-        if (orthogonal_R.determinant() < 0) {
-            orthogonal_R = -orthogonal_R;
+        while (non_corrected_file >> kf_id >> scale >> tx >> ty >> tz >> qx >> qy >> qz >> qw) {
+            std::vector<double> pose = {qx, qy, qz, qw, tx, ty, tz}; // qx, qy, qz, qw, tx, ty, tz format
+            non_corrected_poses[kf_id] = pose;
         }
         
-        // 使用正交化后的旋转矩阵和原始平移向量创建SE3
-        Eigen::Vector3d t = mat.block<3,1>(0,3);
-        loop_relative_pose = Sophus::SE3d(orthogonal_R, t);
-    }
-    loop_match_file.close();
-    
-    // 1.4 读取keyframe_poses.txt
-    std::map<unsigned long, KeyFrame> keyframes;
-    
-    std::ifstream poses_file(data_dir + "/optimization_data/keyframe_poses.txt");
-    if (!poses_file.is_open()) {
-        std::cerr << "Failed to open keyframe_poses.txt" << std::endl;
-        return 1;
+        std::cout << "Read non-corrected poses for " << non_corrected_poses.size() << " keyframes" << std::endl;
     }
     
-    // 跳过注释行
-    while (std::getline(poses_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        break;
+    // Identify the corrected range to find potential boundary
+    int min_corrected_id = std::numeric_limits<int>::max();
+    int max_corrected_id = 0;
+    
+    for (const auto& entry : corrected_poses) {
+        min_corrected_id = std::min(min_corrected_id, entry.first);
+        max_corrected_id = std::max(max_corrected_id, entry.first);
     }
     
-    // 处理第一行
-    std::stringstream first_ss(line);
-    processKeyframePose(first_ss, keyframes);
+    std::cout << "Corrected keyframe range: " << min_corrected_id << " to " << max_corrected_id << std::endl;
     
-    // 处理剩余行
-    while (std::getline(poses_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        
-        std::stringstream ss(line);
-        processKeyframePose(ss, keyframes);
-    }
-    poses_file.close();
-    
-    // 1.5 读取keyframes.txt，设置父关键帧和固定标志
-    std::ifstream kfs_file(data_dir + "/optimization_data/keyframes.txt");
-    if (!kfs_file.is_open()) {
-        std::cerr << "Failed to open keyframes.txt" << std::endl;
-        return 1;
+    // 5. Read spanning tree information
+    std::map<int, int> spanning_tree; // child -> parent
+    std::ifstream spanning_tree_file(data_dir + "spanning_tree.txt");
+    if (!spanning_tree_file.is_open()) {
+        std::cerr << "Error: Could not open spanning_tree.txt" << std::endl;
+        return -1;
     }
     
-    // 跳过注释行
-    while (std::getline(kfs_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        break;
-    }
+    std::getline(spanning_tree_file, line); // Skip the header line
+    int child_id, parent_id;
     
-    // 处理第一行
-    std::stringstream first_kf_ss(line);
-    processKeyframeInfo(first_kf_ss, keyframes);
-    
-    // 处理剩余行
-    while (std::getline(kfs_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        
-        std::stringstream ss(line);
-        processKeyframeInfo(ss, keyframes);
-    }
-    kfs_file.close();
-    
-    // 1.6 读取spanning_tree.txt
-    std::map<unsigned long, unsigned long> spanning_tree;  // child -> parent
-    
-    std::ifstream tree_file(data_dir + "/optimization_data/spanning_tree.txt");
-    if (!tree_file.is_open()) {
-        std::cerr << "Failed to open spanning_tree.txt" << std::endl;
-        return 1;
-    }
-    
-    // 跳过注释行
-    while (std::getline(tree_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        break;
-    }
-    
-    // 处理第一行
-    {
-        std::stringstream ss(line);
-        unsigned long child_id, parent_id;
-        ss >> child_id >> parent_id;
+    while (spanning_tree_file >> child_id >> parent_id) {
         spanning_tree[child_id] = parent_id;
     }
     
-    // 处理剩余行
-    while (std::getline(tree_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        
-        std::stringstream ss(line);
-        unsigned long child_id, parent_id;
-        ss >> child_id >> parent_id;
-        spanning_tree[child_id] = parent_id;
-    }
-    tree_file.close();
+    std::cout << "Read " << spanning_tree.size() << " spanning tree edges" << std::endl;
     
-    // 1.7 读取covisibility.txt
-    std::map<std::pair<unsigned long, unsigned long>, int> covisibility_weights;
-    
-    std::ifstream covis_file(data_dir + "/optimization_data/covisibility.txt");
-    if (!covis_file.is_open()) {
-        std::cerr << "Failed to open covisibility.txt" << std::endl;
-        return 1;
+    // 6. Read map information
+    std::ifstream map_info_file(data_dir + "map_info.txt");
+    if (!map_info_file.is_open()) {
+        std::cerr << "Error: Could not open map_info.txt" << std::endl;
+        return -1;
     }
     
-    // 跳过注释行
-    while (std::getline(covis_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        break;
-    }
+    int map_id, init_kf_id, max_kf_id, num_kfs, num_mps;
+    std::string key;
     
-    // 处理第一行
-    {
-        std::stringstream ss(line);
-        unsigned long kf_id, conn_id;
-        int weight;
-        ss >> kf_id >> conn_id >> weight;
-        
-        std::pair<unsigned long, unsigned long> edge = 
-            (kf_id < conn_id) ? std::make_pair(kf_id, conn_id) : std::make_pair(conn_id, kf_id);
-        covisibility_weights[edge] = weight;
-    }
+    map_info_file >> key >> map_id;
+    map_info_file >> key >> init_kf_id;
+    map_info_file >> key >> max_kf_id;
+    map_info_file >> key >> num_kfs;
+    map_info_file >> key >> num_mps;
     
-    // 处理剩余行
-    while (std::getline(covis_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        
-        std::stringstream ss(line);
-        unsigned long kf_id, conn_id;
-        int weight;
-        ss >> kf_id >> conn_id >> weight;
-        
-        std::pair<unsigned long, unsigned long> edge = 
-            (kf_id < conn_id) ? std::make_pair(kf_id, conn_id) : std::make_pair(conn_id, kf_id);
-        covisibility_weights[edge] = weight;
-    }
-    covis_file.close();
+    std::cout << "Map info: " << num_kfs << " keyframes, " << num_mps << " map points" << std::endl;
+    std::cout << "Init KF: " << init_kf_id << ", Max KF: " << max_kf_id << std::endl;
     
-    // 1.8 读取loop_connections.txt
-    std::map<unsigned long, std::set<unsigned long>> loop_connections;
-    
-    std::ifstream loop_conn_file(data_dir + "/optimization_data/loop_connections.txt");
-    if (!loop_conn_file.is_open()) {
-        std::cerr << "Failed to open loop_connections.txt" << std::endl;
-        return 1;
-    }
-    
-    // 跳过注释行
-    while (std::getline(loop_conn_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        break;
-    }
-    
-    // 处理第一行
-    {
-        std::stringstream ss(line);
-        unsigned long kf_id;
-        ss >> kf_id;
-        
-        unsigned long conn_id;
-        while (ss >> conn_id) {
-            loop_connections[kf_id].insert(conn_id);
-        }
-    }
-    
-    // 处理剩余行
-    while (std::getline(loop_conn_file, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        
-        std::stringstream ss(line);
-        unsigned long kf_id;
-        ss >> kf_id;
-        
-        unsigned long conn_id;
-        while (ss >> conn_id) {
-            loop_connections[kf_id].insert(conn_id);
-        }
-    }
-    loop_conn_file.close();
-    
-    // 2. 设置CERES优化问题
-    
-    // 2.1 备份原始关键帧位姿
-    std::map<unsigned long, Sophus::SE3d> original_poses;
-    for (const auto& kf_pair : keyframes) {
-        original_poses[kf_pair.first] = kf_pair.second.pose;
-    }
-    
-    // 2.2 配置求解器选项
+    // Create the optimization problem
     ceres::Problem problem;
-    ceres::LossFunction* loss_function = new ceres::HuberLoss(1.0);
     
-    // 2.3 设置参数块
-    std::map<unsigned long, double*> pose_parameters;
+    // Create the SE3 manifold
+    ceres::Manifold* se3_manifold = new SE3Manifold();
     
-    // 使用Ceres内置的欧氏空间和四元数流形组合 - 更适合SE3
-    // 更简洁的方式，使用类型推导
-    auto* product_manifold = new ceres::ProductManifold(
-        ceres::EuclideanManifold<3>{}, 
-        ceres::EigenQuaternionManifold{});
+    // Storage for the optimized poses
+    std::map<int, double*> optimized_poses;
     
-    const int min_covisibility_weight = 100;  // 最小共视权重阈值
-    
-    // 对每个关键帧，添加SE3位姿变量
-    for (const auto& kf_pair : keyframes) {
-        unsigned long kf_id = kf_pair.first;
-        const KeyFrame& kf = kf_pair.second;
+    // Add the keyframe poses as variables to optimize
+    for (auto& kf_pose : keyframe_poses) {
+        int kf_id = kf_pose.first;
         
-        // 每个SE3变量包含平移(3)和四元数旋转(4)
-        double* param = new double[7];
+        // Check if this keyframe has a corrected pose
+        if (corrected_poses.find(kf_id) != corrected_poses.end()) {
+            // Use the corrected pose for initial values
+            double* pose = new double[7];
+            for (int i = 0; i < 7; i++) {
+                pose[i] = corrected_poses[kf_id][i];
+            }
+            optimized_poses[kf_id] = pose;
+            std::cout << "Using corrected pose for KF " << kf_id << std::endl;
+        } else {
+            // Use the original pose
+            double* pose = new double[7];
+            for (int i = 0; i < 7; i++) {
+                pose[i] = kf_pose.second[i];
+            }
+            optimized_poses[kf_id] = pose;
+        }
         
-        // 平移部分
-        param[0] = kf.pose.translation()(0);
-        param[1] = kf.pose.translation()(1);
-        param[2] = kf.pose.translation()(2);
+        // Add the variable to the optimization problem
+        problem.AddParameterBlock(optimized_poses[kf_id], 7, se3_manifold);
         
-        // 旋转部分（四元数）
-        Eigen::Quaterniond q = kf.pose.unit_quaternion();
-        param[3] = q.x();
-        param[4] = q.y();
-        param[5] = q.z();
-        param[6] = q.w();
-        
-        pose_parameters[kf_id] = param;
-        
-        // 添加到优化问题中 - 使用Ceres 2.2的Manifold API
-        problem.AddParameterBlock(param, 7, product_manifold);
-        
-        // 固定初始关键帧或指定为固定的关键帧
-        if (kf.is_fixed) {
-            problem.SetParameterBlockConstant(param);
+        // Fix the initial keyframe
+        if (kf_id == init_kf_id) {
+            problem.SetParameterBlockConstant(optimized_poses[kf_id]);
+            std::cout << "Fixed KF " << kf_id << " (initial keyframe)" << std::endl;
         }
     }
     
-    // 3. 添加约束
-    
-    // 3.1 添加生成树约束
-    for (const auto& tree_edge : spanning_tree) {
-        unsigned long child_id = tree_edge.first;
-        unsigned long parent_id = tree_edge.second;
+    // Add the loop closure constraint
+    if (optimized_poses.find(current_kf_id) != optimized_poses.end() && 
+        optimized_poses.find(loop_kf_id) != optimized_poses.end()) {
         
-        double* child_param = pose_parameters[child_id];
-        double* parent_param = pose_parameters[parent_id];
-        
-        // 计算相对变换
-        const KeyFrame& child_kf = keyframes[child_id];
-        const KeyFrame& parent_kf = keyframes[parent_id];
-        
-        Sophus::SE3d T_parent_world = parent_kf.pose;
-        Sophus::SE3d T_child_world = child_kf.pose;
-        Sophus::SE3d T_parent_child = T_parent_world * T_child_world.inverse();
-        
-        // 添加相对位姿约束
-        ceres::CostFunction* cost_function = 
-            new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
-                new SE3RelativePoseCostFunctor(T_parent_child));
+        // Add the residual with high weight (1000.0) for loop closure
+        ceres::CostFunction* loop_cost_function = 
+            new SE3RelativePoseCostFunction(loop_constraint, 1000.0);
         
         problem.AddResidualBlock(
-            cost_function, 
-            loss_function, 
-            parent_param,
-            child_param);
+            loop_cost_function,
+            nullptr, // No robust loss function for now
+            optimized_poses[current_kf_id],
+            optimized_poses[loop_kf_id]
+        );
+        
+        std::cout << "Added loop closure constraint between KF " << current_kf_id 
+                  << " and KF " << loop_kf_id << " with weight 1000.0" << std::endl;
+    } else {
+        std::cerr << "Warning: Could not add loop constraint, keyframes not found" << std::endl;
     }
     
-    // 3.2 添加共视图约束
-    std::set<std::pair<unsigned long, unsigned long>> inserted_edges;
+    // Add spanning tree constraints
+    std::cout << "\nBefore optimization - Relative poses:" << std::endl;
     
-    for (const auto& covis_edge : covisibility_weights) {
-        const std::pair<unsigned long, unsigned long>& edge = covis_edge.first;
-        int weight = covis_edge.second;
-        
-        // 跳过低权重的共视关系
-        if (weight < min_covisibility_weight) 
-            continue;
-        
-        unsigned long id1 = edge.first;
-        unsigned long id2 = edge.second;
-        
-        // 避免已经添加过的边（如生成树边）
-        if (spanning_tree[id1] == id2 || spanning_tree[id2] == id1)
-            continue;
-        
-        // 标记已插入边
-        inserted_edges.insert(edge);
-        
-        double* param1 = pose_parameters[id1];
-        double* param2 = pose_parameters[id2];
-        
-        // 计算相对变换
-        const KeyFrame& kf1 = keyframes[id1];
-        const KeyFrame& kf2 = keyframes[id2];
-        
-        Sophus::SE3d T_kf1_world = kf1.pose;
-        Sophus::SE3d T_kf2_world = kf2.pose;
-        Sophus::SE3d T_kf1_kf2 = T_kf1_world * T_kf2_world.inverse();
-        
-        // 添加相对位姿约束
-        ceres::CostFunction* cost_function = 
-            new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
-                new SE3RelativePoseCostFunctor(T_kf1_kf2));
-        
-        // 根据共视权重调整信息矩阵
-        double information_scale = weight / static_cast<double>(min_covisibility_weight);
-        if (information_scale > 1.0) information_scale = 1.0;
-        
-        ceres::LossFunction* scaled_loss = 
-            new ceres::ScaledLoss(loss_function, information_scale, ceres::TAKE_OWNERSHIP);
-        
-        problem.AddResidualBlock(
-            cost_function, 
-            scaled_loss, 
-            param1,
-            param2);
-    }
+    int spanning_tree_count = 0;
+    int print_counter = 0;
     
-    // 3.3 添加回环约束
-    
-    // 3.3.1 首先添加来自loop_connections的约束
-    for (const auto& lc_pair : loop_connections) {
-        unsigned long kf_id = lc_pair.first;
-        const std::set<unsigned long>& connections = lc_pair.second;
+    for (auto& edge : spanning_tree) {
+        int child_id = edge.first;
+        int parent_id = edge.second;
         
-        double* kf_param = pose_parameters[kf_id];
-        
-        for (unsigned long conn_id : connections) {
-            // 避免重复添加边
-            std::pair<unsigned long, unsigned long> edge = 
-                (kf_id < conn_id) ? std::make_pair(kf_id, conn_id) : std::make_pair(conn_id, kf_id);
+        if (optimized_poses.find(child_id) != optimized_poses.end() && 
+            optimized_poses.find(parent_id) != optimized_poses.end()) {
+            
+            // Check if we're at a boundary between corrected and uncorrected poses
+            bool child_corrected = (corrected_poses.find(child_id) != corrected_poses.end());
+            bool parent_corrected = (corrected_poses.find(parent_id) != corrected_poses.end());
+            bool is_boundary = (child_corrected != parent_corrected);
+            
+            // Print detailed pose information
+            printDetailedRelativePose(
+                parent_id, child_id, 
+                optimized_poses[parent_id], optimized_poses[child_id],
+                keyframe_poses, corrected_poses, non_corrected_poses,
+                is_boundary,
+                print_counter,
+                true // before optimization
+            );
+            
+            print_counter++;
+            
+            // Setup the correct constraint depending on the region
+            Eigen::Quaterniond q_parent, q_child;
+            Eigen::Vector3d t_parent, t_child;
+            
+            if (is_boundary) {
+                // For boundary constraints, special handling is needed
+                if (parent_corrected) {
+                    // Parent is in corrected region
+                    q_parent = getQuaternionFromPose(corrected_poses[parent_id]);
+                    t_parent = getTranslationFromPose(corrected_poses[parent_id]);
+                    
+                    // Child is in uncorrected region
+                    q_child = getQuaternionFromPose(keyframe_poses[child_id]);
+                    t_child = getTranslationFromPose(keyframe_poses[child_id]);
+                } else {
+                    // Parent is in uncorrected region
+                    q_parent = getQuaternionFromPose(keyframe_poses[parent_id]);
+                    t_parent = getTranslationFromPose(keyframe_poses[parent_id]);
+                    
+                    // Child is in corrected region
+                    q_child = getQuaternionFromPose(corrected_poses[child_id]);
+                    t_child = getTranslationFromPose(corrected_poses[child_id]);
+                }
+            } else if (parent_corrected && child_corrected) {
+                // Both in corrected region - use corrected poses
+                q_parent = getQuaternionFromPose(corrected_poses[parent_id]);
+                t_parent = getTranslationFromPose(corrected_poses[parent_id]);
                 
-            if (inserted_edges.count(edge))
-                continue;
+                q_child = getQuaternionFromPose(corrected_poses[child_id]);
+                t_child = getTranslationFromPose(corrected_poses[child_id]);
+            } else {
+                // Both in uncorrected region - use original poses
+                q_parent = getQuaternionFromPose(keyframe_poses[parent_id]);
+                t_parent = getTranslationFromPose(keyframe_poses[parent_id]);
                 
-            // 标记已插入边
-            inserted_edges.insert(edge);
+                q_child = getQuaternionFromPose(keyframe_poses[child_id]);
+                t_child = getTranslationFromPose(keyframe_poses[child_id]);
+            }
             
-            double* conn_param = pose_parameters[conn_id];
+            // Compute the relative transformation to use as constraint
+            Eigen::Matrix3d R_parent = q_parent.toRotationMatrix();
+            Eigen::Matrix3d R_child = q_child.toRotationMatrix();
             
-            // 计算相对变换
-            const KeyFrame& kf = keyframes[kf_id];
-            const KeyFrame& conn_kf = keyframes[conn_id];
+            Eigen::Matrix3d R_parent_child = R_parent.transpose() * R_child;
+            Eigen::Vector3d t_parent_child = R_parent.transpose() * (t_child - t_parent);
             
-            Sophus::SE3d T_kf_world = kf.pose;
-            Sophus::SE3d T_conn_world = conn_kf.pose;
-            Sophus::SE3d T_kf_conn = T_kf_world * T_conn_world.inverse();
+            Eigen::Matrix4d T_parent_child = Eigen::Matrix4d::Identity();
+            T_parent_child.block<3, 3>(0, 0) = R_parent_child;
+            T_parent_child.block<3, 1>(0, 3) = t_parent_child;
             
-            // 添加相对位姿约束，高权重
-            ceres::CostFunction* cost_function = 
-                new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
-                    new SE3RelativePoseCostFunctor(T_kf_conn));
-            
-            // 回环约束使用更高的权重
-            ceres::LossFunction* loop_loss = 
-                new ceres::ScaledLoss(loss_function, 10.0, ceres::TAKE_OWNERSHIP);
+            // Add the residual with medium weight (100.0) for spanning tree
+            ceres::CostFunction* spanning_tree_cost_function = 
+                new SE3RelativePoseCostFunction(T_parent_child, 100.0);
             
             problem.AddResidualBlock(
-                cost_function, 
-                loop_loss, 
-                kf_param,
-                conn_param);
+                spanning_tree_cost_function,
+                nullptr, // No robust loss function for now
+                optimized_poses[parent_id],
+                optimized_poses[child_id]
+            );
+            
+            spanning_tree_count++;
         }
     }
     
-    // 3.3.2 添加当前回环约束
-    double* current_param = pose_parameters[current_kf_id];
-    double* loop_param = pose_parameters[loop_kf_id];
+    std::cout << "\nAdded " << spanning_tree_count << " spanning tree constraints with weight 100.0" << std::endl;
     
-    // 添加回环约束，这是最重要的约束，使用较高的权重
-    ceres::CostFunction* loop_cost_function = 
-        new ceres::AutoDiffCostFunction<SE3RelativePoseCostFunctor, 6, 7, 7>(
-            new SE3RelativePoseCostFunctor(loop_relative_pose));
-    
-    // 回环约束使用更高的权重
-    ceres::LossFunction* direct_loop_loss = 
-        new ceres::ScaledLoss(loss_function, 10.0, ceres::TAKE_OWNERSHIP);
-    
-    problem.AddResidualBlock(
-        loop_cost_function, 
-        direct_loop_loss, 
-        loop_param,      // 回环KF参数
-        current_param);  // 当前KF参数
-    
-    // 4. 执行优化
-    
-    // 4.1 配置求解器选项
+    // Configure the solver
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    options.max_num_iterations = 20;  // 与原始ORB-SLAM3保持一致
     options.minimizer_progress_to_stdout = true;
-    options.num_threads = 8;  // 多线程优化
+    options.max_num_iterations = 20;
+    options.function_tolerance = 1e-6;
+    options.gradient_tolerance = 1e-10;
+    options.parameter_tolerance = 1e-8;
     
+    // Run the solver
     ceres::Solver::Summary summary;
-    std::cout << "Starting optimization..." << std::endl;
     ceres::Solve(options, &problem, &summary);
     
-    std::cout << summary.FullReport() << std::endl;
+    std::cout << summary.BriefReport() << std::endl;
     
-    // 5. 更新关键帧位姿
+    // Print relative poses after optimization
+    std::cout << "\nAfter optimization - Relative poses:" << std::endl;
     
-    // 5.1 获取优化后的位姿
-    for (const auto& param_pair : pose_parameters) {
-        unsigned long kf_id = param_pair.first;
-        const double* param = param_pair.second;
+    print_counter = 0; // Reset counter for after optimization
+    
+    for (auto& edge : spanning_tree) {
+        int child_id = edge.first;
+        int parent_id = edge.second;
         
-        Eigen::Vector3d t(param[0], param[1], param[2]);
-        Eigen::Quaterniond q(param[6], param[3], param[4], param[5]); // w,x,y,z
-        q.normalize();
+        if (optimized_poses.find(child_id) != optimized_poses.end() && 
+            optimized_poses.find(parent_id) != optimized_poses.end()) {
+            
+            bool child_corrected = (corrected_poses.find(child_id) != corrected_poses.end());
+            bool parent_corrected = (corrected_poses.find(parent_id) != corrected_poses.end());
+            bool is_boundary = (child_corrected != parent_corrected);
+            
+            // Print detailed pose information after optimization
+            printDetailedRelativePose(
+                parent_id, child_id, 
+                optimized_poses[parent_id], optimized_poses[child_id],
+                keyframe_poses, corrected_poses, non_corrected_poses,
+                is_boundary,
+                print_counter,
+                false // after optimization
+            );
+            
+            print_counter++;
+        }
+    }
+    
+    // Write the optimized results to a TUM format file
+    std::string output_file = "/Datasets/CERES_Work/output/optimized_poses.txt";
+    std::ofstream out_file(output_file);
+    
+    if (!out_file.is_open()) {
+        std::cerr << "Error: Could not open output file" << std::endl;
+        return -1;
+    }
+    
+    // First, collect all poses with timestamps
+    std::vector<std::pair<double, int>> timestamps_kfids;
+    for (const auto& kf_pair : keyframe_poses) {
+        int kf_id = kf_pair.first;
         
-        // 更新关键帧位姿
-        keyframes[kf_id].pose = Sophus::SE3d(q, t);
+        // Get the timestamp from keyframe_poses.txt
+        std::ifstream ts_file(data_dir + "keyframe_poses.txt");
+        std::string ts_line;
+        std::getline(ts_file, ts_line); // Skip header
+        
+        int id;
+        double ts;
+        while (ts_file >> id >> ts) {
+            if (id == kf_id) {
+                timestamps_kfids.push_back(std::make_pair(ts, kf_id));
+                break;
+            }
+            // Skip rest of line
+            std::getline(ts_file, ts_line);
+        }
     }
     
-    // 6. 保存优化结果
+    // Sort by timestamp
+    std::sort(timestamps_kfids.begin(), timestamps_kfids.end());
     
-    std::string output_dir = data_dir + "/../output";
-    
-    // 创建输出目录
-    struct stat st = {0};
-    if (stat(output_dir.c_str(), &st) == -1) {
-#ifdef _WIN32
-        _mkdir(output_dir.c_str());
-#else
-        mkdir(output_dir.c_str(), 0755);
-#endif
+    // Write in TUM format: timestamp tx ty tz qx qy qz qw
+    for (const auto& ts_kf : timestamps_kfids) {
+        double timestamp = ts_kf.first;
+        int kf_id = ts_kf.second;
+        
+        if (optimized_poses.find(kf_id) != optimized_poses.end()) {
+            const double* pose = optimized_poses[kf_id];
+            
+            // TUM format: timestamp tx ty tz qx qy qz qw
+            out_file << std::fixed << std::setprecision(9) << timestamp << " "
+                    << pose[4] << " " << pose[5] << " " << pose[6] << " "
+                    << pose[0] << " " << pose[1] << " " << pose[2] << " " << pose[3] << std::endl;
+        }
     }
     
-    // 保存TUM格式轨迹
-    saveTUMTrajectory(output_dir + "/trajectory.txt", keyframes);
+    out_file.close();
     
-    std::cout << "Optimization completed successfully!" << std::endl;
-    std::cout << "Results saved to: " << output_dir << "/trajectory.txt (TUM format)" << std::endl;
+    std::cout << "Optimized poses saved to: " << output_file << std::endl;
     
-    // 释放内存
-    for (auto& param_pair : pose_parameters) {
-        delete[] param_pair.second;
+    // Clean up
+    for (auto& pose : optimized_poses) {
+        delete[] pose.second;
     }
+    
+    delete se3_manifold;
     
     return 0;
 }
