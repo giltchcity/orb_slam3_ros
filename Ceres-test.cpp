@@ -1206,7 +1206,59 @@ public:
         
         std::cout << "优化后的姿态已保存到: " << output_file << std::endl;
     }
+
+    // 输出优化后的Twc格式姿态（相机在世界坐标系中的位置）
+    void OutputOptimizedPosesTwc(const std::string& output_file) {
+        std::ofstream file(output_file);
+        if (!file.is_open()) {
+            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            return;
+        }
+        
+        file << "# KF_ID tx ty tz qx qy qz qw (Twc format - 相机在世界坐标系中的位置)" << std::endl;
+        
+        for (const auto& kf_pair : data_.keyframes) {
+            const auto& kf = kf_pair.second;
+            if (kf->is_bad) continue;
+            
+            // 从SE3状态获取Tcw
+            Eigen::Vector3d t_cw(kf->se3_state[0], kf->se3_state[1], kf->se3_state[2]);
+            Eigen::Quaterniond q_cw(kf->se3_state[6], kf->se3_state[3], kf->se3_state[4], kf->se3_state[5]);
+            
+            // 构建Tcw变换矩阵
+            Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
+            T_cw.block<3, 3>(0, 0) = q_cw.toRotationMatrix();
+            T_cw.block<3, 1>(0, 3) = t_cw;
+            
+            // 计算Twc = Tcw^(-1)
+            Eigen::Matrix4d T_wc = T_cw.inverse();
+            
+            // 提取Twc的平移和旋转
+            Eigen::Vector3d t_wc = T_wc.block<3, 1>(0, 3);
+            Eigen::Matrix3d R_wc = T_wc.block<3, 3>(0, 0);
+            Eigen::Quaterniond q_wc(R_wc);
+            
+            // 输出Twc格式
+            file << kf->id << " "
+                 << t_wc.x() << " " << t_wc.y() << " " << t_wc.z() << " "
+                 << q_wc.x() << " " << q_wc.y() << " " << q_wc.z() << " " << q_wc.w() << std::endl;
+        }
+        
+        std::cout << "优化后的Twc姿态已保存到: " << output_file << std::endl;
+    }
     
+    // 同时输出Tcw和Twc格式
+    void OutputBothFormats(const std::string& output_dir, const std::string& suffix = "") {
+        std::string tcw_file = output_dir + "/poses_tcw" + suffix + ".txt";
+        std::string twc_file = output_dir + "/poses_twc" + suffix + ".txt";
+        
+        // 输出Tcw格式
+        OutputOptimizedPoses(tcw_file);
+        
+        // 输出Twc格式  
+        OutputOptimizedPosesTwc(twc_file);
+    }
+
     // 获取关键帧信息用于调试
     void PrintKeyFrameInfo(int id) {
         if (data_.keyframes.find(id) != data_.keyframes.end()) {
@@ -1368,9 +1420,12 @@ int main() {
     
     std::cout << "\n注意：当前版本只添加了关键帧顶点，约束部分将在后续版本中添加" << std::endl;
     
-    // 输出初始姿态（用于验证）
-    optimizer.OutputOptimizedPoses(output_dir + "/initial_poses.txt");
-
+    // // 输出初始姿态（用于验证）
+    // optimizer.OutputOptimizedPoses(output_dir + "/initial_poses.txt");
+    
+    // 输出优化前的姿态（两种格式）
+    std::cout << "\n保存优化前姿态..." << std::endl;
+    optimizer.OutputBothFormats(output_dir, "_before_optimization");
     
     // 执行优化！
     std::cout << "\n=== 开始执行回环优化 ===" << std::endl;
@@ -1380,11 +1435,20 @@ int main() {
     if (success) {
         std::cout << "\n=== 优化成功完成 ===" << std::endl;
         
-        // 输出优化后的姿态
-        optimizer.OutputOptimizedPoses(output_dir + "/poses_after_optimization.txt");
+        // // 输出优化后的姿态
+        // optimizer.OutputOptimizedPoses(output_dir + "/poses_after_optimization.txt");
+        
+        // 输出优化后的姿态（两种格式）
+        std::cout << "\n保存优化后姿态..." << std::endl;
+        optimizer.OutputBothFormats(output_dir, "_after_optimization");
         
         // 打印一些关键帧的优化前后对比
         optimizer.PrintOptimizationResults();
+        
+        std::cout << "\n输出文件说明:" << std::endl;
+        std::cout << "- poses_tcw_*.txt: Tcw格式（世界到相机的变换）" << std::endl;
+        std::cout << "- poses_twc_*.txt: Twc格式（相机在世界坐标系中的位置，直接用于可视化）" << std::endl;
+        
     } else {
         std::cout << "\n=== 优化失败 ===" << std::endl;
         return -1;
