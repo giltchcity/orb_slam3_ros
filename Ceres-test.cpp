@@ -7,6 +7,8 @@
 #include <set>
 #include <unordered_map>
 #include <memory>
+#include <algorithm>
+#include <iomanip>
 
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
@@ -1259,6 +1261,182 @@ public:
         OutputOptimizedPosesTwc(twc_file);
     }
 
+    // 输出优化后的Twc格式姿态（TUM格式，按时间戳排序）
+    void OutputOptimizedPosesTwcTUM(const std::string& output_file) {
+        std::ofstream file(output_file);
+        if (!file.is_open()) {
+            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            return;
+        }
+        
+        // TUM格式头部
+        file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
+        file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
+        
+        // 收集所有关键帧的时间戳和姿态
+        struct KeyFramePose {
+            double timestamp;
+            int kf_id;
+            Eigen::Vector3d position_wc;
+            Eigen::Quaterniond quaternion_wc;
+        };
+        
+        std::vector<KeyFramePose> kf_poses;
+        
+        for (const auto& kf_pair : data_.keyframes) {
+            const auto& kf = kf_pair.second;
+            if (kf->is_bad) continue;
+            
+            // 从SE3状态获取Tcw
+            Eigen::Vector3d t_cw(kf->se3_state[0], kf->se3_state[1], kf->se3_state[2]);
+            Eigen::Quaterniond q_cw(kf->se3_state[6], kf->se3_state[3], kf->se3_state[4], kf->se3_state[5]);
+            
+            // 构建Tcw变换矩阵
+            Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
+            T_cw.block<3, 3>(0, 0) = q_cw.toRotationMatrix();
+            T_cw.block<3, 1>(0, 3) = t_cw;
+            
+            // 计算Twc = Tcw^(-1)
+            Eigen::Matrix4d T_wc = T_cw.inverse();
+            
+            // 提取Twc的平移和旋转
+            Eigen::Vector3d t_wc = T_wc.block<3, 1>(0, 3);
+            Eigen::Matrix3d R_wc = T_wc.block<3, 3>(0, 0);
+            Eigen::Quaterniond q_wc(R_wc);
+            
+            // 创建KeyFramePose对象
+            KeyFramePose kf_pose;
+            kf_pose.timestamp = kf->timestamp;
+            kf_pose.kf_id = kf->id;
+            kf_pose.position_wc = t_wc;
+            kf_pose.quaternion_wc = q_wc;
+            
+            kf_poses.push_back(kf_pose);
+        }
+        
+        // 按时间戳排序
+        std::sort(kf_poses.begin(), kf_poses.end(), 
+                  [](const KeyFramePose& a, const KeyFramePose& b) {
+                      return a.timestamp < b.timestamp;
+                  });
+        
+        // 输出TUM格式
+        for (const auto& kf_pose : kf_poses) {
+            // TUM格式：timestamp tx ty tz qx qy qz qw
+            file << std::fixed << std::setprecision(9) << kf_pose.timestamp << " "
+                 << std::setprecision(6)
+                 << kf_pose.position_wc.x() << " " 
+                 << kf_pose.position_wc.y() << " " 
+                 << kf_pose.position_wc.z() << " "
+                 << kf_pose.quaternion_wc.x() << " " 
+                 << kf_pose.quaternion_wc.y() << " " 
+                 << kf_pose.quaternion_wc.z() << " " 
+                 << kf_pose.quaternion_wc.w() << std::endl;
+        }
+        
+        std::cout << "优化后的TUM格式Twc轨迹已保存到: " << output_file << std::endl;
+        std::cout << "包含 " << kf_poses.size() << " 个关键帧，按时间戳排序" << std::endl;
+    }
+    
+    // 输出优化前的Twc格式姿态（TUM格式，按时间戳排序）
+    void OutputInitialPosesTwcTUM(const std::string& output_file) {
+        std::ofstream file(output_file);
+        if (!file.is_open()) {
+            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            return;
+        }
+        
+        // TUM格式头部
+        file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
+        file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
+        
+        // 收集所有关键帧的时间戳和姿态
+        struct KeyFramePose {
+            double timestamp;
+            int kf_id;
+            Eigen::Vector3d position_wc;
+            Eigen::Quaterniond quaternion_wc;
+        };
+        
+        std::vector<KeyFramePose> kf_poses;
+        
+        for (const auto& kf_pair : data_.keyframes) {
+            const auto& kf = kf_pair.second;
+            if (kf->is_bad) continue;
+            
+            // 检查是否有修正姿态，如果有则使用修正姿态，否则使用当前姿态
+            Eigen::Vector3d t_cw;
+            Eigen::Quaterniond q_cw;
+            
+            if (data_.corrected_poses.find(kf->id) != data_.corrected_poses.end()) {
+                const auto& corrected = data_.corrected_poses[kf->id];
+                t_cw = corrected.translation;
+                q_cw = corrected.quaternion;
+            } else {
+                // 使用当前姿态作为初始姿态
+                t_cw = kf->translation;
+                q_cw = kf->quaternion;
+            }
+            
+            // 构建Tcw变换矩阵
+            Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
+            T_cw.block<3, 3>(0, 0) = q_cw.toRotationMatrix();
+            T_cw.block<3, 1>(0, 3) = t_cw;
+            
+            // 计算Twc = Tcw^(-1)
+            Eigen::Matrix4d T_wc = T_cw.inverse();
+            
+            // 提取Twc的平移和旋转
+            Eigen::Vector3d t_wc = T_wc.block<3, 1>(0, 3);
+            Eigen::Matrix3d R_wc = T_wc.block<3, 3>(0, 0);
+            Eigen::Quaterniond q_wc(R_wc);
+            
+            // 创建KeyFramePose对象
+            KeyFramePose kf_pose;
+            kf_pose.timestamp = kf->timestamp;
+            kf_pose.kf_id = kf->id;
+            kf_pose.position_wc = t_wc;
+            kf_pose.quaternion_wc = q_wc;
+            
+            kf_poses.push_back(kf_pose);
+        }
+        
+        // 按时间戳排序
+        std::sort(kf_poses.begin(), kf_poses.end(), 
+                  [](const KeyFramePose& a, const KeyFramePose& b) {
+                      return a.timestamp < b.timestamp;
+                  });
+        
+        // 输出TUM格式
+        for (const auto& kf_pose : kf_poses) {
+            // TUM格式：timestamp tx ty tz qx qy qz qw
+            file << std::fixed << std::setprecision(9) << kf_pose.timestamp << " "
+                 << std::setprecision(6)
+                 << kf_pose.position_wc.x() << " " 
+                 << kf_pose.position_wc.y() << " " 
+                 << kf_pose.position_wc.z() << " "
+                 << kf_pose.quaternion_wc.x() << " " 
+                 << kf_pose.quaternion_wc.y() << " " 
+                 << kf_pose.quaternion_wc.z() << " " 
+                 << kf_pose.quaternion_wc.w() << std::endl;
+        }
+        
+        std::cout << "优化前的TUM格式Twc轨迹已保存到: " << output_file << std::endl;
+        std::cout << "包含 " << kf_poses.size() << " 个关键帧，按时间戳排序" << std::endl;
+    }
+    
+    // 输出TUM格式的轨迹文件
+    void OutputTUMTrajectory(const std::string& output_dir) {
+        std::string tum_before_file = output_dir + "/trajectory_before_optimization.txt";
+        std::string tum_after_file = output_dir + "/trajectory_after_optimization.txt";
+        
+        // 输出优化前的TUM格式轨迹
+        OutputInitialPosesTwcTUM(tum_before_file);
+        
+        // 输出优化后的TUM格式轨迹
+        OutputOptimizedPosesTwcTUM(tum_after_file);
+    }
+
     // 获取关键帧信息用于调试
     void PrintKeyFrameInfo(int id) {
         if (data_.keyframes.find(id) != data_.keyframes.end()) {
@@ -1437,6 +1615,11 @@ int main() {
         
         // // 输出优化后的姿态
         // optimizer.OutputOptimizedPoses(output_dir + "/poses_after_optimization.txt");
+
+
+        // 输出TUM格式的轨迹文件（按时间戳排序）
+        std::cout << "\n保存TUM格式轨迹文件..." << std::endl;
+        optimizer.OutputTUMTrajectory(output_dir);
         
         // 输出优化后的姿态（两种格式）
         std::cout << "\n保存优化后姿态..." << std::endl;
@@ -1446,8 +1629,10 @@ int main() {
         optimizer.PrintOptimizationResults();
         
         std::cout << "\n输出文件说明:" << std::endl;
+        std::cout << "- trajectory_before_optimization.txt: 优化前TUM格式轨迹（按时间戳排序）" << std::endl;
+        std::cout << "- trajectory_after_optimization.txt: 优化后TUM格式轨迹（按时间戳排序）" << std::endl;
         std::cout << "- poses_tcw_*.txt: Tcw格式（世界到相机的变换）" << std::endl;
-        std::cout << "- poses_twc_*.txt: Twc格式（相机在世界坐标系中的位置，直接用于可视化）" << std::endl;
+        std::cout << "- poses_twc_*.txt: Twc格式（相机在世界坐标系中的位置）" << std::endl;
         
     } else {
         std::cout << "\n=== 优化失败 ===" << std::endl;
