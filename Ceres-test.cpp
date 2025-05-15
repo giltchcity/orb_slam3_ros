@@ -338,6 +338,73 @@ private:
 };
 
 
+// 回环边约束 - 对应g2o的EdgeSim3（用于回环边）
+class SE3LoopEdgeCost {
+public:
+    SE3LoopEdgeCost(const Eigen::Matrix4d& relative_transform, const Eigen::Matrix<double, 6, 6>& information)
+        : relative_rotation_(relative_transform.block<3, 3>(0, 0)),
+          relative_translation_(relative_transform.block<3, 1>(0, 3)),
+          sqrt_information_(information.llt().matrixL()) {
+    }
+    
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_l, T* residuals) const {
+        // pose_i: 当前关键帧, pose_l: 回环关键帧
+        // 格式: [tx, ty, tz, qx, qy, qz, qw]
+        
+        // 提取姿态
+        Eigen::Matrix<T, 3, 1> t_i(pose_i[0], pose_i[1], pose_i[2]);
+        Eigen::Matrix<T, 3, 1> t_l(pose_l[0], pose_l[1], pose_l[2]);
+        Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]);
+        Eigen::Quaternion<T> q_l(pose_l[6], pose_l[3], pose_l[4], pose_l[5]);
+        
+        // 转换为旋转矩阵
+        Eigen::Matrix<T, 3, 3> R_i = q_i.toRotationMatrix();
+        Eigen::Matrix<T, 3, 3> R_l = q_l.toRotationMatrix();
+        
+        // 计算相对变换 T_li = T_l * T_i^{-1}
+        Eigen::Matrix<T, 3, 3> R_li = R_l * R_i.transpose();
+        Eigen::Matrix<T, 3, 1> t_li = R_l * (R_i.transpose() * (-t_i)) + t_l;
+        
+        // 预期的相对变换
+        Eigen::Matrix<T, 3, 3> R_expected = relative_rotation_.cast<T>();
+        Eigen::Matrix<T, 3, 1> t_expected = relative_translation_.cast<T>();
+        
+        // 计算旋转误差
+        Eigen::Matrix<T, 3, 3> R_error_mat = R_expected.transpose() * R_li;
+        Eigen::Matrix<T, 3, 1> rotation_error = LogSO3(R_error_mat);
+        
+        // 计算平移误差
+        Eigen::Matrix<T, 3, 1> translation_error = t_li - t_expected;
+        
+        // 组合残差
+        residuals[0] = rotation_error[0];
+        residuals[1] = rotation_error[1];
+        residuals[2] = rotation_error[2];
+        residuals[3] = translation_error[0];
+        residuals[4] = translation_error[1];
+        residuals[5] = translation_error[2];
+        
+        // 应用信息矩阵
+        Eigen::Map<Eigen::Matrix<T, 6, 1>> residuals_map(residuals);
+        residuals_map = sqrt_information_.cast<T>() * residuals_map;
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Matrix4d& relative_transform,
+                                       const Eigen::Matrix<double, 6, 6>& information) {
+        return new ceres::AutoDiffCostFunction<SE3LoopEdgeCost, 6, 7, 7>(
+            new SE3LoopEdgeCost(relative_transform, information));
+    }
+    
+private:
+    const Eigen::Matrix3d relative_rotation_;
+    const Eigen::Vector3d relative_translation_;
+    const Eigen::Matrix<double, 6, 6> sqrt_information_;
+};
+
+
 // 生成树约束 - 对应g2o的EdgeSim3
 class SE3SpanningTreeCost {
 public:
@@ -528,6 +595,9 @@ struct OptimizationData {
     std::map<int, std::vector<int>> spanning_tree;
     std::map<int, std::map<int, int>> covisibility;
     std::map<int, std::vector<int>> loop_connections;
+
+    // 回环边信息
+    std::map<int, std::set<int>> loop_edges;  // KF_ID -> {Loop_KF_IDs}
     
     int loop_kf_id;
     int current_kf_id;
@@ -799,7 +869,36 @@ public:
         std::cout << "解析生成树: " << data_.spanning_tree.size() << " 个父节点" << std::endl;
         return true;
     }
-    
+
+    // 解析回环边文件
+    bool ParseLoopEdges(const std::string& filename) {
+        std::ifstream file(filename);
+        if (!file.is_open()) {
+            std::cerr << "无法打开文件: " << filename << std::endl;
+            return false;
+        }
+        
+        std::string line;
+        int loop_edge_count = 0;
+        
+        while (std::getline(file, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            
+            std::istringstream iss(line);
+            int kf_id, loop_kf_id;
+            
+            if (iss >> kf_id >> loop_kf_id) {
+                // 双向添加回环边
+                data_.loop_edges[kf_id].insert(loop_kf_id);
+                data_.loop_edges[loop_kf_id].insert(kf_id);
+                loop_edge_count++;
+            }
+        }
+        
+        std::cout << "解析回环边: " << loop_edge_count << " 条边，涉及 " << data_.loop_edges.size() << " 个关键帧" << std::endl;
+        return true;
+    }
+
     // 解析共视关系
     bool ParseCovisibility(const std::string& filename) {
         std::ifstream file(filename);
@@ -866,6 +965,7 @@ public:
         if (!ParseSpanningTree(base_path + "spanning_tree.txt")) return false;
         if (!ParseCovisibility(base_path + "covisibility.txt")) return false;
         if (!ParseLoopConnections(base_path + "loop_connections.txt")) return false;
+        if (!ParseLoopEdges(base_path + "loop_edges.txt")) return false;  // 新添加
         
         std::cout << "\n所有数据文件解析完成" << std::endl;
         return true;
@@ -1021,10 +1121,8 @@ public:
         std::cout << "共添加了 " << loop_edges_added << " 个回环约束" << std::endl;
     }
 
-
-    // 添加正常边约束（生成树 + 共视）
     void AddNormalEdgeConstraints() {
-        std::cout << "\n开始添加正常边约束（生成树 + 共视）..." << std::endl;
+        std::cout << "\n开始添加正常边约束（生成树 + 回环边 + 共视）..." << std::endl;
         
         const int minFeat = 100;
         
@@ -1035,6 +1133,7 @@ public:
         information(2, 2) = 1e3;
         
         int spanning_tree_edges = 0;
+        int loop_edges_count = 0;
         int covisibility_edges = 0;
         std::set<std::pair<int, int>> inserted_edges;
         
@@ -1087,7 +1186,46 @@ public:
                 }
             }
             
-            // 2. Covisibility graph edges - 复用T_iw
+            // 2. Loop edges - 复用T_iw (新添加的部分)
+            if (data_.loop_edges.find(nIDi) != data_.loop_edges.end()) {
+                for (int nIDl : data_.loop_edges[nIDi]) {
+                    // 只处理 ID 较小的边，避免重复
+                    if (nIDl >= nIDi) continue;
+                    
+                    // 检查回环关键帧是否存在且不是坏帧
+                    if (data_.keyframes.find(nIDl) == data_.keyframes.end() ||
+                        data_.keyframes[nIDl]->is_bad) continue;
+                    
+                    auto kf_l = data_.keyframes[nIDl];
+                    
+                    // 计算回环关键帧的变换
+                    Eigen::Matrix4d T_wl = Eigen::Matrix4d::Identity();
+                    if (data_.non_corrected_poses.find(nIDl) != data_.non_corrected_poses.end()) {
+                        const auto& non_corrected_l = data_.non_corrected_poses[nIDl];
+                        T_wl.block<3, 3>(0, 0) = non_corrected_l.quaternion.toRotationMatrix();
+                        T_wl.block<3, 1>(0, 3) = non_corrected_l.translation;
+                    } else {
+                        T_wl.block<3, 3>(0, 0) = kf_l->quaternion.toRotationMatrix();
+                        T_wl.block<3, 1>(0, 3) = kf_l->translation;
+                    }
+                    
+                    // T_li = T_wl * T_iw (对应ORB-SLAM3的 Sli = Slw * Swi)
+                    Eigen::Matrix4d T_li = T_wl * T_iw;
+                    
+                    ceres::CostFunction* cost_function = SE3LoopEdgeCost::Create(T_li, information);
+                    problem_->AddResidualBlock(cost_function, nullptr,
+                                             kf_i->se3_state.data(),
+                                             kf_l->se3_state.data());
+                    loop_edges_count++;
+                    
+                    // 调试输出
+                    if (loop_edges_count <= 5) {
+                        std::cout << "添加回环边约束: " << nIDi << " <-> " << nIDl << std::endl;
+                    }
+                }
+            }
+            
+            // 3. Covisibility graph edges - 复用T_iw
             if (data_.covisibility.find(nIDi) != data_.covisibility.end()) {
                 for (const auto& covis_pair : data_.covisibility[nIDi]) {
                     int nIDn = covis_pair.first;
@@ -1113,6 +1251,10 @@ public:
                         }
                     }
                     if (is_child) continue;
+                    
+                    // 跳过回环边（避免重复约束）
+                    if (data_.loop_edges.find(nIDi) != data_.loop_edges.end() &&
+                        data_.loop_edges[nIDi].count(nIDn) > 0) continue;
                     
                     // 确保 nIDn < nIDi
                     if (nIDn >= nIDi) continue;
@@ -1147,9 +1289,9 @@ public:
         }
         
         std::cout << "添加生成树约束: " << spanning_tree_edges << " 个" << std::endl;
+        std::cout << "添加回环边约束: " << loop_edges_count << " 个" << std::endl;
         std::cout << "添加共视约束: " << covisibility_edges << " 个" << std::endl;
     }
-
 
     // 获取参数块信息
     void PrintProblemInfo() {
@@ -1587,7 +1729,7 @@ int main() {
     optimizer.AddLoopConstraints();
     
 
-    // 添加正常边约束（生成树 + 共视）
+    // 添加正常边约束（生成树 + 回环边 + 共视）
     optimizer.AddNormalEdgeConstraints();
     
     // 打印问题信息
@@ -1596,7 +1738,7 @@ int main() {
     // 打印一些关键帧信息用于调试
     optimizer.PrintKeyFrameInfo(0);  // 初始关键帧
     
-    std::cout << "\n注意：当前版本只添加了关键帧顶点，约束部分将在后续版本中添加" << std::endl;
+    // std::cout << "\n注意：当前版本只添加了关键帧顶点，约束部分将在后续版本中添加" << std::endl;
     
     // // 输出初始姿态（用于验证）
     // optimizer.OutputOptimizedPoses(output_dir + "/initial_poses.txt");
