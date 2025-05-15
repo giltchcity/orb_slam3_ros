@@ -1158,31 +1158,31 @@ public:
         std::cout << "残差数量: " << problem_->NumResiduals() << std::endl;
     }
     
-    // 主要优化函数
-    bool OptimizeEssentialGraph() {
-        std::cout << "\n开始本质图优化..." << std::endl;
+    // // 主要优化函数
+    // bool OptimizeEssentialGraph() {
+    //     std::cout << "\n开始本质图优化..." << std::endl;
         
-        // 配置求解器选项
-        ceres::Solver::Options options;
-        options.linear_solver_type = ceres::SPARSE_SCHUR;
-        options.minimizer_progress_to_stdout = true;
-        options.max_num_iterations = 50;
-        options.num_threads = 4;
+    //     // 配置求解器选项
+    //     ceres::Solver::Options options;
+    //     options.linear_solver_type = ceres::SPARSE_SCHUR;
+    //     options.minimizer_progress_to_stdout = true;
+    //     options.max_num_iterations = 50;
+    //     options.num_threads = 4;
         
-        // 求解
-        ceres::Solver::Summary summary;
-        ceres::Solve(options, problem_.get(), &summary);
+    //     // 求解
+    //     ceres::Solver::Summary summary;
+    //     ceres::Solve(options, problem_.get(), &summary);
         
-        std::cout << "\n优化完成" << std::endl;
-        std::cout << summary.BriefReport() << std::endl;
+    //     std::cout << "\n优化完成" << std::endl;
+    //     std::cout << summary.BriefReport() << std::endl;
         
-        // 更新所有关键帧的姿态
-        for (auto& kf_pair : data_.keyframes) {
-            kf_pair.second->UpdateFromState();
-        }
+    //     // 更新所有关键帧的姿态
+    //     for (auto& kf_pair : data_.keyframes) {
+    //         kf_pair.second->UpdateFromState();
+    //     }
         
-        return summary.IsSolutionUsable();
-    }
+    //     return summary.IsSolutionUsable();
+    // }
     
     // 输出优化后的姿态
     void OutputOptimizedPoses(const std::string& output_file) {
@@ -1219,7 +1219,119 @@ public:
             std::cout << "  坏帧: " << (kf->is_bad ? "是" : "否") << std::endl;
         }
     }
+
+
+    // 打印优化结果
+    void PrintOptimizationResults() {
+        std::cout << "\n=== 优化结果分析 ===" << std::endl;
+        
+        // 打印几个关键帧的优化前后对比
+        std::vector<int> key_frames = {0, data_.loop_kf_id, data_.current_kf_id};
+        
+        for (int kf_id : key_frames) {
+            if (data_.keyframes.find(kf_id) == data_.keyframes.end()) continue;
+            
+            auto kf = data_.keyframes[kf_id];
+            
+            // 优化前的姿态（从corrected_poses或原始姿态）
+            Eigen::Vector3d pos_before;
+            Eigen::Quaterniond quat_before;
+            
+            if (data_.corrected_poses.find(kf_id) != data_.corrected_poses.end()) {
+                pos_before = data_.corrected_poses[kf_id].translation;
+                quat_before = data_.corrected_poses[kf_id].quaternion;
+            } else {
+                // 使用初始姿态
+                std::ifstream file("/Datasets/CERES_Work/input/optimization_data/keyframe_poses.txt");
+                std::string line;
+                while (std::getline(file, line)) {
+                    if (line.empty() || line[0] == '#') continue;
+                    std::istringstream iss(line);
+                    int id;
+                    double timestamp, tx, ty, tz, qx, qy, qz, qw;
+                    if (iss >> id >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw && id == kf_id) {
+                        pos_before = Eigen::Vector3d(tx, ty, tz);
+                        quat_before = Eigen::Quaterniond(qw, qx, qy, qz);
+                        break;
+                    }
+                }
+            }
+            
+            // 优化后的姿态
+            Eigen::Vector3d pos_after(kf->se3_state[0], kf->se3_state[1], kf->se3_state[2]);
+            Eigen::Quaterniond quat_after(kf->se3_state[6], kf->se3_state[3], kf->se3_state[4], kf->se3_state[5]);
+            
+            // 计算位置变化
+            double pos_change = (pos_after - pos_before).norm();
+            
+            // 计算旋转变化（角度）
+            Eigen::Quaterniond quat_diff = quat_before.inverse() * quat_after;
+            double angle_change = 2.0 * acos(std::abs(quat_diff.w())) * 180.0 / M_PI;
+            
+            std::cout << "关键帧 " << kf_id << ":" << std::endl;
+            std::cout << "  位置变化: " << pos_change << " 米" << std::endl;
+            std::cout << "  旋转变化: " << angle_change << " 度" << std::endl;
+            std::cout << "  优化前位置: [" << pos_before.transpose() << "]" << std::endl;
+            std::cout << "  优化后位置: [" << pos_after.transpose() << "]" << std::endl;
+            std::cout << std::endl;
+        }
+        
+        // 计算所有关键帧的平均位置变化
+        double total_pos_change = 0.0;
+        int count = 0;
+        
+        for (const auto& kf_pair : data_.keyframes) {
+            if (kf_pair.second->is_bad) continue;
+            
+            // 这里简化，假设没有修正姿态的帧位置变化为0
+            if (data_.corrected_poses.find(kf_pair.first) != data_.corrected_poses.end()) {
+                const auto& before = data_.corrected_poses[kf_pair.first];
+                Eigen::Vector3d after(kf_pair.second->se3_state[0], 
+                                    kf_pair.second->se3_state[1], 
+                                    kf_pair.second->se3_state[2]);
+                total_pos_change += (after - before.translation).norm();
+                count++;
+            }
+        }
+        
+        if (count > 0) {
+            std::cout << "平均位置变化: " << total_pos_change / count << " 米" << std::endl;
+        }
+        
+        std::cout << "参与优化的关键帧数: " << count << std::endl;
+    }
+
+
+    bool OptimizeEssentialGraph() {
+        std::cout << "\n开始本质图优化..." << std::endl;
+        
+        // 配置求解器选项
+        ceres::Solver::Options options;
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY; // 可以尝试不同的求解器
+        options.minimizer_progress_to_stdout = true;
+        options.max_num_iterations = 100;  // 增加迭代次数
+        options.num_threads = 4;
+        options.function_tolerance = 1e-6;
+        options.gradient_tolerance = 1e-8;
+        options.parameter_tolerance = 1e-8;
+        
+        // 求解
+        ceres::Solver::Summary summary;
+        ceres::Solve(options, problem_.get(), &summary);
+        
+        std::cout << "\n=== 优化详细报告 ===" << std::endl;
+        std::cout << summary.FullReport() << std::endl;
+        
+        // 更新所有关键帧的姿态
+        for (auto& kf_pair : data_.keyframes) {
+            kf_pair.second->UpdateFromState();
+        }
+        
+        return summary.IsSolutionUsable();
+    }
 };
+
+
 
 int main() {
     // 数据文件路径
@@ -1258,6 +1370,26 @@ int main() {
     
     // 输出初始姿态（用于验证）
     optimizer.OutputOptimizedPoses(output_dir + "/initial_poses.txt");
+
+    
+    // 执行优化！
+    std::cout << "\n=== 开始执行回环优化 ===" << std::endl;
+    
+    bool success = optimizer.OptimizeEssentialGraph();
+    
+    if (success) {
+        std::cout << "\n=== 优化成功完成 ===" << std::endl;
+        
+        // 输出优化后的姿态
+        optimizer.OutputOptimizedPoses(output_dir + "/poses_after_optimization.txt");
+        
+        // 打印一些关键帧的优化前后对比
+        optimizer.PrintOptimizationResults();
+    } else {
+        std::cout << "\n=== 优化失败 ===" << std::endl;
+        return -1;
+    }
+    
     
     return 0;
 }
