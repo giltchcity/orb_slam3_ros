@@ -999,84 +999,6 @@ public:
         std::cout << "共添加了 " << loop_edges_added << " 个回环约束" << std::endl;
     }
 
-    // // 添加生成树约束
-    // void AddSpanningTreeConstraints() {
-    //     std::cout << "\n开始添加生成树约束..." << std::endl;
-        
-    //     // 使用与回环约束相同的信息矩阵
-    //     Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
-    //     information(0, 0) = 1e3;  // x轴旋转权重
-    //     information(1, 1) = 1e3;  // y轴旋转权重  
-    //     information(2, 2) = 1e3;  // z轴旋转权重
-    //     // 平移部分使用默认权重1.0
-        
-    //     int spanning_tree_edges_added = 0;
-        
-    //     // 遍历所有关键帧
-    //     for (const auto& kf_pair : data_.keyframes) {
-    //         auto kf_i = kf_pair.second;
-    //         int nIDi = kf_i->id;
-            
-    //         // 跳过坏帧
-    //         if (kf_i->is_bad) continue;
-            
-    //         // 找到父关键帧
-    //         if (kf_i->parent_id == -1 || kf_i->parent_id == kf_i->id) continue;
-            
-    //         // 检查父关键帧是否存在且不是坏帧
-    //         if (data_.keyframes.find(kf_i->parent_id) == data_.keyframes.end() ||
-    //             data_.keyframes[kf_i->parent_id]->is_bad) {
-    //             continue;
-    //         }
-            
-    //         auto kf_j = data_.keyframes[kf_i->parent_id];
-    //         int nIDj = kf_j->id;
-            
-    //         // 获取子关键帧的世界坐标变换（使用非修正姿态）
-    //         Eigen::Matrix4d T_wi = Eigen::Matrix4d::Identity();
-    //         if (data_.non_corrected_poses.find(nIDi) != data_.non_corrected_poses.end()) {
-    //             const auto& non_corrected_i = data_.non_corrected_poses[nIDi];
-    //             T_wi.block<3, 3>(0, 0) = non_corrected_i.quaternion.toRotationMatrix();
-    //             T_wi.block<3, 1>(0, 3) = non_corrected_i.translation;
-    //         } else {
-    //             T_wi.block<3, 3>(0, 0) = kf_i->quaternion.toRotationMatrix();
-    //             T_wi.block<3, 1>(0, 3) = kf_i->translation;
-    //         }
-            
-    //         // 获取父关键帧的世界坐标变换（使用非修正姿态）
-    //         Eigen::Matrix4d T_wj = Eigen::Matrix4d::Identity();
-    //         if (data_.non_corrected_poses.find(nIDj) != data_.non_corrected_poses.end()) {
-    //             const auto& non_corrected_j = data_.non_corrected_poses[nIDj];
-    //             T_wj.block<3, 3>(0, 0) = non_corrected_j.quaternion.toRotationMatrix();
-    //             T_wj.block<3, 1>(0, 3) = non_corrected_j.translation;
-    //         } else {
-    //             T_wj.block<3, 3>(0, 0) = kf_j->quaternion.toRotationMatrix();
-    //             T_wj.block<3, 1>(0, 3) = kf_j->translation;
-    //         }
-            
-    //         // 计算相对变换 T_ji = T_wj * T_wi^{-1}
-    //         Eigen::Matrix4d T_ji = T_wj * T_wi.inverse();
-            
-    //         // 创建生成树约束
-    //         ceres::CostFunction* cost_function = SE3SpanningTreeCost::Create(T_ji, information);
-            
-    //         // 添加到优化问题 (注意顺序：子帧在前，父帧在后)
-    //         problem_->AddResidualBlock(cost_function,
-    //                                  nullptr,  // 不使用鲁棒核函数
-    //                                  kf_i->se3_state.data(),  // 子关键帧
-    //                                  kf_j->se3_state.data()); // 父关键帧
-            
-    //         spanning_tree_edges_added++;
-            
-    //         // 调试输出前几个约束
-    //         if (spanning_tree_edges_added <= 5) {
-    //             std::cout << "添加生成树约束: " << nIDi << " -> " << nIDj 
-    //                       << " (子->父)" << std::endl;
-    //         }
-    //     }
-        
-    //     std::cout << "共添加了 " << spanning_tree_edges_added << " 个生成树约束" << std::endl;
-    // }
 
     // 添加正常边约束（生成树 + 共视）
     void AddNormalEdgeConstraints() {
@@ -1302,8 +1224,6 @@ int main() {
     // 添加回环约束
     optimizer.AddLoopConstraints();
     
-    // 添加生成树约束
-    // optimizer.AddSpanningTreeConstraints();
 
     // 添加正常边约束（生成树 + 共视）
     optimizer.AddNormalEdgeConstraints();
