@@ -374,9 +374,14 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
     const double normal_weight = 100.0;     // 保持不变
     
     // 11. 添加回环闭合约束
-    std::set<std::pair<int, int>> inserted_edges;
+    // 11. 添加回环闭合约束
+    std::cout << "开始添加回环约束..." << std::endl;
+    std::set<std::pair<int, int>> sInsertedEdges;
+    int count_loop = 0;
+    int skipped_by_weight = 0;
+    int skipped_by_missing_pose = 0;
     
-    // 首先添加主回环闭合约束
+    // 首先添加主回环闭合约束 (pCurKF到pLoopKF)
     if (optimized_poses.find(current_kf_id) != optimized_poses.end() && 
         optimized_poses.find(loop_kf_id) != optimized_poses.end()) {
         
@@ -394,111 +399,133 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         );
         
         // 标记这条边已插入
-        inserted_edges.insert(std::make_pair(std::min(current_kf_id, loop_kf_id), 
+        sInsertedEdges.insert(std::make_pair(std::min(current_kf_id, loop_kf_id), 
                                             std::max(current_kf_id, loop_kf_id)));
+        count_loop++;
         
         std::cout << "添加了关键帧 " << current_kf_id 
                 << " 和关键帧 " << loop_kf_id << " 之间的回环闭合约束，权重为 " << loop_weight << std::endl;
     }
     
-    // 遍历所有回环连接
+    // 然后，按照ORB-SLAM3的方式处理其他回环连接
     for (const auto& kf_pair : loop_connections) {
         int kf1_id = kf_pair.first;
         
         // 如果这个关键帧不在我们的 optimized_poses 中，则跳过
         if (optimized_poses.find(kf1_id) == optimized_poses.end()) {
+            skipped_by_missing_pose++;
             continue;
         }
+        
+        // 获取并准备当前关键帧的位姿变换
+        Eigen::Quaterniond q1;
+        Eigen::Vector3d t1;
+        bool kf1_corrected = corrected_poses.find(kf1_id) != corrected_poses.end();
+        
+        if (kf1_corrected) {
+            q1 = getQuaternionFromPose(corrected_poses[kf1_id]);
+            t1 = getTranslationFromPose(corrected_poses[kf1_id]);
+        } else {
+            q1 = getQuaternionFromPose(keyframe_poses[kf1_id]);
+            t1 = getTranslationFromPose(keyframe_poses[kf1_id]);
+        }
+        
+        Eigen::Matrix3d R1 = q1.toRotationMatrix();
         
         const std::set<int>& connected_kfs = kf_pair.second;
         
         for (int kf2_id : connected_kfs) {
             // 如果连接的关键帧不在我们的 optimized_poses 中，则跳过
             if (optimized_poses.find(kf2_id) == optimized_poses.end()) {
+                skipped_by_missing_pose++;
                 continue;
             }
             
-            // 如果我们已经添加了这条边，则跳过
-            if (inserted_edges.count(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)))) {
-                continue;
-            }
-            
-            // 实现 ORB-SLAM3 的过滤规则：
-            // if((nIDi!=pCurKF->mnId || nIDj!=pLoopKF->mnId) && pKF->GetWeight(*sit)<minFeat)
-            //     continue;
+            // 检查是否为主回环连接，或具有足够的特征点
             bool isMainLoopEdge = (kf1_id == current_kf_id && kf2_id == loop_kf_id) || 
                                  (kf1_id == loop_kf_id && kf2_id == current_kf_id);
                                  
-            // 跳过不是主回环边且权重低的边
+            // 如果不是主回环边且权重低，则跳过 - 仿照ORB-SLAM3的逻辑
             if (!isMainLoopEdge) {
                 int covis_weight = getCovisibilityWeight(kf1_id, kf2_id);
                 if (covis_weight < minFeat) {
-                    continue; // 如果权重低于最小值，则跳过
+                    skipped_by_weight++;
+                    continue;
                 }
             }
             
-            // 首先，确定两个关键帧是否都在校正区域内
-            bool kf1_corrected = corrected_poses.find(kf1_id) != corrected_poses.end();
-            bool kf2_corrected = corrected_poses.find(kf2_id) != corrected_poses.end();
-            
-            // 设置变换约束
-            Eigen::Matrix4d T_kf1_kf2 = Eigen::Matrix4d::Identity();
-            
-            if (kf1_corrected && kf2_corrected) {
-                // 两个都在校正区域 - 使用校正后的位姿
-                Eigen::Quaterniond q1 = getQuaternionFromPose(corrected_poses[kf1_id]);
-                Eigen::Vector3d t1 = getTranslationFromPose(corrected_poses[kf1_id]);
-                
-                Eigen::Quaterniond q2 = getQuaternionFromPose(corrected_poses[kf2_id]);
-                Eigen::Vector3d t2 = getTranslationFromPose(corrected_poses[kf2_id]);
-                
-                Eigen::Matrix3d R1 = q1.toRotationMatrix();
-                Eigen::Matrix3d R2 = q2.toRotationMatrix();
-                
-                Eigen::Matrix3d R12 = R1.transpose() * R2;
-                Eigen::Vector3d t12 = R1.transpose() * (t2 - t1);
-                
-                T_kf1_kf2.block<3, 3>(0, 0) = R12;
-                T_kf1_kf2.block<3, 1>(0, 3) = t12;
-            } else {
-                // 至少有一个未校正 - 使用原始位姿
-                Eigen::Quaterniond q1 = getQuaternionFromPose(keyframe_poses[kf1_id]);
-                Eigen::Vector3d t1 = getTranslationFromPose(keyframe_poses[kf1_id]);
-                
-                Eigen::Quaterniond q2 = getQuaternionFromPose(keyframe_poses[kf2_id]);
-                Eigen::Vector3d t2 = getTranslationFromPose(keyframe_poses[kf2_id]);
-                
-                Eigen::Matrix3d R1 = q1.toRotationMatrix();
-                Eigen::Matrix3d R2 = q2.toRotationMatrix();
-                
-                Eigen::Matrix3d R12 = R1.transpose() * R2;
-                Eigen::Vector3d t12 = R1.transpose() * (t2 - t1);
-                
-                T_kf1_kf2.block<3, 3>(0, 0) = R12;
-                T_kf1_kf2.block<3, 1>(0, 3) = t12;
+            // 如果已添加过此边，则跳过
+            if (sInsertedEdges.count(std::make_pair(std::min(kf1_id, kf2_id), 
+                                                  std::max(kf1_id, kf2_id)))) {
+                continue;
             }
             
-            // 添加标准权重（100.0）的约束
+            // 获取并准备连接关键帧的位姿变换
+            Eigen::Quaterniond q2;
+            Eigen::Vector3d t2;
+            bool kf2_corrected = corrected_poses.find(kf2_id) != corrected_poses.end();
+            
+            if (kf2_corrected) {
+                q2 = getQuaternionFromPose(corrected_poses[kf2_id]);
+                t2 = getTranslationFromPose(corrected_poses[kf2_id]);
+            } else {
+                q2 = getQuaternionFromPose(keyframe_poses[kf2_id]);
+                t2 = getTranslationFromPose(keyframe_poses[kf2_id]);
+            }
+            
+            Eigen::Matrix3d R2 = q2.toRotationMatrix();
+            
+            // 计算相对位姿变换 - 这里采用SE3的形式而不是Sim3，因为尺度都为1
+            Eigen::Matrix3d R12 = R1.transpose() * R2;
+            Eigen::Vector3d t12 = R1.transpose() * (t2 - t1);
+            
+            Eigen::Matrix4d T12 = Eigen::Matrix4d::Identity();
+            T12.block<3, 3>(0, 0) = R12;
+            T12.block<3, 1>(0, 3) = t12;
+            
+            // 使用合适的权重 - 对回环连接使用较高权重
+            double edge_weight = normal_weight;
+            if (isMainLoopEdge) {
+                edge_weight = loop_weight; // 主回环边使用最高权重
+            } else {
+                // 可以根据共视点数量动态调整权重
+                int covis_weight = getCovisibilityWeight(kf1_id, kf2_id);
+                edge_weight = std::max(normal_weight, std::min(loop_weight/2.0, normal_weight * covis_weight / 100.0));
+            }
+            
+            // 创建并添加回环连接约束
             ceres::CostFunction* loop_conn_cost = 
                 new ceres::AutoDiffCostFunction<SE3RelativePoseFunctor, 6, 7, 7>(
-                    new SE3RelativePoseFunctor(T_kf1_kf2, normal_weight)
+                    new SE3RelativePoseFunctor(T12, edge_weight)
                 );
+            
+            ceres::LossFunction* loss_function = (isMainLoopEdge) ? loop_huber_loss : normal_huber_loss;
             
             problem.AddResidualBlock(
                 loop_conn_cost,
-                normal_huber_loss, // 使用鲁棒损失函数
+                loss_function,
                 optimized_poses[kf1_id],
                 optimized_poses[kf2_id]
             );
             
-            std::cout << "添加了关键帧 " << kf1_id 
-                    << " 和关键帧 " << kf2_id << " 之间的回环连接约束，权重为 " << normal_weight << std::endl;
+            // 标记此边已添加
+            sInsertedEdges.insert(std::make_pair(std::min(kf1_id, kf2_id), 
+                                                std::max(kf1_id, kf2_id)));
+            count_loop++;
             
-            // 标记这条边已插入
-            inserted_edges.insert(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)));
+            // 打印调试信息
+            std::string edge_type = isMainLoopEdge ? "主回环" : "回环连接";
+            std::cout << "添加了关键帧 " << kf1_id << " 和关键帧 " << kf2_id 
+                    << " 之间的" << edge_type << "约束，权重为 " << edge_weight << std::endl;
         }
     }
+    
+    std::cout << "成功添加了 " << count_loop << " 条回环约束" << std::endl;
+    std::cout << "因共视权重不足跳过了 " << skipped_by_weight << " 条边" << std::endl;
+    std::cout << "因关键帧缺失跳过了 " << skipped_by_missing_pose << " 条边" << std::endl;
 
+
+        
     // 12. 添加生成树约束
     for (auto& edge : spanning_tree) {
         int child_id = edge.first;
