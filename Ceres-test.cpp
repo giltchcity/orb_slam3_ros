@@ -206,8 +206,74 @@ public:
 };
 
 
+// SO(3)的对数映射：将旋转矩阵转换为轴角向量
+template<typename T>
+Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
+    // 计算旋转角度
+    T trace = R.trace();
+    T cos_angle = (trace - T(1.0)) * T(0.5);
+    
+    // 限制cos_angle在[-1, 1]范围内
+    if (cos_angle > T(1.0)) cos_angle = T(1.0);
+    if (cos_angle < T(-1.0)) cos_angle = T(-1.0);
+    
+    T angle = acos(cos_angle);
+    
+    Eigen::Matrix<T, 3, 1> omega;
+    
+    // 处理小角度情况
+    if (angle < T(1e-6)) {
+        // 对于小角度，使用一阶近似
+        T factor = T(0.5) * (T(1.0) + trace * trace / T(12.0));
+        omega << factor * (R(2, 1) - R(1, 2)),
+                 factor * (R(0, 2) - R(2, 0)),
+                 factor * (R(1, 0) - R(0, 1));
+    } else if (angle > T(M_PI - 1e-6)) {
+        // 处理接近180度的情况
+        Eigen::Matrix<T, 3, 3> A = (R + R.transpose()) * T(0.5);
+        A.diagonal().array() -= T(1.0);
+        
+        // 找到最大的对角元素
+        int max_idx = 0;
+        T max_val = ceres::abs(A(0, 0));
+        for (int i = 1; i < 3; ++i) {
+            if (ceres::abs(A(i, i)) > max_val) {
+                max_val = ceres::abs(A(i, i));
+                max_idx = i;
+            }
+        }
+        
+        // 计算轴向量
+        Eigen::Matrix<T, 3, 1> axis;
+        axis[max_idx] = sqrt(A(max_idx, max_idx));
+        for (int i = 0; i < 3; ++i) {
+            if (i != max_idx) {
+                axis[i] = A(max_idx, i) / axis[max_idx];
+            }
+        }
+        axis.normalize();
+        
+        // 确定正确的符号
+        if ((R(2, 1) - R(1, 2)) * axis[0] + 
+            (R(0, 2) - R(2, 0)) * axis[1] + 
+            (R(1, 0) - R(0, 1)) * axis[2] < T(0.0)) {
+            axis = -axis;
+        }
+        
+        omega = angle * axis;
+    } else {
+        // 一般情况
+        T sin_angle = sin(angle);
+        T factor = angle / (T(2.0) * sin_angle);
+        omega << factor * (R(2, 1) - R(1, 2)),
+                 factor * (R(0, 2) - R(2, 0)),
+                 factor * (R(1, 0) - R(0, 1));
+    }
+    
+    return omega;
+}
 
-// SE3相对姿态约束 - 对应g2o的Edge4DoF
+
 // SE3相对姿态约束 - 对应g2o的Edge4DoF
 class SE3RelativePoseCost {
 public:
@@ -219,60 +285,39 @@ public:
     
     template <typename T>
     bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
-        // pose_i, pose_j 格式: [tx, ty, tz, qx, qy, qz, qw]
+        // 提取姿态
+        Eigen::Matrix<T, 3, 1> t_i(pose_i[0], pose_i[1], pose_i[2]);
+        Eigen::Matrix<T, 3, 1> t_j(pose_j[0], pose_j[1], pose_j[2]);
+        Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]);
+        Eigen::Quaternion<T> q_j(pose_j[6], pose_j[3], pose_j[4], pose_j[5]);
         
-        // 提取姿态i
-        Eigen::Map<const Eigen::Matrix<T, 3, 1> > t_i(pose_i);
-        Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]); // [w, x, y, z]
+        // 转换为旋转矩阵
+        Eigen::Matrix<T, 3, 3> R_i = q_i.toRotationMatrix();
+        Eigen::Matrix<T, 3, 3> R_j = q_j.toRotationMatrix();
         
-        // 提取姿态j  
-        Eigen::Map<const Eigen::Matrix<T, 3, 1> > t_j(pose_j);
-        Eigen::Quaternion<T> q_j(pose_j[6], pose_j[3], pose_j[4], pose_j[5]); // [w, x, y, z]
+        // 预期的相对变换
+        Eigen::Matrix<T, 3, 3> R_ij = relative_rotation_.cast<T>();
+        Eigen::Matrix<T, 3, 1> t_ij = relative_translation_.cast<T>();
         
-        // 计算相对变换 T_ij = T_i^{-1} * T_j
-        Eigen::Quaternion<T> q_i_inv = q_i.conjugate();
-        Eigen::Matrix<T, 3, 1> t_rel = q_i_inv * (t_j - t_i);
-        Eigen::Quaternion<T> q_rel = q_i_inv * q_j;
+        // 按照ORB-SLAM3的公式计算error
+        // 旋转error: LogSO3(R_i * R_j^T * R_ij^T)
+        Eigen::Matrix<T, 3, 3> R_error_mat = R_i * R_j.transpose() * R_ij.transpose();
+        Eigen::Matrix<T, 3, 1> rotation_error = LogSO3(R_error_mat);
         
-        // 计算预期的相对变换（从relative_transform_转换为模板类型）
-        Eigen::Matrix<T, 3, 3> R_expected = relative_rotation_.cast<T>();
-        Eigen::Matrix<T, 3, 1> t_expected = relative_translation_.cast<T>();
-        Eigen::Quaternion<T> q_expected(R_expected);
+        // 平移error: R_i * (-R_j^T * t_j) + t_i - t_ij
+        Eigen::Matrix<T, 3, 1> translation_error = 
+            R_i * (-R_j.transpose() * t_j) + t_i - t_ij;
         
-        // 计算旋转误差 (使用李代数)
-        Eigen::Quaternion<T> q_error = q_expected.conjugate() * q_rel;
-        Eigen::Matrix<T, 3, 1> rotation_error;
-        
-        // 四元数到轴角的转换（简化版本）
-        T w_abs = ceres::abs(q_error.w());
-        if (w_abs >= T(1.0)) {
-            rotation_error.setZero();
-        } else {
-            T vec_norm = q_error.vec().norm();
-            if (vec_norm > T(1e-8)) {
-                T angle = T(2.0) * atan2(vec_norm, w_abs);
-                if (q_error.w() < T(0.0)) {
-                    angle = -angle;
-                }
-                rotation_error = (angle / vec_norm) * q_error.vec();
-            } else {
-                rotation_error = T(2.0) * q_error.vec();
-            }
-        }
-        
-        // 计算平移误差
-        Eigen::Matrix<T, 3, 1> translation_error = t_rel - t_expected;
-        
-        // 组合残差 [rotation_error, translation_error]
+        // 组合residuals
         residuals[0] = rotation_error[0];
-        residuals[1] = rotation_error[1]; 
+        residuals[1] = rotation_error[1];
         residuals[2] = rotation_error[2];
         residuals[3] = translation_error[0];
         residuals[4] = translation_error[1];
         residuals[5] = translation_error[2];
         
-        // 应用信息矩阵的平方根
-        Eigen::Map<Eigen::Matrix<T, 6, 1> > residuals_map(residuals);
+        // 应用信息矩阵
+        Eigen::Map<Eigen::Matrix<T, 6, 1>> residuals_map(residuals);
         residuals_map = sqrt_information_.cast<T>() * residuals_map;
         
         return true;
@@ -289,7 +334,6 @@ private:
     const Eigen::Vector3d relative_translation_;
     const Eigen::Matrix<double, 6, 6> sqrt_information_;
 };
-
 
 
 // 关键帧结构
