@@ -336,6 +336,139 @@ private:
 };
 
 
+// 生成树约束 - 对应g2o的EdgeSim3
+class SE3SpanningTreeCost {
+public:
+    SE3SpanningTreeCost(const Eigen::Matrix4d& relative_transform, const Eigen::Matrix<double, 6, 6>& information)
+        : relative_rotation_(relative_transform.block<3, 3>(0, 0)),
+          relative_translation_(relative_transform.block<3, 1>(0, 3)),
+          sqrt_information_(information.llt().matrixL()) {
+    }
+    
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
+        // pose_i: 子关键帧, pose_j: 父关键帧
+        // 格式: [tx, ty, tz, qx, qy, qz, qw]
+        
+        // 提取姿态
+        Eigen::Matrix<T, 3, 1> t_i(pose_i[0], pose_i[1], pose_i[2]);
+        Eigen::Matrix<T, 3, 1> t_j(pose_j[0], pose_j[1], pose_j[2]);
+        Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]);
+        Eigen::Quaternion<T> q_j(pose_j[6], pose_j[3], pose_j[4], pose_j[5]);
+        
+        // 转换为旋转矩阵
+        Eigen::Matrix<T, 3, 3> R_i = q_i.toRotationMatrix();
+        Eigen::Matrix<T, 3, 3> R_j = q_j.toRotationMatrix();
+        
+        // 计算相对变换 T_ji = T_j * T_i^{-1}
+        Eigen::Matrix<T, 3, 3> R_ji = R_j * R_i.transpose();
+        Eigen::Matrix<T, 3, 1> t_ji = R_j * (R_i.transpose() * (-t_i)) + t_j;
+        
+        // 预期的相对变换
+        Eigen::Matrix<T, 3, 3> R_expected = relative_rotation_.cast<T>();
+        Eigen::Matrix<T, 3, 1> t_expected = relative_translation_.cast<T>();
+        
+        // 计算旋转误差
+        Eigen::Matrix<T, 3, 3> R_error_mat = R_expected.transpose() * R_ji;
+        Eigen::Matrix<T, 3, 1> rotation_error = LogSO3(R_error_mat);
+        
+        // 计算平移误差
+        Eigen::Matrix<T, 3, 1> translation_error = t_ji - t_expected;
+        
+        // 组合残差
+        residuals[0] = rotation_error[0];
+        residuals[1] = rotation_error[1];
+        residuals[2] = rotation_error[2];
+        residuals[3] = translation_error[0];
+        residuals[4] = translation_error[1];
+        residuals[5] = translation_error[2];
+        
+        // 应用信息矩阵
+        Eigen::Map<Eigen::Matrix<T, 6, 1>> residuals_map(residuals);
+        residuals_map = sqrt_information_.cast<T>() * residuals_map;
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Matrix4d& relative_transform,
+                                       const Eigen::Matrix<double, 6, 6>& information) {
+        return new ceres::AutoDiffCostFunction<SE3SpanningTreeCost, 6, 7, 7>(
+            new SE3SpanningTreeCost(relative_transform, information));
+    }
+    
+private:
+    const Eigen::Matrix3d relative_rotation_;
+    const Eigen::Vector3d relative_translation_;
+    const Eigen::Matrix<double, 6, 6> sqrt_information_;
+};
+
+// 共视约束 - 对应g2o的EdgeSim3（用于共视关系）
+class SE3CovisibilityCost {
+public:
+    SE3CovisibilityCost(const Eigen::Matrix4d& relative_transform, const Eigen::Matrix<double, 6, 6>& information)
+        : relative_rotation_(relative_transform.block<3, 3>(0, 0)),
+          relative_translation_(relative_transform.block<3, 1>(0, 3)),
+          sqrt_information_(information.llt().matrixL()) {
+    }
+    
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_n, T* residuals) const {
+        // pose_i: 当前关键帧, pose_n: 共视关键帧
+        // 格式: [tx, ty, tz, qx, qy, qz, qw]
+        
+        // 提取姿态
+        Eigen::Matrix<T, 3, 1> t_i(pose_i[0], pose_i[1], pose_i[2]);
+        Eigen::Matrix<T, 3, 1> t_n(pose_n[0], pose_n[1], pose_n[2]);
+        Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]);
+        Eigen::Quaternion<T> q_n(pose_n[6], pose_n[3], pose_n[4], pose_n[5]);
+        
+        // 转换为旋转矩阵
+        Eigen::Matrix<T, 3, 3> R_i = q_i.toRotationMatrix();
+        Eigen::Matrix<T, 3, 3> R_n = q_n.toRotationMatrix();
+        
+        // 计算相对变换 T_ni = T_n * T_i^{-1}
+        Eigen::Matrix<T, 3, 3> R_ni = R_n * R_i.transpose();
+        Eigen::Matrix<T, 3, 1> t_ni = R_n * (R_i.transpose() * (-t_i)) + t_n;
+        
+        // 预期的相对变换
+        Eigen::Matrix<T, 3, 3> R_expected = relative_rotation_.cast<T>();
+        Eigen::Matrix<T, 3, 1> t_expected = relative_translation_.cast<T>();
+        
+        // 计算旋转误差
+        Eigen::Matrix<T, 3, 3> R_error_mat = R_expected.transpose() * R_ni;
+        Eigen::Matrix<T, 3, 1> rotation_error = LogSO3(R_error_mat);
+        
+        // 计算平移误差
+        Eigen::Matrix<T, 3, 1> translation_error = t_ni - t_expected;
+        
+        // 组合残差
+        residuals[0] = rotation_error[0];
+        residuals[1] = rotation_error[1];
+        residuals[2] = rotation_error[2];
+        residuals[3] = translation_error[0];
+        residuals[4] = translation_error[1];
+        residuals[5] = translation_error[2];
+        
+        // 应用信息矩阵
+        Eigen::Map<Eigen::Matrix<T, 6, 1>> residuals_map(residuals);
+        residuals_map = sqrt_information_.cast<T>() * residuals_map;
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Matrix4d& relative_transform,
+                                       const Eigen::Matrix<double, 6, 6>& information) {
+        return new ceres::AutoDiffCostFunction<SE3CovisibilityCost, 6, 7, 7>(
+            new SE3CovisibilityCost(relative_transform, information));
+    }
+    
+private:
+    const Eigen::Matrix3d relative_rotation_;
+    const Eigen::Vector3d relative_translation_;
+    const Eigen::Matrix<double, 6, 6> sqrt_information_;
+};
+
+
 // 关键帧结构
 struct KeyFrame {
     int id;
@@ -866,6 +999,214 @@ public:
         std::cout << "共添加了 " << loop_edges_added << " 个回环约束" << std::endl;
     }
 
+    // // 添加生成树约束
+    // void AddSpanningTreeConstraints() {
+    //     std::cout << "\n开始添加生成树约束..." << std::endl;
+        
+    //     // 使用与回环约束相同的信息矩阵
+    //     Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
+    //     information(0, 0) = 1e3;  // x轴旋转权重
+    //     information(1, 1) = 1e3;  // y轴旋转权重  
+    //     information(2, 2) = 1e3;  // z轴旋转权重
+    //     // 平移部分使用默认权重1.0
+        
+    //     int spanning_tree_edges_added = 0;
+        
+    //     // 遍历所有关键帧
+    //     for (const auto& kf_pair : data_.keyframes) {
+    //         auto kf_i = kf_pair.second;
+    //         int nIDi = kf_i->id;
+            
+    //         // 跳过坏帧
+    //         if (kf_i->is_bad) continue;
+            
+    //         // 找到父关键帧
+    //         if (kf_i->parent_id == -1 || kf_i->parent_id == kf_i->id) continue;
+            
+    //         // 检查父关键帧是否存在且不是坏帧
+    //         if (data_.keyframes.find(kf_i->parent_id) == data_.keyframes.end() ||
+    //             data_.keyframes[kf_i->parent_id]->is_bad) {
+    //             continue;
+    //         }
+            
+    //         auto kf_j = data_.keyframes[kf_i->parent_id];
+    //         int nIDj = kf_j->id;
+            
+    //         // 获取子关键帧的世界坐标变换（使用非修正姿态）
+    //         Eigen::Matrix4d T_wi = Eigen::Matrix4d::Identity();
+    //         if (data_.non_corrected_poses.find(nIDi) != data_.non_corrected_poses.end()) {
+    //             const auto& non_corrected_i = data_.non_corrected_poses[nIDi];
+    //             T_wi.block<3, 3>(0, 0) = non_corrected_i.quaternion.toRotationMatrix();
+    //             T_wi.block<3, 1>(0, 3) = non_corrected_i.translation;
+    //         } else {
+    //             T_wi.block<3, 3>(0, 0) = kf_i->quaternion.toRotationMatrix();
+    //             T_wi.block<3, 1>(0, 3) = kf_i->translation;
+    //         }
+            
+    //         // 获取父关键帧的世界坐标变换（使用非修正姿态）
+    //         Eigen::Matrix4d T_wj = Eigen::Matrix4d::Identity();
+    //         if (data_.non_corrected_poses.find(nIDj) != data_.non_corrected_poses.end()) {
+    //             const auto& non_corrected_j = data_.non_corrected_poses[nIDj];
+    //             T_wj.block<3, 3>(0, 0) = non_corrected_j.quaternion.toRotationMatrix();
+    //             T_wj.block<3, 1>(0, 3) = non_corrected_j.translation;
+    //         } else {
+    //             T_wj.block<3, 3>(0, 0) = kf_j->quaternion.toRotationMatrix();
+    //             T_wj.block<3, 1>(0, 3) = kf_j->translation;
+    //         }
+            
+    //         // 计算相对变换 T_ji = T_wj * T_wi^{-1}
+    //         Eigen::Matrix4d T_ji = T_wj * T_wi.inverse();
+            
+    //         // 创建生成树约束
+    //         ceres::CostFunction* cost_function = SE3SpanningTreeCost::Create(T_ji, information);
+            
+    //         // 添加到优化问题 (注意顺序：子帧在前，父帧在后)
+    //         problem_->AddResidualBlock(cost_function,
+    //                                  nullptr,  // 不使用鲁棒核函数
+    //                                  kf_i->se3_state.data(),  // 子关键帧
+    //                                  kf_j->se3_state.data()); // 父关键帧
+            
+    //         spanning_tree_edges_added++;
+            
+    //         // 调试输出前几个约束
+    //         if (spanning_tree_edges_added <= 5) {
+    //             std::cout << "添加生成树约束: " << nIDi << " -> " << nIDj 
+    //                       << " (子->父)" << std::endl;
+    //         }
+    //     }
+        
+    //     std::cout << "共添加了 " << spanning_tree_edges_added << " 个生成树约束" << std::endl;
+    // }
+
+    // 添加正常边约束（生成树 + 共视）
+    void AddNormalEdgeConstraints() {
+        std::cout << "\n开始添加正常边约束（生成树 + 共视）..." << std::endl;
+        
+        const int minFeat = 100;
+        
+        // 信息矩阵
+        Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
+        information(0, 0) = 1e3;
+        information(1, 1) = 1e3;
+        information(2, 2) = 1e3;
+        
+        int spanning_tree_edges = 0;
+        int covisibility_edges = 0;
+        std::set<std::pair<int, int>> inserted_edges;
+        
+        // 遍历所有关键帧 - 完全按照ORB-SLAM3的结构
+        for (const auto& kf_pair : data_.keyframes) {
+            auto kf_i = kf_pair.second;
+            int nIDi = kf_i->id;
+            
+            if (kf_i->is_bad) continue;
+            
+            // 计算Swi（世界到当前帧的变换的逆）- 对应ORB-SLAM3的逻辑
+            Eigen::Matrix4d T_wi = Eigen::Matrix4d::Identity();
+            if (data_.non_corrected_poses.find(nIDi) != data_.non_corrected_poses.end()) {
+                const auto& non_corrected_i = data_.non_corrected_poses[nIDi];
+                T_wi.block<3, 3>(0, 0) = non_corrected_i.quaternion.toRotationMatrix();
+                T_wi.block<3, 1>(0, 3) = non_corrected_i.translation;
+            } else {
+                T_wi.block<3, 3>(0, 0) = kf_i->quaternion.toRotationMatrix();
+                T_wi.block<3, 1>(0, 3) = kf_i->translation;
+            }
+            Eigen::Matrix4d T_iw = T_wi.inverse(); // 这就是Swi
+            
+            // 1. Spanning tree edge - 复用T_iw
+            if (kf_i->parent_id != -1 && kf_i->parent_id != kf_i->id) {
+                if (data_.keyframes.find(kf_i->parent_id) != data_.keyframes.end() &&
+                    !data_.keyframes[kf_i->parent_id]->is_bad) {
+                    
+                    auto kf_j = data_.keyframes[kf_i->parent_id];
+                    int nIDj = kf_j->id;
+                    
+                    // 计算父关键帧的变换
+                    Eigen::Matrix4d T_wj = Eigen::Matrix4d::Identity();
+                    if (data_.non_corrected_poses.find(nIDj) != data_.non_corrected_poses.end()) {
+                        const auto& non_corrected_j = data_.non_corrected_poses[nIDj];
+                        T_wj.block<3, 3>(0, 0) = non_corrected_j.quaternion.toRotationMatrix();
+                        T_wj.block<3, 1>(0, 3) = non_corrected_j.translation;
+                    } else {
+                        T_wj.block<3, 3>(0, 0) = kf_j->quaternion.toRotationMatrix();
+                        T_wj.block<3, 1>(0, 3) = kf_j->translation;
+                    }
+                    
+                    // T_ji = T_wj * T_iw (对应ORB-SLAM3的 Sji = Sjw * Swi)
+                    Eigen::Matrix4d T_ji = T_wj * T_iw;
+                    
+                    ceres::CostFunction* cost_function = SE3SpanningTreeCost::Create(T_ji, information);
+                    problem_->AddResidualBlock(cost_function, nullptr,
+                                             kf_i->se3_state.data(),
+                                             kf_j->se3_state.data());
+                    spanning_tree_edges++;
+                }
+            }
+            
+            // 2. Covisibility graph edges - 复用T_iw
+            if (data_.covisibility.find(nIDi) != data_.covisibility.end()) {
+                for (const auto& covis_pair : data_.covisibility[nIDi]) {
+                    int nIDn = covis_pair.first;
+                    int weight = covis_pair.second;
+                    
+                    if (weight < minFeat) continue;
+                    if (data_.keyframes.find(nIDn) == data_.keyframes.end() ||
+                        data_.keyframes[nIDn]->is_bad) continue;
+                    
+                    auto kf_n = data_.keyframes[nIDn];
+                    
+                    // 跳过父关键帧和子关键帧
+                    if (kf_i->parent_id == nIDn) continue;
+                    
+                    // 检查是否为子关键帧
+                    bool is_child = false;
+                    if (data_.spanning_tree.find(nIDi) != data_.spanning_tree.end()) {
+                        for (int child_id : data_.spanning_tree[nIDi]) {
+                            if (child_id == nIDn) {
+                                is_child = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (is_child) continue;
+                    
+                    // 确保 nIDn < nIDi
+                    if (nIDn >= nIDi) continue;
+                    
+                    // 检查是否已添加
+                    std::pair<int, int> edge_pair = std::make_pair(std::min(nIDi, nIDn), std::max(nIDi, nIDn));
+                    if (inserted_edges.count(edge_pair)) continue;
+                    
+                    // 计算共视关键帧的变换
+                    Eigen::Matrix4d T_wn = Eigen::Matrix4d::Identity();
+                    if (data_.non_corrected_poses.find(nIDn) != data_.non_corrected_poses.end()) {
+                        const auto& non_corrected_n = data_.non_corrected_poses[nIDn];
+                        T_wn.block<3, 3>(0, 0) = non_corrected_n.quaternion.toRotationMatrix();
+                        T_wn.block<3, 1>(0, 3) = non_corrected_n.translation;
+                    } else {
+                        T_wn.block<3, 3>(0, 0) = kf_n->quaternion.toRotationMatrix();
+                        T_wn.block<3, 1>(0, 3) = kf_n->translation;
+                    }
+                    
+                    // T_ni = T_wn * T_iw (对应ORB-SLAM3的 Sni = Snw * Swi)
+                    Eigen::Matrix4d T_ni = T_wn * T_iw;
+                    
+                    ceres::CostFunction* cost_function = SE3CovisibilityCost::Create(T_ni, information);
+                    problem_->AddResidualBlock(cost_function, nullptr,
+                                             kf_i->se3_state.data(),
+                                             kf_n->se3_state.data());
+                    
+                    inserted_edges.insert(edge_pair);
+                    covisibility_edges++;
+                }
+            }
+        }
+        
+        std::cout << "添加生成树约束: " << spanning_tree_edges << " 个" << std::endl;
+        std::cout << "添加共视约束: " << covisibility_edges << " 个" << std::endl;
+    }
+
+
     // 获取参数块信息
     void PrintProblemInfo() {
         std::cout << "\n优化问题信息:" << std::endl;
@@ -961,6 +1302,11 @@ int main() {
     // 添加回环约束
     optimizer.AddLoopConstraints();
     
+    // 添加生成树约束
+    // optimizer.AddSpanningTreeConstraints();
+
+    // 添加正常边约束（生成树 + 共视）
+    optimizer.AddNormalEdgeConstraints();
     
     // 打印问题信息
     optimizer.PrintProblemInfo();
