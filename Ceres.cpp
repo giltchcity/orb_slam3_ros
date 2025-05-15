@@ -538,7 +538,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         }
         
         // 如果我们已经添加了这条边，则跳过
-        if (inserted_edges.count(std::make_pair(std::min(child_id, parent_id), std::max(child_id, parent_id)))) {
+        if (sInsertedEdges.count(std::make_pair(std::min(child_id, parent_id), std::max(child_id, parent_id)))) {
             continue;
         }
         
@@ -673,7 +673,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         }
         
         // 标记这条边已插入
-        inserted_edges.insert(std::make_pair(std::min(child_id, parent_id), std::max(child_id, parent_id)));
+        sInsertedEdges.insert(std::make_pair(std::min(child_id, parent_id), std::max(child_id, parent_id)));
     }
 
     // 13. 添加共视图约束
@@ -694,7 +694,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         }
         
         // 如果我们已经添加了这条边，则跳过
-        if (inserted_edges.count(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)))) {
+        if (sInsertedEdges.count(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)))) {
             continue;
         }
         
@@ -766,7 +766,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         );
         
         // 标记这条边已插入
-        inserted_edges.insert(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)));
+        sInsertedEdges.insert(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)));
     }
 
     // 14. 配置求解器 - 改进的优化器配置
