@@ -205,6 +205,88 @@ public:
     }
 };
 
+
+
+// SE3相对姿态约束 - 对应g2o的Edge4DoF
+class SE3RelativePoseCost {
+public:
+    SE3RelativePoseCost(const Eigen::Matrix4d& relative_transform, const Eigen::Matrix<double, 6, 6>& information)
+        : relative_transform_(relative_transform), sqrt_information_(information.llt().matrixL()) {
+        // 提取相对旋转和平移
+        relative_rotation_ = relative_transform.block<3, 3>(0, 0);
+        relative_translation_ = relative_transform.block<3, 1>(0, 3);
+    }
+    
+    template <typename T>
+    bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
+        // pose_i, pose_j 格式: [tx, ty, tz, qx, qy, qz, qw]
+        
+        // 提取姿态i
+        Eigen::Map<const Eigen::Matrix<T, 3, 1> > t_i(pose_i);
+        Eigen::Map<const Eigen::Quaternion<T> > q_i(pose_i + 6, pose_i + 3);
+        
+        // 提取姿态j  
+        Eigen::Map<const Eigen::Matrix<T, 3, 1> > t_j(pose_j);
+        Eigen::Map<const Eigen::Quaternion<T> > q_j(pose_j + 6, pose_j + 3);
+        
+        // 计算相对变换 T_ij = T_i^{-1} * T_j
+        Eigen::Quaternion<T> q_i_inv = q_i.conjugate();
+        Eigen::Matrix<T, 3, 1> t_rel = q_i_inv * (t_j - t_i);
+        Eigen::Quaternion<T> q_rel = q_i_inv * q_j;
+        
+        // 计算预期的相对变换（从relative_transform_转换为模板类型）
+        Eigen::Matrix<T, 3, 3> R_expected = relative_rotation_.cast<T>();
+        Eigen::Matrix<T, 3, 1> t_expected = relative_translation_.cast<T>();
+        Eigen::Quaternion<T> q_expected(R_expected);
+        
+        // 计算旋转误差 (使用李代数)
+        Eigen::Quaternion<T> q_error = q_expected.conjugate() * q_rel;
+        Eigen::Matrix<T, 3, 1> rotation_error;
+        
+        // 四元数到轴角的转换
+        T angle = T(2.0) * atan2(q_error.vec().norm(), abs(q_error.w()));
+        if (q_error.w() < T(0.0)) {
+            angle = T(2.0) * M_PI - angle;
+        }
+        
+        if (angle > T(1e-8)) {
+            rotation_error = (angle / sin(angle * T(0.5))) * q_error.vec();
+        } else {
+            rotation_error = T(2.0) * q_error.vec();
+        }
+        
+        // 计算平移误差
+        Eigen::Matrix<T, 3, 1> translation_error = t_rel - t_expected;
+        
+        // 组合残差 [rotation_error, translation_error]
+        residuals[0] = rotation_error[0];
+        residuals[1] = rotation_error[1]; 
+        residuals[2] = rotation_error[2];
+        residuals[3] = translation_error[0];
+        residuals[4] = translation_error[1];
+        residuals[5] = translation_error[2];
+        
+        // 应用信息矩阵的平方根
+        Eigen::Map<Eigen::Matrix<T, 6, 1> > residuals_map(residuals);
+        residuals_map = sqrt_information_.cast<T>() * residuals_map;
+        
+        return true;
+    }
+    
+    static ceres::CostFunction* Create(const Eigen::Matrix4d& relative_transform,
+                                       const Eigen::Matrix<double, 6, 6>& information) {
+        return new ceres::AutoDiffCostFunction<SE3RelativePoseCost, 6, 7, 7>(
+            new SE3RelativePoseCost(relative_transform, information));
+    }
+    
+private:
+    const Eigen::Matrix4d relative_transform_;
+    const Eigen::Matrix3d relative_rotation_;
+    const Eigen::Vector3d relative_translation_;
+    const Eigen::Matrix<double, 6, 6> sqrt_information_;
+};
+
+
 // 关键帧结构
 struct KeyFrame {
     int id;
@@ -642,7 +724,99 @@ public:
         std::cout << "添加了 " << data_.keyframes.size() << " 个关键帧顶点" << std::endl;
         std::cout << "优化问题设置完成，参数块数量: " << problem_->NumParameterBlocks() << std::endl;
     }
-    
+
+
+    // 添加回环约束
+    void AddLoopConstraints() {
+        std::cout << "\n开始添加回环约束..." << std::endl;
+        
+        const int minFeat = 100; // 最小特征点数阈值
+        
+        // 设置信息矩阵 - 对应g2o代码中的matLambda
+        Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
+        information(0, 0) = 1e3;  // x轴旋转权重
+        information(1, 1) = 1e3;  // y轴旋转权重
+        information(2, 2) = 1e3;  // z轴旋转权重 (原代码中这行重复了，我改为z轴)
+        // 平移部分使用默认权重1.0
+        
+        int loop_edges_added = 0;
+        
+        // 遍历所有回环连接
+        for (const auto& connection : data_.loop_connections) {
+            int kf_i_id = connection.first;
+            const auto& connected_kfs = connection.second;
+            
+            // 检查关键帧i是否存在且不是坏帧
+            if (data_.keyframes.find(kf_i_id) == data_.keyframes.end() || 
+                data_.keyframes[kf_i_id]->is_bad) {
+                continue;
+            }
+            
+            auto kf_i = data_.keyframes[kf_i_id];
+            
+            // 获取关键帧i的修正后姿态（如果有的话）
+            Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
+            if (data_.corrected_poses.find(kf_i_id) != data_.corrected_poses.end()) {
+                const auto& corrected_kf = data_.corrected_poses[kf_i_id];
+                T_i.block<3, 3>(0, 0) = corrected_kf.quaternion.toRotationMatrix();
+                T_i.block<3, 1>(0, 3) = corrected_kf.translation;
+            } else {
+                T_i.block<3, 3>(0, 0) = kf_i->quaternion.toRotationMatrix();
+                T_i.block<3, 1>(0, 3) = kf_i->translation;
+            }
+            
+            // 遍历与关键帧i连接的所有关键帧
+            for (int kf_j_id : connected_kfs) {
+                // 检查关键帧j是否存在且不是坏帧
+                if (data_.keyframes.find(kf_j_id) == data_.keyframes.end() || 
+                    data_.keyframes[kf_j_id]->is_bad) {
+                    continue;
+                }
+                
+                auto kf_j = data_.keyframes[kf_j_id];
+                
+                // 检查权重条件（除了当前关键帧和回环关键帧的组合）
+                if (!((kf_i_id == data_.current_kf_id && kf_j_id == data_.loop_kf_id) ||
+                      (kf_j_id == data_.current_kf_id && kf_i_id == data_.loop_kf_id))) {
+                    // 这里简化处理，假设所有回环连接都有足够的权重
+                    // 实际ORB-SLAM3会检查GetWeight()，但我们的数据中没有直接的权重信息
+                }
+                
+                // 获取关键帧j的修正后姿态
+                Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
+                if (data_.corrected_poses.find(kf_j_id) != data_.corrected_poses.end()) {
+                    const auto& corrected_kf = data_.corrected_poses[kf_j_id];
+                    T_j.block<3, 3>(0, 0) = corrected_kf.quaternion.toRotationMatrix();
+                    T_j.block<3, 1>(0, 3) = corrected_kf.translation;
+                } else {
+                    T_j.block<3, 3>(0, 0) = kf_j->quaternion.toRotationMatrix();
+                    T_j.block<3, 1>(0, 3) = kf_j->translation;
+                }
+                
+                // 计算相对变换 T_ij = T_i^{-1} * T_j
+                Eigen::Matrix4d T_ij = T_i.inverse() * T_j;
+                
+                // 创建相对姿态约束
+                ceres::CostFunction* cost_function = SE3RelativePoseCost::Create(T_ij, information);
+                
+                // 添加到优化问题
+                problem_->AddResidualBlock(cost_function,
+                                         nullptr,  // 不使用鲁棒核函数
+                                         kf_i->se3_state.data(),
+                                         kf_j->se3_state.data());
+                
+                loop_edges_added++;
+                
+                // 调试输出
+                if (loop_edges_added <= 5) {
+                    std::cout << "添加回环约束: " << kf_i_id << " <-> " << kf_j_id << std::endl;
+                }
+            }
+        }
+        
+        std::cout << "共添加了 " << loop_edges_added << " 个回环约束" << std::endl;
+    }
+
     // 获取参数块信息
     void PrintProblemInfo() {
         std::cout << "\n优化问题信息:" << std::endl;
@@ -734,6 +908,10 @@ int main() {
     
     // 设置优化问题
     optimizer.SetupOptimizationProblem();
+    
+    // 添加回环约束
+    optimizer.AddLoopConstraints();
+    
     
     // 打印问题信息
     optimizer.PrintProblemInfo();
