@@ -208,13 +208,13 @@ public:
 
 
 // SE3相对姿态约束 - 对应g2o的Edge4DoF
+// SE3相对姿态约束 - 对应g2o的Edge4DoF
 class SE3RelativePoseCost {
 public:
     SE3RelativePoseCost(const Eigen::Matrix4d& relative_transform, const Eigen::Matrix<double, 6, 6>& information)
-        : relative_transform_(relative_transform), sqrt_information_(information.llt().matrixL()) {
-        // 提取相对旋转和平移
-        relative_rotation_ = relative_transform.block<3, 3>(0, 0);
-        relative_translation_ = relative_transform.block<3, 1>(0, 3);
+        : relative_rotation_(relative_transform.block<3, 3>(0, 0)),
+          relative_translation_(relative_transform.block<3, 1>(0, 3)),
+          sqrt_information_(information.llt().matrixL()) {
     }
     
     template <typename T>
@@ -223,11 +223,11 @@ public:
         
         // 提取姿态i
         Eigen::Map<const Eigen::Matrix<T, 3, 1> > t_i(pose_i);
-        Eigen::Map<const Eigen::Quaternion<T> > q_i(pose_i + 6, pose_i + 3);
+        Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]); // [w, x, y, z]
         
         // 提取姿态j  
         Eigen::Map<const Eigen::Matrix<T, 3, 1> > t_j(pose_j);
-        Eigen::Map<const Eigen::Quaternion<T> > q_j(pose_j + 6, pose_j + 3);
+        Eigen::Quaternion<T> q_j(pose_j[6], pose_j[3], pose_j[4], pose_j[5]); // [w, x, y, z]
         
         // 计算相对变换 T_ij = T_i^{-1} * T_j
         Eigen::Quaternion<T> q_i_inv = q_i.conjugate();
@@ -243,16 +243,21 @@ public:
         Eigen::Quaternion<T> q_error = q_expected.conjugate() * q_rel;
         Eigen::Matrix<T, 3, 1> rotation_error;
         
-        // 四元数到轴角的转换
-        T angle = T(2.0) * atan2(q_error.vec().norm(), abs(q_error.w()));
-        if (q_error.w() < T(0.0)) {
-            angle = T(2.0) * M_PI - angle;
-        }
-        
-        if (angle > T(1e-8)) {
-            rotation_error = (angle / sin(angle * T(0.5))) * q_error.vec();
+        // 四元数到轴角的转换（简化版本）
+        T w_abs = ceres::abs(q_error.w());
+        if (w_abs >= T(1.0)) {
+            rotation_error.setZero();
         } else {
-            rotation_error = T(2.0) * q_error.vec();
+            T vec_norm = q_error.vec().norm();
+            if (vec_norm > T(1e-8)) {
+                T angle = T(2.0) * atan2(vec_norm, w_abs);
+                if (q_error.w() < T(0.0)) {
+                    angle = -angle;
+                }
+                rotation_error = (angle / vec_norm) * q_error.vec();
+            } else {
+                rotation_error = T(2.0) * q_error.vec();
+            }
         }
         
         // 计算平移误差
@@ -280,11 +285,11 @@ public:
     }
     
 private:
-    const Eigen::Matrix4d relative_transform_;
     const Eigen::Matrix3d relative_rotation_;
     const Eigen::Vector3d relative_translation_;
     const Eigen::Matrix<double, 6, 6> sqrt_information_;
 };
+
 
 
 // 关键帧结构
