@@ -318,10 +318,10 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
     
     // 创建 SE3 流形 - 使用 Ceres 内置的 ProductManifold
     // 将四元数流形和欧几里得流形组合成 SE3
-    ceres::Manifold* se3_manifold = new ceres::ProductManifold<
-        ceres::EigenQuaternionManifold, 
-        ceres::EuclideanManifold<3>
-    >();
+// 创建 SE3 流形 - 使用单独的实例化而不是模板参数列表
+    auto* quaternion_manifold = new ceres::EigenQuaternionManifold();
+    auto* translation_manifold = new ceres::EuclideanManifold<3>();
+    ceres::Manifold* se3_manifold = new ceres::ProductManifold(quaternion_manifold, translation_manifold);
     
     // 存储优化后的位姿
     std::map<int, double*> optimized_poses;
@@ -362,6 +362,17 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         }
     }
     
+    // 创建损失函数
+    // 对于回环闭合和边界约束使用强度不同的鲁棒核函数
+    ceres::LossFunction* loop_huber_loss = new ceres::HuberLoss(1.0);
+    ceres::LossFunction* boundary_huber_loss = new ceres::HuberLoss(1.0);
+    ceres::LossFunction* normal_huber_loss = new ceres::HuberLoss(1.0);
+    
+    // 调整权重 - 降低权重的相对差异
+    const double loop_weight = 1000.0;      // 降低从10000到1000
+    const double boundary_weight = 500.0;   // 降低从1000到500
+    const double normal_weight = 100.0;     // 保持不变
+    
     // 11. 添加回环闭合约束
     std::set<std::pair<int, int>> inserted_edges;
     
@@ -372,12 +383,12 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         // 使用自动求导代价函数创建回环约束
         ceres::CostFunction* loop_cost_function = 
             new ceres::AutoDiffCostFunction<SE3RelativePoseFunctor, 6, 7, 7>(
-                new SE3RelativePoseFunctor(loop_constraint, 10000.0)
+                new SE3RelativePoseFunctor(loop_constraint, loop_weight)
             );
         
         problem.AddResidualBlock(
             loop_cost_function,
-            nullptr, // 不使用稳健损失函数
+            loop_huber_loss, // 使用鲁棒损失函数
             optimized_poses[current_kf_id],
             optimized_poses[loop_kf_id]
         );
@@ -387,7 +398,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
                                             std::max(current_kf_id, loop_kf_id)));
         
         std::cout << "添加了关键帧 " << current_kf_id 
-                << " 和关键帧 " << loop_kf_id << " 之间的回环闭合约束，权重为 10000.0" << std::endl;
+                << " 和关键帧 " << loop_kf_id << " 之间的回环闭合约束，权重为 " << loop_weight << std::endl;
     }
     
     // 遍历所有回环连接
@@ -470,18 +481,18 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
             // 添加标准权重（100.0）的约束
             ceres::CostFunction* loop_conn_cost = 
                 new ceres::AutoDiffCostFunction<SE3RelativePoseFunctor, 6, 7, 7>(
-                    new SE3RelativePoseFunctor(T_kf1_kf2, 100.0)
+                    new SE3RelativePoseFunctor(T_kf1_kf2, normal_weight)
                 );
             
             problem.AddResidualBlock(
                 loop_conn_cost,
-                nullptr, // 不使用稳健损失函数
+                normal_huber_loss, // 使用鲁棒损失函数
                 optimized_poses[kf1_id],
                 optimized_poses[kf2_id]
             );
             
             std::cout << "添加了关键帧 " << kf1_id 
-                    << " 和关键帧 " << kf2_id << " 之间的回环连接约束，权重为 100.0" << std::endl;
+                    << " 和关键帧 " << kf2_id << " 之间的回环连接约束，权重为 " << normal_weight << std::endl;
             
             // 标记这条边已插入
             inserted_edges.insert(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)));
@@ -613,7 +624,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         }
         
         // 确定权重 - 边界约束的权重更高
-        double constraint_weight = is_boundary ? 1000.0 : 100.0;
+        double constraint_weight = is_boundary ? boundary_weight : normal_weight;
         
         // 添加残差
         ceres::CostFunction* spanning_tree_cost_function = 
@@ -623,7 +634,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         
         problem.AddResidualBlock(
             spanning_tree_cost_function,
-            nullptr, // 不使用稳健损失函数
+            is_boundary ? boundary_huber_loss : normal_huber_loss, // 使用与约束类型匹配的鲁棒损失函数
             optimized_poses[parent_id],
             optimized_poses[child_id]
         );
@@ -722,7 +733,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         
         problem.AddResidualBlock(
             covisibility_cost,
-            nullptr, // 不使用稳健损失函数
+            normal_huber_loss, // 使用鲁棒损失函数
             optimized_poses[kf1_id],
             optimized_poses[kf2_id]
         );
@@ -731,11 +742,13 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
         inserted_edges.insert(std::make_pair(std::min(kf1_id, kf2_id), std::max(kf1_id, kf2_id)));
     }
 
-    // 14. 配置求解器
+    // 14. 配置求解器 - 改进的优化器配置
     ceres::Solver::Options options;
-    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+    options.linear_solver_type = ceres::SPARSE_SCHUR;
+    options.trust_region_strategy_type = ceres::LEVENBERG_MARQUARDT;
+    options.use_nonmonotonic_steps = true;
     options.minimizer_progress_to_stdout = true;
-    options.max_num_iterations = 20;
+    options.max_num_iterations = 100;  // 增加迭代次数
     options.function_tolerance = 1e-6;
     options.gradient_tolerance = 1e-10;
     options.parameter_tolerance = 1e-8;
@@ -841,6 +854,7 @@ void OptimizeEssentialGraph(const std::string& data_dir, bool bFixScale = true) 
     
     std::cout << "优化后的位姿已保存到: " << output_file << "（以 Twc 格式用于可视化）" << std::endl;
 
+
     std::cout << "位姿图优化完成！" << std::endl;
 }
 
@@ -861,168 +875,6 @@ int main(int argc, char** argv) {
     
     // 运行优化
     OptimizeEssentialGraph(data_dir, bFixScale);
-    
-    // 与地面真值比较（如果可用）
-    std::string groundtruth_file = "/Datasets/CERES_Work/Vis_Result/standard_trajectory_with_loop.txt";
-    std::string optimized_file = "/Datasets/CERES_Work/output/optimized_poses.txt";
-    
-    // 存储姿态数据的结构体
-    struct PoseData {
-        double timestamp;
-        Eigen::Vector3d position;
-        Eigen::Quaterniond rotation;
-    };
-    
-    // 读取TUM格式轨迹文件的函数
-    auto readTrajectory = [](const std::string& filename) {
-        std::vector<PoseData> trajectory;
-        std::ifstream file(filename);
-        
-        if (!file.is_open()) {
-            std::cerr << "Error: Could not open file " << filename << std::endl;
-            return trajectory;
-        }
-        
-        std::string line;
-        while (std::getline(file, line)) {
-            // 跳过注释或空行
-            if (line.empty() || line[0] == '#') {
-                continue;
-            }
-            
-            std::istringstream iss(line);
-            PoseData pose;
-            double tx, ty, tz, qx, qy, qz, qw;
-            
-            // 读取时间戳和姿态数据
-            if (!(iss >> pose.timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw)) {
-                continue; // 跳过格式错误的行
-            }
-            
-            pose.position = Eigen::Vector3d(tx, ty, tz);
-            pose.rotation = Eigen::Quaterniond(qw, qx, qy, qz); // 注意：Eigen使用w, x, y, z顺序
-            pose.rotation.normalize();
-            
-            trajectory.push_back(pose);
-        }
-        
-        std::cout << "Read " << trajectory.size() << " poses from " << filename << std::endl;
-        return trajectory;
-    };
-    
-    // 计算两个位置之间的平移误差的函数
-    auto calculateTranslationError = [](const Eigen::Vector3d& p1, const Eigen::Vector3d& p2) {
-        return (p1 - p2).norm();
-    };
-    
-    // 计算两个四元数之间的旋转误差（以度为单位）的函数
-    auto calculateRotationError = [](const Eigen::Quaterniond& q1, const Eigen::Quaterniond& q2) {
-        // 确保四元数已归一化
-        Eigen::Quaterniond q1_norm = q1.normalized();
-        Eigen::Quaterniond q2_norm = q2.normalized();
-        
-        // 计算角度距离
-        double dot_product = std::abs(q1_norm.dot(q2_norm));
-        if (dot_product > 1.0) dot_product = 1.0; // 限制值以防止数值问题
-        
-        double angle_rad = 2.0 * std::acos(dot_product);
-        double angle_deg = angle_rad * 180.0 / M_PI;
-        
-        return angle_deg;
-    };
-    
-    // 读取轨迹
-    std::vector<PoseData> optimized_traj = readTrajectory(optimized_file);
-    std::vector<PoseData> groundtruth_traj = readTrajectory(groundtruth_file);
-    
-    if (optimized_traj.empty() || groundtruth_traj.empty()) {
-        std::cerr << "Error: One or both trajectory files could not be read." << std::endl;
-        return -1;
-    }
-    
-    // 检查轨迹是否具有相同数量的姿态
-    if (optimized_traj.size() != groundtruth_traj.size()) {
-        std::cerr << "Warning: Trajectories have different numbers of poses. Using the smaller size." << std::endl;
-    }
-    
-    // 用于存储每个关联姿态的误差的向量
-    std::vector<std::pair<double, double>> errors; // (translation_error, rotation_error)
-    
-    // 直接按索引比较姿态（关键帧对关键帧）
-    size_t min_size = std::min(optimized_traj.size(), groundtruth_traj.size());
-    for (size_t i = 0; i < min_size; i++) {
-        double trans_error = calculateTranslationError(optimized_traj[i].position, groundtruth_traj[i].position);
-        double rot_error = calculateRotationError(optimized_traj[i].rotation, groundtruth_traj[i].rotation);
-        
-        errors.push_back(std::make_pair(trans_error, rot_error));
-    }
-    
-    std::cout << "\n=== Trajectory Comparison Results ===" << std::endl;
-    std::cout << "Directly compared " << errors.size() << " poses by keyframe order" << std::endl;
-    
-    // 计算每5个关键帧的平均误差
-    std::cout << "\n=== Error Analysis (Average Every 5 KFs) ===" << std::endl;
-    std::cout << std::fixed << std::setprecision(4);
-    
-    const int group_size = 5;
-    int num_groups = (errors.size() + group_size - 1) / group_size; // 向上取整的除法
-    
-    std::cout << "+-------------+------------------+------------------+" << std::endl;
-    std::cout << "| KF Group    | Translation (m)  | Rotation (deg)   |" << std::endl;
-    std::cout << "+-------------+------------------+------------------+" << std::endl;
-    
-    double total_trans_error = 0.0;
-    double total_rot_error = 0.0;
-    
-    for (int i = 0; i < num_groups; ++i) {
-        int start_idx = i * group_size;
-        int end_idx = std::min<int>(start_idx + group_size, errors.size());
-        
-        double avg_trans_error = 0.0;
-        double avg_rot_error = 0.0;
-        int count = 0;
-        
-        for (int j = start_idx; j < end_idx; ++j) {
-            avg_trans_error += errors[j].first;
-            avg_rot_error += errors[j].second;
-            count++;
-        }
-        
-        avg_trans_error /= count;
-        avg_rot_error /= count;
-        
-        total_trans_error += avg_trans_error;
-        total_rot_error += avg_rot_error;
-        
-        std::cout << "| " << std::setw(5) << start_idx << "-" << std::setw(5) << end_idx - 1 
-                  << " | " << std::setw(16) << avg_trans_error 
-                  << " | " << std::setw(16) << avg_rot_error << " |" << std::endl;
-    }
-    
-    double overall_avg_trans_error = total_trans_error / num_groups;
-    double overall_avg_rot_error = total_rot_error / num_groups;
-    
-    std::cout << "+-------------+------------------+------------------+" << std::endl;
-    std::cout << "| Overall     | " << std::setw(16) << overall_avg_trans_error 
-              << " | " << std::setw(16) << overall_avg_rot_error << " |" << std::endl;
-    std::cout << "+-------------+------------------+------------------+" << std::endl;
-    
-    // 计算RMSE
-    double rmse_trans = 0.0;
-    double rmse_rot = 0.0;
-    
-    for (const auto& error : errors) {
-        rmse_trans += error.first * error.first;
-        rmse_rot += error.second * error.second;
-    }
-    
-    rmse_trans = std::sqrt(rmse_trans / errors.size());
-    rmse_rot = std::sqrt(rmse_rot / errors.size());
-    
-    std::cout << "\n=== Overall Error Statistics ===" << std::endl;
-    std::cout << "Number of matched poses: " << errors.size() << std::endl;
-    std::cout << "RMSE Translation: " << rmse_trans << " m" << std::endl;
-    std::cout << "RMSE Rotation: " << rmse_rot << " deg" << std::endl;
     
     return 0;
 }
