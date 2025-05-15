@@ -958,10 +958,30 @@ public:
                 auto kf_j = data_.keyframes[kf_j_id];
                 
                 // 检查权重条件（除了当前关键帧和回环关键帧的组合）
+                // if (!((kf_i_id == data_.current_kf_id && kf_j_id == data_.loop_kf_id) ||
+                //       (kf_j_id == data_.current_kf_id && kf_i_id == data_.loop_kf_id))) {
+                //     // 这里简化处理，假设所有回环连接都有足够的权重
+                //     // 实际ORB-SLAM3会检查GetWeight()，但我们的数据中没有直接的权重信息
+                // }
+                
+                // 检查权重条件（除了当前关键帧和回环关键帧的组合）
                 if (!((kf_i_id == data_.current_kf_id && kf_j_id == data_.loop_kf_id) ||
                       (kf_j_id == data_.current_kf_id && kf_i_id == data_.loop_kf_id))) {
-                    // 这里简化处理，假设所有回环连接都有足够的权重
-                    // 实际ORB-SLAM3会检查GetWeight()，但我们的数据中没有直接的权重信息
+                    
+                    // 查询共视权重
+                    int weight = 0;
+                    if (data_.covisibility.find(kf_i_id) != data_.covisibility.end() &&
+                        data_.covisibility[kf_i_id].find(kf_j_id) != data_.covisibility[kf_i_id].end()) {
+                        weight = data_.covisibility[kf_i_id][kf_j_id];
+                    } else if (data_.covisibility.find(kf_j_id) != data_.covisibility.end() &&
+                               data_.covisibility[kf_j_id].find(kf_i_id) != data_.covisibility[kf_j_id].end()) {
+                        weight = data_.covisibility[kf_j_id][kf_i_id];
+                    }
+                    
+                    // 应用minFeat阈值
+                    if (weight < minFeat) {
+                        continue;
+                    }
                 }
                 
                 // 获取关键帧j的修正后姿态
