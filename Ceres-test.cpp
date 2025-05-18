@@ -209,71 +209,39 @@ public:
 
 
 // SO(3)的对数映射：将旋转矩阵转换为轴角向量
+// ORB-SLAM3 风格的 SO(3) 对数映射实现
 template<typename T>
-Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
-    // 计算旋转角度
-    T trace = R.trace();
-    T cos_angle = (trace - T(1.0)) * T(0.5);
+Eigen::Matrix<T, 3, 1> LogSO3_ORBSLAM3_Style(const Eigen::Matrix<T, 3, 3>& R) {
+    // 计算旋转矩阵的迹
+    const T tr = R(0,0) + R(1,1) + R(2,2);
     
-    // 限制cos_angle在[-1, 1]范围内
-    if (cos_angle > T(1.0)) cos_angle = T(1.0);
-    if (cos_angle < T(-1.0)) cos_angle = T(-1.0);
+    // 提取反对称矩阵的向量部分 (注意：这里已经包含了1/2的系数)
+    Eigen::Matrix<T, 3, 1> w;
+    w << (R(2,1) - R(1,2)) / T(2.0),
+         (R(0,2) - R(2,0)) / T(2.0),
+         (R(1,0) - R(0,1)) / T(2.0);
     
-    T angle = acos(cos_angle);
+    // 计算 cos(theta)
+    const T costheta = (tr - T(1.0)) * T(0.5);
     
-    Eigen::Matrix<T, 3, 1> omega;
-    
-    // 处理小角度情况
-    if (angle < T(1e-6)) {
-        // 对于小角度，使用一阶近似
-        T factor = T(0.5) * (T(1.0) + trace * trace / T(12.0));
-        omega << factor * (R(2, 1) - R(1, 2)),
-                 factor * (R(0, 2) - R(2, 0)),
-                 factor * (R(1, 0) - R(0, 1));
-    } else if (angle > T(M_PI - 1e-6)) {
-        // 处理接近180度的情况
-        Eigen::Matrix<T, 3, 3> A = (R + R.transpose()) * T(0.5);
-        A.diagonal().array() -= T(1.0);
-        
-        // 找到最大的对角元素
-        int max_idx = 0;
-        T max_val = ceres::abs(A(0, 0));
-        for (int i = 1; i < 3; ++i) {
-            if (ceres::abs(A(i, i)) > max_val) {
-                max_val = ceres::abs(A(i, i));
-                max_idx = i;
-            }
-        }
-        
-        // 计算轴向量
-        Eigen::Matrix<T, 3, 1> axis;
-        axis[max_idx] = sqrt(A(max_idx, max_idx));
-        for (int i = 0; i < 3; ++i) {
-            if (i != max_idx) {
-                axis[i] = A(max_idx, i) / axis[max_idx];
-            }
-        }
-        axis.normalize();
-        
-        // 确定正确的符号
-        if ((R(2, 1) - R(1, 2)) * axis[0] + 
-            (R(0, 2) - R(2, 0)) * axis[1] + 
-            (R(1, 0) - R(0, 1)) * axis[2] < T(0.0)) {
-            axis = -axis;
-        }
-        
-        omega = angle * axis;
-    } else {
-        // 一般情况
-        T sin_angle = sin(angle);
-        T factor = angle / (T(2.0) * sin_angle);
-        omega << factor * (R(2, 1) - R(1, 2)),
-                 factor * (R(0, 2) - R(2, 0)),
-                 factor * (R(1, 0) - R(0, 1));
+    // 边界检查：如果 costheta 越界，直接返回反对称部分
+    if (costheta > T(1.0) || costheta < T(-1.0)) {
+        return w;
     }
     
-    return omega;
+    // 计算旋转角度
+    const T theta = acos(costheta);
+    const T s = sin(theta);
+    
+    // 如果 sin(theta) 太小（接近0度或180度），返回反对称部分
+    if (ceres::abs(s) < T(1e-5)) {
+        return w;
+    } else {
+        // 一般情况：返回缩放后的反对称部分
+        return theta * w / s;
+    }
 }
+
 
 
 // SE3相对姿态约束 - 对应g2o的Edge4DoF
