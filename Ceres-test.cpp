@@ -21,63 +21,51 @@ class SE3Parameterization : public ceres::Manifold {
 public:
     ~SE3Parameterization() {}
     
+    // 6维切空间：[rho(3), phi(3)] - SE3的李代数
     // 7维环境空间：[tx, ty, tz, qx, qy, qz, qw] - SE3的四元数表示
     int AmbientSize() const override { return 7; }
-    
-    // 6维切空间：[rho(3), phi(3)] - SE3的李代数
     int TangentSize() const override { return 6; }
     
-    // SE3的指数映射 - 与ORB-SLAM3的VertexSim3Expmap::oplusImpl对齐
+    // SE3的指数映射 - 类似 ORB-SLAM3 的 oplusImpl
     bool Plus(const double* x, const double* delta, double* x_plus_delta) const override {
         // x 是当前的SE3状态: [tx, ty, tz, qx, qy, qz, qw]
         // delta 是SE3李代数增量: [rho(3), phi(3)]
         
         // 提取当前状态
         Eigen::Vector3d t_current(x[0], x[1], x[2]);
-        Eigen::Quaterniond q_current(x[6], x[3], x[4], x[5]); // 注意顺序：w, x, y, z
+        Eigen::Quaterniond q_current(x[6], x[3], x[4], x[5]);
         q_current.normalize();
         
         // SE3李代数增量
         Eigen::Vector3d rho(delta[0], delta[1], delta[2]);    // 平移部分
         Eigen::Vector3d phi(delta[3], delta[4], delta[5]);    // 旋转部分
         
-        // 旋转增量的指数映射
+        // 旋转增量的指数映射 (Rodrigues公式)
         double angle = phi.norm();
         Eigen::Matrix3d R_delta = Eigen::Matrix3d::Identity();
         Eigen::Vector3d t_delta = rho;
         
         if (angle > 1e-8) {
-            // 构建旋转
             Eigen::Vector3d axis = phi / angle;
             
-            // 构建反对称矩阵
+            // Rodrigues公式计算旋转矩阵
             Eigen::Matrix3d K = Eigen::Matrix3d::Zero();
             K << 0, -axis(2), axis(1),
                  axis(2), 0, -axis(0),
                  -axis(1), axis(0), 0;
             
-            // 使用Rodrigues公式计算旋转矩阵
             R_delta = Eigen::Matrix3d::Identity() + 
                       sin(angle) * K + 
                       (1 - cos(angle)) * K * K;
             
-            // SE3的雅可比矩阵用于平移部分 (与ORB-SLAM3计算一致)
+            // SE3的雅可比矩阵用于平移部分
             Eigen::Matrix3d V = Eigen::Matrix3d::Identity();
-            V = Eigen::Matrix3d::Identity() - 
-                (1 - cos(angle)) / angle * K + 
-                (angle - sin(angle)) / angle * K * K;
-            
+            if (angle > 1e-8) {
+                V = (sin(angle) / angle) * Eigen::Matrix3d::Identity() + 
+                    (1 - cos(angle)) / angle * K + 
+                    (angle - sin(angle)) / angle * K * K;
+            }
             t_delta = V * rho;
-        } else {
-            // 小角度情况的精确处理
-            Eigen::Matrix3d K = Eigen::Matrix3d::Zero();
-            K << 0, -phi(2), phi(1),
-                 phi(2), 0, -phi(0),
-                 -phi(1), phi(0), 0;
-                 
-            // 使用泰勒展开近似
-            R_delta = Eigen::Matrix3d::Identity() + K + 0.5 * K * K;
-            t_delta = rho; // 小角度时简化平移计算
         }
         
         // 应用SE3增量: T_new = exp([rho, phi]) * T_current
@@ -101,106 +89,86 @@ public:
         return true;
     }
     
-    // 解析雅可比计算
     bool PlusJacobian(const double* x, double* jacobian) const override {
-        // 初始化雅可比矩阵
+        // 计算Plus操作的雅可比矩阵
         Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor>> J(jacobian);
         J.setZero();
         
-        // 提取四元数
-        Eigen::Quaterniond q(x[6], x[3], x[4], x[5]); // w, x, y, z
-        q.normalize();
+        // 数值微分计算雅可比(简化实现)
+        const double eps = 1e-8;
+        double x_plus_eps[7], x_minus_eps[7];
+        double delta_plus[6], delta_minus[6];
         
-        // 旋转矩阵
-        Eigen::Matrix3d R = q.toRotationMatrix();
-        
-        // 左上角3x3块 - 旋转对平移的影响
-        J.block<3, 3>(0, 0) = R;
-        
-        // 右上角3x3块 - 旋转增量对平移的影响
-        // 这部分涉及到当前位置平移的反对称矩阵
-        Eigen::Vector3d t(x[0], x[1], x[2]);
-        Eigen::Matrix3d t_hat;
-        t_hat << 0, -t(2), t(1),
-                 t(2), 0, -t(0),
-                 -t(1), t(0), 0;
-        J.block<3, 3>(0, 3) = -R * t_hat;
-        
-        // 四元数对旋转向量的雅可比（右下角4x3块）
-        // 这符合ORB-SLAM3中四元数对李代数的导数
-        double qw = q.w(), qx = q.x(), qy = q.y(), qz = q.z();
-        
-        J(3, 3) = -0.5 * qw;  J(3, 4) =  0.5 * qz;  J(3, 5) = -0.5 * qy;
-        J(4, 3) = -0.5 * qz;  J(4, 4) = -0.5 * qw;  J(4, 5) =  0.5 * qx;
-        J(5, 3) =  0.5 * qy;  J(5, 4) = -0.5 * qx;  J(5, 5) = -0.5 * qw;
-        J(6, 3) =  0.5 * qx;  J(6, 4) =  0.5 * qy;  J(6, 5) =  0.5 * qz;
+        for (int i = 0; i < 6; ++i) {
+            // 正向扰动
+            for (int j = 0; j < 6; ++j) {
+                delta_plus[j] = (i == j) ? eps : 0.0;
+                delta_minus[j] = (i == j) ? -eps : 0.0;
+            }
+            
+            Plus(x, delta_plus, x_plus_eps);
+            Plus(x, delta_minus, x_minus_eps);
+            
+            // 数值微分
+            for (int k = 0; k < 7; ++k) {
+                J(k, i) = (x_plus_eps[k] - x_minus_eps[k]) / (2.0 * eps);
+            }
+        }
         
         return true;
     }
     
-    // 使用ORB-SLAM3风格的LogSO3实现，精确计算旋转李代数
-    Eigen::Vector3d LogSO3(const Eigen::Matrix3d &R) const {
-        const double tr = R(0,0) + R(1,1) + R(2,2);
-        Eigen::Vector3d w;
-        w << (R(2,1) - R(1,2))/2, (R(0,2) - R(2,0))/2, (R(1,0) - R(0,1))/2;
-        const double costheta = (tr - 1.0) * 0.5;
-        
-        // 检查costheta是否在有效范围
-        if (costheta > 1.0)
-            return w;
-        if (costheta < -1.0)
-            return M_PI * w / w.norm();
-            
-        const double theta = acos(costheta);
-        const double s = sin(theta);
-        
-        if (fabs(s) < 1e-5)
-            return w;
-        else
-            return theta * w / s;
-    }
-    
-    // SE3的对数映射 - 计算从x到y的SE3李代数，对应ORB-SLAM3中的计算
     bool Minus(const double* y, const double* x, double* y_minus_x) const override {
-        // 从四元数提取SE3变换
+        // SE3的对数映射 - 计算从x到y的SE3李代数
         Eigen::Vector3d t_x(x[0], x[1], x[2]);
-        Eigen::Quaterniond q_x(x[6], x[3], x[4], x[5]); // w, x, y, z
-        
         Eigen::Vector3d t_y(y[0], y[1], y[2]);
-        Eigen::Quaterniond q_y(y[6], y[3], y[4], y[5]); // w, x, y, z
+        Eigen::Quaterniond q_x(x[6], x[3], x[4], x[5]);
+        Eigen::Quaterniond q_y(y[6], y[3], y[4], y[5]);
         
         q_x.normalize();
         q_y.normalize();
         
-        // 计算相对变换: T_rel = T_x^{-1} * T_y
+        // 计算相对变换
         Eigen::Matrix3d R_x = q_x.toRotationMatrix();
         Eigen::Matrix3d R_y = q_y.toRotationMatrix();
         Eigen::Matrix3d R_rel = R_x.transpose() * R_y;
         Eigen::Vector3d t_rel = R_x.transpose() * (t_y - t_x);
         
-        // 使用LogSO3获取旋转向量
-        Eigen::Vector3d phi = LogSO3(R_rel);
+        // 旋转的对数映射
+        Eigen::Vector3d phi;
+        double trace = R_rel.trace();
+        if (trace > 3.0 - 1e-6) {
+            // 接近单位矩阵的情况
+            phi = 0.5 * Eigen::Vector3d(R_rel(2,1) - R_rel(1,2),
+                                       R_rel(0,2) - R_rel(2,0),
+                                       R_rel(1,0) - R_rel(0,1));
+        } else {
+            double angle = acos(0.5 * (trace - 1.0));
+            Eigen::Vector3d axis;
+            axis(0) = R_rel(2,1) - R_rel(1,2);
+            axis(1) = R_rel(0,2) - R_rel(2,0);
+            axis(2) = R_rel(1,0) - R_rel(0,1);
+            axis.normalize();
+            phi = angle * axis;
+        }
         
-        // 计算平移部分的李代数
+        // 平移的对数映射 (需要考虑SE3的雅可比)
         double angle = phi.norm();
         Eigen::Vector3d rho = t_rel;
-        
         if (angle > 1e-8) {
-            Eigen::Vector3d axis = phi / angle;
+            Eigen::Matrix3d V_inv = Eigen::Matrix3d::Identity();
             Eigen::Matrix3d K = Eigen::Matrix3d::Zero();
-            K << 0, -axis(2), axis(1),
-                 axis(2), 0, -axis(0),
-                 -axis(1), axis(0), 0;
-                 
-            // 计算V^{-1}，与ORB-SLAM3中的计算保持一致
-            Eigen::Matrix3d V_inv = Eigen::Matrix3d::Identity() - 
-                                    0.5 * angle * K + 
-                                    (1.0 - angle * cos(angle/2) / (2 * sin(angle/2))) * K * K;
-                                    
+            K << 0, -phi(2), phi(1),
+                 phi(2), 0, -phi(0),
+                 -phi(1), phi(0), 0;
+            K /= angle;
+            
+            V_inv = Eigen::Matrix3d::Identity() - 0.5 * K + 
+                    (2*sin(angle) - angle*(1 + cos(angle))) / 
+                    (2*angle*angle*sin(angle)) * K * K;
             rho = V_inv * t_rel;
         }
         
-        // 返回李代数向量 [rho, phi]
         y_minus_x[0] = rho(0);
         y_minus_x[1] = rho(1);
         y_minus_x[2] = rho(2);
@@ -211,9 +179,8 @@ public:
         return true;
     }
     
-    // 使用数值微分计算MinusJacobian - 当需要解析雅可比时可以替换
     bool MinusJacobian(const double* x, double* jacobian) const override {
-        // 使用数值微分计算MinusJacobian
+        // 数值微分计算MinusJacobian
         Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J(jacobian);
         J.setZero();
         
@@ -228,11 +195,9 @@ public:
                 y_minus[j] = x[j] - ((i == j) ? eps : 0.0);
             }
             
-            // 计算扰动后的差值
             Minus(y_plus, x, diff_plus);
             Minus(y_minus, x, diff_minus);
             
-            // 中心差分近似导数
             for (int k = 0; k < 6; ++k) {
                 J(k, i) = (diff_plus[k] - diff_minus[k]) / (2.0 * eps);
             }
@@ -244,39 +209,71 @@ public:
 
 
 // SO(3)的对数映射：将旋转矩阵转换为轴角向量
-// ORB-SLAM3 风格的 SO(3) 对数映射实现
 template<typename T>
 Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
-    // 计算旋转矩阵的迹
-    const T tr = R(0,0) + R(1,1) + R(2,2);
-    
-    // 提取反对称矩阵的向量部分 (注意：这里已经包含了1/2的系数)
-    Eigen::Matrix<T, 3, 1> w;
-    w << (R(2,1) - R(1,2)) / T(2.0),
-         (R(0,2) - R(2,0)) / T(2.0),
-         (R(1,0) - R(0,1)) / T(2.0);
-    
-    // 计算 cos(theta)
-    const T costheta = (tr - T(1.0)) * T(0.5);
-    
-    // 边界检查：如果 costheta 越界，直接返回反对称部分
-    if (costheta > T(1.0) || costheta < T(-1.0)) {
-        return w;
-    }
-    
     // 计算旋转角度
-    const T theta = acos(costheta);
-    const T s = sin(theta);
+    T trace = R.trace();
+    T cos_angle = (trace - T(1.0)) * T(0.5);
     
-    // 如果 sin(theta) 太小（接近0度或180度），返回反对称部分
-    if (ceres::abs(s) < T(1e-5)) {
-        return w;
+    // 限制cos_angle在[-1, 1]范围内
+    if (cos_angle > T(1.0)) cos_angle = T(1.0);
+    if (cos_angle < T(-1.0)) cos_angle = T(-1.0);
+    
+    T angle = acos(cos_angle);
+    
+    Eigen::Matrix<T, 3, 1> omega;
+    
+    // 处理小角度情况
+    if (angle < T(1e-6)) {
+        // 对于小角度，使用一阶近似
+        T factor = T(0.5) * (T(1.0) + trace * trace / T(12.0));
+        omega << factor * (R(2, 1) - R(1, 2)),
+                 factor * (R(0, 2) - R(2, 0)),
+                 factor * (R(1, 0) - R(0, 1));
+    } else if (angle > T(M_PI - 1e-6)) {
+        // 处理接近180度的情况
+        Eigen::Matrix<T, 3, 3> A = (R + R.transpose()) * T(0.5);
+        A.diagonal().array() -= T(1.0);
+        
+        // 找到最大的对角元素
+        int max_idx = 0;
+        T max_val = ceres::abs(A(0, 0));
+        for (int i = 1; i < 3; ++i) {
+            if (ceres::abs(A(i, i)) > max_val) {
+                max_val = ceres::abs(A(i, i));
+                max_idx = i;
+            }
+        }
+        
+        // 计算轴向量
+        Eigen::Matrix<T, 3, 1> axis;
+        axis[max_idx] = sqrt(A(max_idx, max_idx));
+        for (int i = 0; i < 3; ++i) {
+            if (i != max_idx) {
+                axis[i] = A(max_idx, i) / axis[max_idx];
+            }
+        }
+        axis.normalize();
+        
+        // 确定正确的符号
+        if ((R(2, 1) - R(1, 2)) * axis[0] + 
+            (R(0, 2) - R(2, 0)) * axis[1] + 
+            (R(1, 0) - R(0, 1)) * axis[2] < T(0.0)) {
+            axis = -axis;
+        }
+        
+        omega = angle * axis;
     } else {
-        // 一般情况：返回缩放后的反对称部分
-        return theta * w / s;
+        // 一般情况
+        T sin_angle = sin(angle);
+        T factor = angle / (T(2.0) * sin_angle);
+        omega << factor * (R(2, 1) - R(1, 2)),
+                 factor * (R(0, 2) - R(2, 0)),
+                 factor * (R(1, 0) - R(0, 1));
     }
+    
+    return omega;
 }
-
 
 
 // SE3相对姿态约束 - 对应g2o的Edge4DoF
