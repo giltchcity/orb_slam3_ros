@@ -246,7 +246,7 @@ public:
 // SO(3)的对数映射：将旋转矩阵转换为轴角向量
 // ORB-SLAM3 风格的 SO(3) 对数映射实现
 template<typename T>
-Eigen::Matrix<T, 3, 1> LogSO3_ORBSLAM3_Style(const Eigen::Matrix<T, 3, 3>& R) {
+Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
     // 计算旋转矩阵的迹
     const T tr = R(0,0) + R(1,1) + R(2,2);
     
