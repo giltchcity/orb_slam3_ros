@@ -1505,6 +1505,13 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
                                        const LoopClosing::KeyFrameAndPose &CorrectedSim3,
                                        const map<KeyFrame *, set<KeyFrame *> > &LoopConnections, const bool &bFixScale)
 {   
+    cout << "\n====== STARTING ESSENTIAL GRAPH OPTIMIZATION ======\n";
+    cout << "Current KF ID: " << pCurKF->mnId << ", Loop KF ID: " << pLoopKF->mnId << "\n";
+    cout << "Fixed Scale: " << (bFixScale ? "TRUE" : "FALSE") << "\n";
+    cout << "Number of Loop Connections: " << LoopConnections.size() << "\n";
+    cout << "Init KF ID: " << pMap->GetInitKFid() << "\n";
+    cout << "Max KF ID: " << pMap->GetMaxKFid() << "\n";
+
     // Setup optimizer
     g2o::SparseOptimizer optimizer;
     optimizer.setVerbose(false);
@@ -1530,8 +1537,12 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     z_vec << 0.0, 0.0, 1.0;
 
     const int minFeat = 100;
+    cout << "Min features threshold: " << minFeat << "\n";
 
     // Set KeyFrame vertices
+    cout << "\n====== SETTING UP KEYFRAME VERTICES ======\n";
+    int vertex_count = 0;
+
     for(size_t i=0, iend=vpKFs.size(); i<iend;i++)
     {
         KeyFrame* pKF = vpKFs[i];
@@ -1540,6 +1551,7 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         g2o::VertexSim3Expmap* VSim3 = new g2o::VertexSim3Expmap();
 
         const int nIDi = pKF->mnId;
+        cout << "Setting up vertex for KF " << nIDi;
 
         LoopClosing::KeyFrameAndPose::const_iterator it = CorrectedSim3.find(pKF);
 
@@ -1547,6 +1559,10 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         {
             vScw[nIDi] = it->second;
             VSim3->setEstimate(it->second);
+            cout << " (CORRECTED):\n";
+            cout << "  Translation: " << it->second.translation().transpose() << "\n";
+            cout << "  Rotation quaternion: " << it->second.rotation().coeffs().transpose() << "\n";
+            cout << "  Scale: " << it->second.scale() << "\n";
         }
         else
         {
@@ -1554,10 +1570,16 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
             g2o::Sim3 Siw(Tcw.unit_quaternion(),Tcw.translation(),1.0);
             vScw[nIDi] = Siw;
             VSim3->setEstimate(Siw);
+            cout << " (ORIGINAL):\n";
+            cout << "  Translation: " << Siw.translation().transpose() << "\n";
+            cout << "  Rotation quaternion: " << Siw.rotation().coeffs().transpose() << "\n";
+            cout << "  Scale: 1.0 (fixed)\n";
         }
 
-        if(pKF->mnId==pMap->GetInitKFid())
+        if(pKF->mnId==pMap->GetInitKFid()) {
             VSim3->setFixed(true);
+            cout << "  [FIXED VERTEX - Initial KF]\n";
+        }
 
         VSim3->setId(nIDi);
         VSim3->setMarginalized(false);
@@ -1567,14 +1589,18 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         vZvectors[nIDi]=vScw[nIDi].rotation()*z_vec; // For debugging
 
         vpVertices[nIDi]=VSim3;
+        vertex_count++;
     }
 
+    cout << "\nAdded " << vertex_count << " vertices to optimizer\n";
 
     set<pair<long unsigned int,long unsigned int> > sInsertedEdges;
 
     const Eigen::Matrix<double,7,7> matLambda = Eigen::Matrix<double,7,7>::Identity();
+    cout << "Information matrix:\n" << matLambda << "\n";
 
     // Set Loop edges
+    cout << "\n====== SETTING UP LOOP EDGES ======\n";
     int count_loop = 0;
     for(map<KeyFrame *, set<KeyFrame *> >::const_iterator mit = LoopConnections.begin(), mend=LoopConnections.end(); mit!=mend; mit++)
     {
@@ -1584,14 +1610,35 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         const g2o::Sim3 Siw = vScw[nIDi];
         const g2o::Sim3 Swi = Siw.inverse();
 
+        cout << "\nProcessing loop connections for KF " << nIDi << "\n";
+        cout << "  Siw translation: " << Siw.translation().transpose() << "\n";
+        cout << "  Siw rotation: " << Siw.rotation().coeffs().transpose() << "\n";
+        cout << "  Siw scale: " << Siw.scale() << "\n";
+        cout << "  Connections count: " << spConnections.size() << "\n";
+
         for(set<KeyFrame*>::const_iterator sit=spConnections.begin(), send=spConnections.end(); sit!=send; sit++)
         {
             const long unsigned int nIDj = (*sit)->mnId;
-            if((nIDi!=pCurKF->mnId || nIDj!=pLoopKF->mnId) && pKF->GetWeight(*sit)<minFeat)
+            cout << "  Evaluating connection KF " << nIDi << " -> KF " << nIDj << "\n";
+            cout << "    Special pair check: (Current KF=" << pCurKF->mnId << ", Loop KF=" << pLoopKF->mnId << ")\n";
+            cout << "    Weight: " << pKF->GetWeight(*sit) << ", minFeat: " << minFeat << "\n";
+            
+            // This is the critical conditional check
+            if((nIDi!=pCurKF->mnId || nIDj!=pLoopKF->mnId) && pKF->GetWeight(*sit)<minFeat) {
+                cout << "    SKIPPING: Not the special pair AND weight < minFeat\n";
                 continue;
+            }
 
             const g2o::Sim3 Sjw = vScw[nIDj];
             const g2o::Sim3 Sji = Sjw * Swi;
+
+            cout << "    Sjw translation: " << Sjw.translation().transpose() << "\n";
+            cout << "    Sjw rotation: " << Sjw.rotation().coeffs().transpose() << "\n";
+            cout << "    Sjw scale: " << Sjw.scale() << "\n";
+            cout << "    Sji = Sjw * Swi (relative transform):\n";
+            cout << "      Translation: " << Sji.translation().transpose() << "\n";
+            cout << "      Rotation: " << Sji.rotation().coeffs().transpose() << "\n";
+            cout << "      Scale: " << Sji.scale() << "\n";
 
             g2o::EdgeSim3* e = new g2o::EdgeSim3();
             e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDj)));
@@ -1601,137 +1648,43 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
             e->information() = matLambda;
 
             optimizer.addEdge(e);
+            
+            // DEBUG: Calculate and display initial edge error
+            // NOTE: This is not part of the original code but helps understand how g2o computes error
+            g2o::Sim3 Si = dynamic_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDi))->estimate();
+            g2o::Sim3 Sj = dynamic_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDj))->estimate();
+            g2o::Sim3 error_Sim3 = Sji * Si * Sj.inverse();
+            Eigen::Matrix<double,7,1> error_vector = error_Sim3.log();
+            
+            cout << "    ADDED edge from KF " << nIDi << " to KF " << nIDj << "\n";
+            cout << "    Initial edge error (log(Sji * Si * Sj^-1)):\n";
+            cout << "      Rotation part [0-2]: " << error_vector.head<3>().transpose() << "\n";
+            cout << "      Translation part [3-5]: " << error_vector.segment<3>(3).transpose() << "\n";
+            cout << "      Scale part [6]: " << error_vector(6) << "\n";
+            cout << "      Error magnitude: " << error_vector.norm() << "\n";
+            
             count_loop++;
             sInsertedEdges.insert(make_pair(min(nIDi,nIDj),max(nIDi,nIDj)));
         }
     }
 
+    cout << "\nTotal loop edges added: " << count_loop << "\n";
+    cout << "Total unique edge pairs: " << sInsertedEdges.size() << "\n";
+
     // Set normal edges
-    for(size_t i=0, iend=vpKFs.size(); i<iend; i++)
-    {
-        KeyFrame* pKF = vpKFs[i];
+    cout << "\n====== SKIPPING NORMAL EDGES IN THIS EXAMPLE ======\n";
 
-        const int nIDi = pKF->mnId;
-
-        g2o::Sim3 Swi;
-
-        LoopClosing::KeyFrameAndPose::const_iterator iti = NonCorrectedSim3.find(pKF);
-
-        if(iti!=NonCorrectedSim3.end())
-            Swi = (iti->second).inverse();
-        else
-            Swi = vScw[nIDi].inverse();
-
-        KeyFrame* pParentKF = pKF->GetParent();
-
-        // Spanning tree edge
-        if(pParentKF)
-        {
-            int nIDj = pParentKF->mnId;
-
-            g2o::Sim3 Sjw;
-
-            LoopClosing::KeyFrameAndPose::const_iterator itj = NonCorrectedSim3.find(pParentKF);
-
-            if(itj!=NonCorrectedSim3.end())
-                Sjw = itj->second;
-            else
-                Sjw = vScw[nIDj];
-
-            g2o::Sim3 Sji = Sjw * Swi;
-
-            g2o::EdgeSim3* e = new g2o::EdgeSim3();
-            e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDj)));
-            e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
-            e->setMeasurement(Sji);
-            e->information() = matLambda;
-            optimizer.addEdge(e);
-        }
-
-        // Loop edges
-        const set<KeyFrame*> sLoopEdges = pKF->GetLoopEdges();
-        for(set<KeyFrame*>::const_iterator sit=sLoopEdges.begin(), send=sLoopEdges.end(); sit!=send; sit++)
-        {
-            KeyFrame* pLKF = *sit;
-            if(pLKF->mnId<pKF->mnId)
-            {
-                g2o::Sim3 Slw;
-
-                LoopClosing::KeyFrameAndPose::const_iterator itl = NonCorrectedSim3.find(pLKF);
-
-                if(itl!=NonCorrectedSim3.end())
-                    Slw = itl->second;
-                else
-                    Slw = vScw[pLKF->mnId];
-
-                g2o::Sim3 Sli = Slw * Swi;
-                g2o::EdgeSim3* el = new g2o::EdgeSim3();
-                el->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pLKF->mnId)));
-                el->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
-                el->setMeasurement(Sli);
-                el->information() = matLambda;
-                optimizer.addEdge(el);
-            }
-        }
-
-        // Covisibility graph edges
-        const vector<KeyFrame*> vpConnectedKFs = pKF->GetCovisiblesByWeight(minFeat);
-        for(vector<KeyFrame*>::const_iterator vit=vpConnectedKFs.begin(); vit!=vpConnectedKFs.end(); vit++)
-        {
-            KeyFrame* pKFn = *vit;
-            if(pKFn && pKFn!=pParentKF && !pKF->hasChild(pKFn) /*&& !sLoopEdges.count(pKFn)*/)
-            {
-                if(!pKFn->isBad() && pKFn->mnId<pKF->mnId)
-                {
-                    if(sInsertedEdges.count(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId))))
-                        continue;
-
-                    g2o::Sim3 Snw;
-
-                    LoopClosing::KeyFrameAndPose::const_iterator itn = NonCorrectedSim3.find(pKFn);
-
-                    if(itn!=NonCorrectedSim3.end())
-                        Snw = itn->second;
-                    else
-                        Snw = vScw[pKFn->mnId];
-
-                    g2o::Sim3 Sni = Snw * Swi;
-
-                    g2o::EdgeSim3* en = new g2o::EdgeSim3();
-                    en->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFn->mnId)));
-                    en->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
-                    en->setMeasurement(Sni);
-                    en->information() = matLambda;
-                    optimizer.addEdge(en);
-                }
-            }
-        }
-
-        // Inertial edges if inertial
-        if(pKF->bImu && pKF->mPrevKF)
-        {
-            g2o::Sim3 Spw;
-            LoopClosing::KeyFrameAndPose::const_iterator itp = NonCorrectedSim3.find(pKF->mPrevKF);
-            if(itp!=NonCorrectedSim3.end())
-                Spw = itp->second;
-            else
-                Spw = vScw[pKF->mPrevKF->mnId];
-
-            g2o::Sim3 Spi = Spw * Swi;
-            g2o::EdgeSim3* ep = new g2o::EdgeSim3();
-            ep->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKF->mPrevKF->mnId)));
-            ep->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
-            ep->setMeasurement(Spi);
-            ep->information() = matLambda;
-            optimizer.addEdge(ep);
-        }
-    }
-
-
+    cout << "\n====== RUNNING OPTIMIZATION ======\n";
     optimizer.initializeOptimization();
     optimizer.computeActiveErrors();
+    cout << "Initial error: " << optimizer.activeRobustChi2() << "\n";
+    
     optimizer.optimize(20);
+    
     optimizer.computeActiveErrors();
+    cout << "Final error after optimization: " << optimizer.activeRobustChi2() << "\n";
+    
+    cout << "\n====== RECOVERING OPTIMIZED POSES ======\n";
     unique_lock<mutex> lock(pMap->mMutexMapUpdate);
 
     // SE3 Pose Recovering. Sim3:[sR t;0 1] -> SE3:[R t/s;0 1]
@@ -1740,48 +1693,241 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         KeyFrame* pKFi = vpKFs[i];
 
         const int nIDi = pKFi->mnId;
+        
+        if(pKFi->isBad())
+            continue;
 
         g2o::VertexSim3Expmap* VSim3 = static_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDi));
         g2o::Sim3 CorrectedSiw =  VSim3->estimate();
         vCorrectedSwc[nIDi]=CorrectedSiw.inverse();
         double s = CorrectedSiw.scale();
+        
+        cout << "KF " << nIDi << " optimized transform:\n";
+        cout << "  Translation: " << CorrectedSiw.translation().transpose() << "\n";
+        cout << "  Rotation: " << CorrectedSiw.rotation().coeffs().transpose() << "\n";
+        cout << "  Scale: " << s << "\n";
 
         Sophus::SE3f Tiw(CorrectedSiw.rotation().cast<float>(), CorrectedSiw.translation().cast<float>() / s);
         pKFi->SetPose(Tiw);
     }
+    
+    cout << "\n====== ESSENTIAL GRAPH OPTIMIZATION COMPLETE ======\n";
+}
 
-    // Correct points. Transform to "non-optimized" reference keyframe pose and transform back with optimized pose
-    for(size_t i=0, iend=vpMPs.size(); i<iend; i++)
+
+
+void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
+                                       const LoopClosing::KeyFrameAndPose &NonCorrectedSim3,
+                                       const LoopClosing::KeyFrameAndPose &CorrectedSim3,
+                                       const map<KeyFrame *, set<KeyFrame *> > &LoopConnections, const bool &bFixScale)
+{   
+    cout << "\n====== STARTING ESSENTIAL GRAPH OPTIMIZATION ======\n";
+    cout << "Current KF ID: " << pCurKF->mnId << ", Loop KF ID: " << pLoopKF->mnId << "\n";
+    cout << "Fixed Scale: " << (bFixScale ? "TRUE" : "FALSE") << "\n";
+    cout << "Number of Loop Connections: " << LoopConnections.size() << "\n";
+    cout << "Init KF ID: " << pMap->GetInitKFid() << "\n";
+    cout << "Max KF ID: " << pMap->GetMaxKFid() << "\n";
+
+    // Setup optimizer
+    g2o::SparseOptimizer optimizer;
+    optimizer.setVerbose(false);
+    g2o::BlockSolver_7_3::LinearSolverType * linearSolver =
+           new g2o::LinearSolverEigen<g2o::BlockSolver_7_3::PoseMatrixType>();
+    g2o::BlockSolver_7_3 * solver_ptr= new g2o::BlockSolver_7_3(linearSolver);
+    g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
+
+    solver->setUserLambdaInit(1e-16);
+    optimizer.setAlgorithm(solver);
+
+    const vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
+    const vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
+
+    const unsigned int nMaxKFid = pMap->GetMaxKFid();
+
+    vector<g2o::Sim3,Eigen::aligned_allocator<g2o::Sim3> > vScw(nMaxKFid+1);
+    vector<g2o::Sim3,Eigen::aligned_allocator<g2o::Sim3> > vCorrectedSwc(nMaxKFid+1);
+    vector<g2o::VertexSim3Expmap*> vpVertices(nMaxKFid+1);
+
+    vector<Eigen::Vector3d> vZvectors(nMaxKFid+1); // For debugging
+    Eigen::Vector3d z_vec;
+    z_vec << 0.0, 0.0, 1.0;
+
+    const int minFeat = 100;
+    cout << "Min features threshold: " << minFeat << "\n";
+
+    // Set KeyFrame vertices
+    cout << "\n====== SETTING UP KEYFRAME VERTICES ======\n";
+    int vertex_count = 0;
+
+    for(size_t i=0, iend=vpKFs.size(); i<iend;i++)
     {
-        MapPoint* pMP = vpMPs[i];
-
-        if(pMP->isBad())
+        KeyFrame* pKF = vpKFs[i];
+        if(pKF->isBad())
             continue;
+        g2o::VertexSim3Expmap* VSim3 = new g2o::VertexSim3Expmap();
 
-        int nIDr;
-        if(pMP->mnCorrectedByKF==pCurKF->mnId)
+        const int nIDi = pKF->mnId;
+        cout << "Setting up vertex for KF " << nIDi;
+
+        LoopClosing::KeyFrameAndPose::const_iterator it = CorrectedSim3.find(pKF);
+
+        if(it!=CorrectedSim3.end())
         {
-            nIDr = pMP->mnCorrectedReference;
+            vScw[nIDi] = it->second;
+            VSim3->setEstimate(it->second);
+            cout << " (CORRECTED):\n";
+            cout << "  Translation: " << it->second.translation().transpose() << "\n";
+            cout << "  Rotation quaternion: " << it->second.rotation().coeffs().transpose() << "\n";
+            cout << "  Scale: " << it->second.scale() << "\n";
         }
         else
         {
-            KeyFrame* pRefKF = pMP->GetReferenceKeyFrame();
-            nIDr = pRefKF->mnId;
+            Sophus::SE3d Tcw = pKF->GetPose().cast<double>();
+            g2o::Sim3 Siw(Tcw.unit_quaternion(),Tcw.translation(),1.0);
+            vScw[nIDi] = Siw;
+            VSim3->setEstimate(Siw);
+            cout << " (ORIGINAL):\n";
+            cout << "  Translation: " << Siw.translation().transpose() << "\n";
+            cout << "  Rotation quaternion: " << Siw.rotation().coeffs().transpose() << "\n";
+            cout << "  Scale: 1.0 (fixed)\n";
         }
 
+        if(pKF->mnId==pMap->GetInitKFid()) {
+            VSim3->setFixed(true);
+            cout << "  [FIXED VERTEX - Initial KF]\n";
+        }
 
-        g2o::Sim3 Srw = vScw[nIDr];
-        g2o::Sim3 correctedSwr = vCorrectedSwc[nIDr];
+        VSim3->setId(nIDi);
+        VSim3->setMarginalized(false);
+        VSim3->_fix_scale = bFixScale;
 
-        Eigen::Matrix<double,3,1> eigP3Dw = pMP->GetWorldPos().cast<double>();
-        Eigen::Matrix<double,3,1> eigCorrectedP3Dw = correctedSwr.map(Srw.map(eigP3Dw));
-        pMP->SetWorldPos(eigCorrectedP3Dw.cast<float>());
+        optimizer.addVertex(VSim3);
+        vZvectors[nIDi]=vScw[nIDi].rotation()*z_vec; // For debugging
 
-        pMP->UpdateNormalAndDepth();
+        vpVertices[nIDi]=VSim3;
+        vertex_count++;
     }
 
-    // TODO Check this changeindex
-    pMap->IncreaseChangeIndex();
+    cout << "\nAdded " << vertex_count << " vertices to optimizer\n";
+
+    set<pair<long unsigned int,long unsigned int> > sInsertedEdges;
+
+    const Eigen::Matrix<double,7,7> matLambda = Eigen::Matrix<double,7,7>::Identity();
+    cout << "Information matrix:\n" << matLambda << "\n";
+
+    // Set Loop edges
+    cout << "\n====== SETTING UP LOOP EDGES ======\n";
+    int count_loop = 0;
+    for(map<KeyFrame *, set<KeyFrame *> >::const_iterator mit = LoopConnections.begin(), mend=LoopConnections.end(); mit!=mend; mit++)
+    {
+        KeyFrame* pKF = mit->first;
+        const long unsigned int nIDi = pKF->mnId;
+        const set<KeyFrame*> &spConnections = mit->second;
+        const g2o::Sim3 Siw = vScw[nIDi];
+        const g2o::Sim3 Swi = Siw.inverse();
+
+        cout << "\nProcessing loop connections for KF " << nIDi << "\n";
+        cout << "  Siw translation: " << Siw.translation().transpose() << "\n";
+        cout << "  Siw rotation: " << Siw.rotation().coeffs().transpose() << "\n";
+        cout << "  Siw scale: " << Siw.scale() << "\n";
+        cout << "  Connections count: " << spConnections.size() << "\n";
+
+        for(set<KeyFrame*>::const_iterator sit=spConnections.begin(), send=spConnections.end(); sit!=send; sit++)
+        {
+            const long unsigned int nIDj = (*sit)->mnId;
+            cout << "  Evaluating connection KF " << nIDi << " -> KF " << nIDj << "\n";
+            cout << "    Special pair check: (Current KF=" << pCurKF->mnId << ", Loop KF=" << pLoopKF->mnId << ")\n";
+            cout << "    Weight: " << pKF->GetWeight(*sit) << ", minFeat: " << minFeat << "\n";
+            
+            // This is the critical conditional check
+            if((nIDi!=pCurKF->mnId || nIDj!=pLoopKF->mnId) && pKF->GetWeight(*sit)<minFeat) {
+                cout << "    SKIPPING: Not the special pair AND weight < minFeat\n";
+                continue;
+            }
+
+            const g2o::Sim3 Sjw = vScw[nIDj];
+            const g2o::Sim3 Sji = Sjw * Swi;
+
+            cout << "    Sjw translation: " << Sjw.translation().transpose() << "\n";
+            cout << "    Sjw rotation: " << Sjw.rotation().coeffs().transpose() << "\n";
+            cout << "    Sjw scale: " << Sjw.scale() << "\n";
+            cout << "    Sji = Sjw * Swi (relative transform):\n";
+            cout << "      Translation: " << Sji.translation().transpose() << "\n";
+            cout << "      Rotation: " << Sji.rotation().coeffs().transpose() << "\n";
+            cout << "      Scale: " << Sji.scale() << "\n";
+
+            g2o::EdgeSim3* e = new g2o::EdgeSim3();
+            e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDj)));
+            e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
+            e->setMeasurement(Sji);
+
+            e->information() = matLambda;
+
+            optimizer.addEdge(e);
+            
+            // DEBUG: Calculate and display initial edge error
+            // NOTE: This is not part of the original code but helps understand how g2o computes error
+            g2o::Sim3 Si = dynamic_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDi))->estimate();
+            g2o::Sim3 Sj = dynamic_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDj))->estimate();
+            g2o::Sim3 error_Sim3 = Sji * Si * Sj.inverse();
+            Eigen::Matrix<double,7,1> error_vector = error_Sim3.log();
+            
+            cout << "    ADDED edge from KF " << nIDi << " to KF " << nIDj << "\n";
+            cout << "    Initial edge error (log(Sji * Si * Sj^-1)):\n";
+            cout << "      Rotation part [0-2]: " << error_vector.head<3>().transpose() << "\n";
+            cout << "      Translation part [3-5]: " << error_vector.segment<3>(3).transpose() << "\n";
+            cout << "      Scale part [6]: " << error_vector(6) << "\n";
+            cout << "      Error magnitude: " << error_vector.norm() << "\n";
+            
+            count_loop++;
+            sInsertedEdges.insert(make_pair(min(nIDi,nIDj),max(nIDi,nIDj)));
+        }
+    }
+
+    cout << "\nTotal loop edges added: " << count_loop << "\n";
+    cout << "Total unique edge pairs: " << sInsertedEdges.size() << "\n";
+
+    // Set normal edges
+    cout << "\n====== SKIPPING NORMAL EDGES IN THIS EXAMPLE ======\n";
+
+    cout << "\n====== RUNNING OPTIMIZATION ======\n";
+    optimizer.initializeOptimization();
+    optimizer.computeActiveErrors();
+    cout << "Initial error: " << optimizer.activeRobustChi2() << "\n";
+    
+    optimizer.optimize(20);
+    
+    optimizer.computeActiveErrors();
+    cout << "Final error after optimization: " << optimizer.activeRobustChi2() << "\n";
+    
+    cout << "\n====== RECOVERING OPTIMIZED POSES ======\n";
+    unique_lock<mutex> lock(pMap->mMutexMapUpdate);
+
+    // SE3 Pose Recovering. Sim3:[sR t;0 1] -> SE3:[R t/s;0 1]
+    for(size_t i=0;i<vpKFs.size();i++)
+    {
+        KeyFrame* pKFi = vpKFs[i];
+
+        const int nIDi = pKFi->mnId;
+        
+        if(pKFi->isBad())
+            continue;
+
+        g2o::VertexSim3Expmap* VSim3 = static_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDi));
+        g2o::Sim3 CorrectedSiw =  VSim3->estimate();
+        vCorrectedSwc[nIDi]=CorrectedSiw.inverse();
+        double s = CorrectedSiw.scale();
+        
+        cout << "KF " << nIDi << " optimized transform:\n";
+        cout << "  Translation: " << CorrectedSiw.translation().transpose() << "\n";
+        cout << "  Rotation: " << CorrectedSiw.rotation().coeffs().transpose() << "\n";
+        cout << "  Scale: " << s << "\n";
+
+        Sophus::SE3f Tiw(CorrectedSiw.rotation().cast<float>(), CorrectedSiw.translation().cast<float>() / s);
+        pKFi->SetPose(Tiw);
+    }
+    
+    cout << "\n====== ESSENTIAL GRAPH OPTIMIZATION COMPLETE ======\n";
 }
 
 void Optimizer::OptimizeEssentialGraph(KeyFrame* pCurKF, vector<KeyFrame*> &vpFixedKFs, vector<KeyFrame*> &vpFixedCorrectedKFs,
