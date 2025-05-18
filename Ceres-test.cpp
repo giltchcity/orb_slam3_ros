@@ -926,8 +926,8 @@ public:
 
     void AddNormalEdgeConstraints() {
         std::cout << "\n开始添加正常边约束（生成树 + 回环边 + 共视）..." << std::endl;
+        
     }
-
     // 获取参数块信息
     void PrintProblemInfo() {
         std::cout << "\n优化问题信息:" << std::endl;
