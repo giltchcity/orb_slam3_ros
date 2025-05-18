@@ -1412,8 +1412,8 @@ public:
         }
         
         // TUM格式头部
-        file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
-        file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
+        // file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
+        // file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
         
         // 收集所有关键帧的时间戳和姿态
         struct KeyFramePose {
@@ -1466,7 +1466,7 @@ public:
         for (const auto& kf_pose : kf_poses) {
             // TUM格式：timestamp tx ty tz qx qy qz qw
             file << std::fixed << std::setprecision(9) << kf_pose.timestamp << " "
-                 << std::setprecision(6)
+                 << std::setprecision(9)
                  << kf_pose.position_wc.x() << " " 
                  << kf_pose.position_wc.y() << " " 
                  << kf_pose.position_wc.z() << " "
@@ -1489,8 +1489,8 @@ public:
         }
         
         // TUM格式头部
-        file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
-        file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
+        // file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
+        // file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
         
         // 收集所有关键帧的时间戳和姿态
         struct KeyFramePose {
@@ -1553,7 +1553,7 @@ public:
         for (const auto& kf_pose : kf_poses) {
             // TUM格式：timestamp tx ty tz qx qy qz qw
             file << std::fixed << std::setprecision(9) << kf_pose.timestamp << " "
-                 << std::setprecision(6)
+                 << std::setprecision(9)
                  << kf_pose.position_wc.x() << " " 
                  << kf_pose.position_wc.y() << " " 
                  << kf_pose.position_wc.z() << " "
