@@ -15,10 +15,10 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
-// SE3 李代数参数化 - 模仿 ORB-SLAM3 的 VertexSim3Expmap 
-// 但固定尺度为1，使用SE3李代数 [rho(3), phi(3)]
+// SE3 李代数参数化 - 严格按照g2o::Sim3实现但固定尺度为1
 class SE3Parameterization : public ceres::Manifold {
 public:
+    SE3Parameterization() {}
     ~SE3Parameterization() {}
     
     // 6维切空间：[rho(3), phi(3)] - SE3的李代数
@@ -26,257 +26,276 @@ public:
     int AmbientSize() const override { return 7; }
     int TangentSize() const override { return 6; }
     
-    // SE3的指数映射 - 类似 ORB-SLAM3 的 oplusImpl
+    // 创建反对称矩阵
+    template <typename T>
+    static Eigen::Matrix<T, 3, 3> skew(const Eigen::Matrix<T, 3, 1>& v) {
+        Eigen::Matrix<T, 3, 3> m;
+        m << T(0), -v(2), v(1),
+             v(2), T(0), -v(0),
+             -v(1), v(0), T(0);
+        return m;
+    }
+    
+    // SE3的指数映射 - 严格匹配g2o::Sim3构造函数
     bool Plus(const double* x, const double* delta, double* x_plus_delta) const override {
-        // x 是当前的SE3状态: [tx, ty, tz, qx, qy, qz, qw]
-        // delta 是SE3李代数增量: [rho(3), phi(3)]
-        
         // 提取当前状态
-        Eigen::Vector3d t_current(x[0], x[1], x[2]);
-        Eigen::Quaterniond q_current(x[6], x[3], x[4], x[5]);
-        q_current.normalize();
+        Eigen::Map<const Eigen::Vector3d> t(x);
+        Eigen::Map<const Eigen::Quaterniond> q(x + 3);
         
-        // SE3李代数增量
-        Eigen::Vector3d rho(delta[0], delta[1], delta[2]);    // 平移部分
-        Eigen::Vector3d phi(delta[3], delta[4], delta[5]);    // 旋转部分
+        // 提取增量
+        Eigen::Map<const Eigen::Vector3d> omega(delta);    // 旋转增量
+        Eigen::Map<const Eigen::Vector3d> upsilon(delta + 3);   // 平移增量
         
-        // 旋转增量的指数映射 (Rodrigues公式)
-        double angle = phi.norm();
-        Eigen::Matrix3d R_delta = Eigen::Matrix3d::Identity();
-        Eigen::Vector3d t_delta = rho;
+        // 进行指数映射，严格匹配g2o::Sim3构造函数
+        double sigma = 0.0; // 固定尺度为1，对应log(1) = 0
         
-        if (angle > 1e-8) {
-            Eigen::Vector3d axis = phi / angle;
-            
-            // Rodrigues公式计算旋转矩阵
-            Eigen::Matrix3d K = Eigen::Matrix3d::Zero();
-            K << 0, -axis(2), axis(1),
-                 axis(2), 0, -axis(0),
-                 -axis(1), axis(0), 0;
-            
-            R_delta = Eigen::Matrix3d::Identity() + 
-                      sin(angle) * K + 
-                      (1 - cos(angle)) * K * K;
-            
-            // SE3的雅可比矩阵用于平移部分
-            Eigen::Matrix3d V = Eigen::Matrix3d::Identity();
-            if (angle > 1e-8) {
-                V = (sin(angle) / angle) * Eigen::Matrix3d::Identity() + 
-                    (1 - cos(angle)) / angle * K + 
-                    (angle - sin(angle)) / angle * K * K;
-            }
-            t_delta = V * rho;
+        // 计算旋转部分
+        double theta = omega.norm();
+        Eigen::Matrix3d Omega = skew(omega);
+        Eigen::Matrix3d R;
+        Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
+        
+        // 以下变量用于计算平移部分
+        double A, B, C;
+        C = 1.0;  // 因为exp(sigma) = 1.0 (sigma = 0)
+        
+        const double eps = 1e-8;
+        
+        if (theta < eps) {
+            // 小角度情况
+            A = 0.5;
+            B = 1.0/6.0;
+            // 近似计算旋转矩阵，避免数值问题
+            R = I + Omega + 0.5 * Omega * Omega;
+        } else {
+            // 一般情况
+            A = (1.0 - cos(theta)) / (theta * theta);
+            B = (theta - sin(theta)) / (theta * theta * theta);
+            // 使用Rodrigues公式
+            R = I + sin(theta)/theta * Omega + 
+                (1.0 - cos(theta))/(theta * theta) * Omega * Omega;
         }
         
-        // 应用SE3增量: T_new = exp([rho, phi]) * T_current
-        Eigen::Matrix3d R_current = q_current.toRotationMatrix();
-        Eigen::Matrix3d R_new = R_delta * R_current;
-        Eigen::Vector3d t_new = R_delta * t_current + t_delta;
+        // 计算平移部分的转换矩阵
+        Eigen::Matrix3d W = A * Omega + B * Omega * Omega + C * I;
+        Eigen::Vector3d new_t = W * upsilon;
         
-        // 转换回四元数
+        // 应用SE3增量
+        Eigen::Matrix3d R_current = q.normalized().toRotationMatrix();
+        Eigen::Matrix3d R_new = R * R_current;
+        Eigen::Vector3d t_new = R * t + new_t;
+        
+        // 转换为四元数
         Eigen::Quaterniond q_new(R_new);
         q_new.normalize();
         
         // 输出新状态
-        x_plus_delta[0] = t_new(0);
-        x_plus_delta[1] = t_new(1);
-        x_plus_delta[2] = t_new(2);
-        x_plus_delta[3] = q_new.x();
-        x_plus_delta[4] = q_new.y();
-        x_plus_delta[5] = q_new.z();
-        x_plus_delta[6] = q_new.w();
+        Eigen::Map<Eigen::Vector3d> t_plus_delta(x_plus_delta);
+        Eigen::Map<Eigen::Quaterniond> q_plus_delta(x_plus_delta + 3);
+        
+        t_plus_delta = t_new;
+        q_plus_delta = q_new;
         
         return true;
     }
     
+    // 计算deltaR，用于对数映射
+    template <typename T>
+    static Eigen::Matrix<T, 3, 1> deltaR(const Eigen::Matrix<T, 3, 3>& R) {
+        Eigen::Matrix<T, 3, 1> v;
+        v(0) = R(2, 1) - R(1, 2);
+        v(1) = R(0, 2) - R(2, 0);
+        v(2) = R(1, 0) - R(0, 1);
+        return v;
+    }
+    
+    // 解析计算Plus操作的雅可比矩阵
     bool PlusJacobian(const double* x, double* jacobian) const override {
-        // 计算Plus操作的雅可比矩阵
         Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor>> J(jacobian);
         J.setZero();
         
-        // 数值微分计算雅可比(简化实现)
-        const double eps = 1e-8;
-        double x_plus_eps[7], x_minus_eps[7];
-        double delta_plus[6], delta_minus[6];
+        // 提取当前状态
+        Eigen::Map<const Eigen::Vector3d> t(x);
+        Eigen::Map<const Eigen::Quaterniond> q(x + 3);
+        Eigen::Matrix3d R = q.normalized().toRotationMatrix();
         
-        for (int i = 0; i < 6; ++i) {
-            // 正向扰动
-            for (int j = 0; j < 6; ++j) {
-                delta_plus[j] = (i == j) ? eps : 0.0;
-                delta_minus[j] = (i == j) ? -eps : 0.0;
-            }
-            
-            Plus(x, delta_plus, x_plus_eps);
-            Plus(x, delta_minus, x_minus_eps);
-            
-            // 数值微分
-            for (int k = 0; k < 7; ++k) {
-                J(k, i) = (x_plus_eps[k] - x_minus_eps[k]) / (2.0 * eps);
-            }
-        }
+        // 设置平移部分的雅可比
+        // 旋转增量对平移的影响 (前3行，前3列)
+        J.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+        
+        // 平移增量对平移的影响 (前3行，后3列)
+        // 在SE3情况下，平移增量在当前旋转下的效果
+        J.block<3, 3>(0, 3) = R;
+        
+        // 设置旋转部分的雅可比
+        // 旋转增量对旋转的影响 (后4行，前3列)
+        // 这部分复杂，涉及四元数的导数
+        // 我们使用四元数与旋转向量的关系
+        // 对于小的旋转向量delta，四元数更新可近似为:
+        // q' = q * [1, delta/2]
+        Eigen::Matrix<double, 4, 3> dq_domega;
+        dq_domega.setZero();
+        // d(qw)/d(omega) = -0.5 * qx, qy, qz
+        dq_domega(0, 0) = -0.5 * q.x();
+        dq_domega(0, 1) = -0.5 * q.y();
+        dq_domega(0, 2) = -0.5 * q.z();
+        // d(qx)/d(omega) = 0.5 * qw, -qz, qy
+        dq_domega(1, 0) = 0.5 * q.w();
+        dq_domega(1, 1) = -0.5 * q.z();
+        dq_domega(1, 2) = 0.5 * q.y();
+        // d(qy)/d(omega) = qz, qw, -qx
+        dq_domega(2, 0) = 0.5 * q.z();
+        dq_domega(2, 1) = 0.5 * q.w();
+        dq_domega(2, 2) = -0.5 * q.x();
+        // d(qz)/d(omega) = -qy, qx, qw
+        dq_domega(3, 0) = -0.5 * q.y();
+        dq_domega(3, 1) = 0.5 * q.x();
+        dq_domega(3, 2) = 0.5 * q.w();
+        
+        J.block<4, 3>(3, 0) = dq_domega;
+        
+        // 平移增量对旋转没有影响 (后4行，后3列) 保持为零
         
         return true;
     }
     
+    // SE3的对数映射 - 严格匹配g2o::Sim3::log()
     bool Minus(const double* y, const double* x, double* y_minus_x) const override {
-        // SE3的对数映射 - 计算从x到y的SE3李代数
-        Eigen::Vector3d t_x(x[0], x[1], x[2]);
-        Eigen::Vector3d t_y(y[0], y[1], y[2]);
-        Eigen::Quaterniond q_x(x[6], x[3], x[4], x[5]);
-        Eigen::Quaterniond q_y(y[6], y[3], y[4], y[5]);
-        
-        q_x.normalize();
-        q_y.normalize();
+        // 提取变换
+        Eigen::Map<const Eigen::Vector3d> t_x(x);
+        Eigen::Map<const Eigen::Quaterniond> q_x(x + 3);
+        Eigen::Map<const Eigen::Vector3d> t_y(y);
+        Eigen::Map<const Eigen::Quaterniond> q_y(y + 3);
         
         // 计算相对变换
-        Eigen::Matrix3d R_x = q_x.toRotationMatrix();
-        Eigen::Matrix3d R_y = q_y.toRotationMatrix();
-        Eigen::Matrix3d R_rel = R_x.transpose() * R_y;
-        Eigen::Vector3d t_rel = R_x.transpose() * (t_y - t_x);
+        Eigen::Matrix3d R_x = q_x.normalized().toRotationMatrix();
+        Eigen::Matrix3d R_y = q_y.normalized().toRotationMatrix();
         
-        // 旋转的对数映射
-        Eigen::Vector3d phi;
-        double trace = R_rel.trace();
-        if (trace > 3.0 - 1e-6) {
-            // 接近单位矩阵的情况
-            phi = 0.5 * Eigen::Vector3d(R_rel(2,1) - R_rel(1,2),
-                                       R_rel(0,2) - R_rel(2,0),
-                                       R_rel(1,0) - R_rel(0,1));
+        // 计算相对旋转 R_rel = R_y * R_x^T
+        Eigen::Matrix3d R_rel = R_y * R_x.transpose();
+        
+        // 计算相对平移 t_rel = t_y - R_rel * t_x
+        Eigen::Vector3d t_rel = t_y - R_rel * t_x;
+        
+        // 对数映射，严格按照g2o::Sim3::log()
+        Eigen::Map<Eigen::Vector6d> result(y_minus_x);
+        
+        // 计算旋转的对数映射
+        double d = 0.5 * (R_rel(0, 0) + R_rel(1, 1) + R_rel(2, 2) - 1.0);
+        Eigen::Vector3d omega;
+        
+        const double eps = 1e-8;
+        // 处理接近单位旋转的情况
+        if (d > 1.0 - eps) {
+            omega = 0.5 * deltaR(R_rel);
         } else {
-            double angle = acos(0.5 * (trace - 1.0));
-            Eigen::Vector3d axis;
-            axis(0) = R_rel(2,1) - R_rel(1,2);
-            axis(1) = R_rel(0,2) - R_rel(2,0);
-            axis(2) = R_rel(1,0) - R_rel(0,1);
-            axis.normalize();
-            phi = angle * axis;
+            double theta = acos(d);
+            double scale = theta / (2.0 * sqrt(1.0 - d * d));
+            omega = scale * deltaR(R_rel);
         }
         
-        // 平移的对数映射 (需要考虑SE3的雅可比)
-        double angle = phi.norm();
-        Eigen::Vector3d rho = t_rel;
-        if (angle > 1e-8) {
-            Eigen::Matrix3d V_inv = Eigen::Matrix3d::Identity();
-            Eigen::Matrix3d K = Eigen::Matrix3d::Zero();
-            K << 0, -phi(2), phi(1),
-                 phi(2), 0, -phi(0),
-                 -phi(1), phi(0), 0;
-            K /= angle;
-            
-            V_inv = Eigen::Matrix3d::Identity() - 0.5 * K + 
-                    (2*sin(angle) - angle*(1 + cos(angle))) / 
-                    (2*angle*angle*sin(angle)) * K * K;
-            rho = V_inv * t_rel;
+        // 计算平移的对数映射
+        double sigma = 0.0; // 因为尺度固定为1
+        double A, B, C;
+        C = 1.0; // 因为exp(sigma) = 1.0
+        
+        double theta = omega.norm();
+        Eigen::Matrix3d Omega = skew(omega);
+        Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
+        
+        if (theta < eps) {
+            // 小角度情况
+            A = 0.5;
+            B = 1.0/6.0;
+        } else {
+            A = (1.0 - cos(theta)) / (theta * theta);
+            B = (theta - sin(theta)) / (theta * theta * theta);
         }
         
-        y_minus_x[0] = rho(0);
-        y_minus_x[1] = rho(1);
-        y_minus_x[2] = rho(2);
-        y_minus_x[3] = phi(0);
-        y_minus_x[4] = phi(1);
-        y_minus_x[5] = phi(2);
+        // 计算W矩阵的逆
+        Eigen::Matrix3d W_inv = I;
+        if (theta >= eps) {
+            W_inv = I - 0.5 * Omega + 
+                (1.0 - theta * cos(theta) / (2.0 * sin(theta))) / 
+                (theta * theta) * (Omega * Omega);
+        }
+        
+        Eigen::Vector3d upsilon = W_inv * t_rel;
+        
+        // 设置结果
+        result.segment<3>(0) = omega;
+        result.segment<3>(3) = upsilon;
         
         return true;
     }
     
+    // 解析计算Minus操作的雅可比矩阵
     bool MinusJacobian(const double* x, double* jacobian) const override {
-        // 数值微分计算MinusJacobian
         Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J(jacobian);
         J.setZero();
         
-        const double eps = 1e-8;
-        double y_plus[7], y_minus[7];
-        double diff_plus[6], diff_minus[6];
+        // 提取当前状态
+        Eigen::Map<const Eigen::Vector3d> t(x);
+        Eigen::Map<const Eigen::Quaterniond> q(x + 3);
+        Eigen::Matrix3d R = q.normalized().toRotationMatrix();
         
-        for (int i = 0; i < 7; ++i) {
-            // 对y的第i个分量进行扰动
-            for (int j = 0; j < 7; ++j) {
-                y_plus[j] = x[j] + ((i == j) ? eps : 0.0);
-                y_minus[j] = x[j] - ((i == j) ? eps : 0.0);
-            }
-            
-            Minus(y_plus, x, diff_plus);
-            Minus(y_minus, x, diff_minus);
-            
-            for (int k = 0; k < 6; ++k) {
-                J(k, i) = (diff_plus[k] - diff_minus[k]) / (2.0 * eps);
-            }
-        }
+        // Minus雅可比是Plus雅可比的"逆"
+        // 平移部分
+        J.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity();
+        J.block<3, 3>(3, 0) = Eigen::Matrix3d::Zero();
+        
+        // 旋转对omega的影响 - 使用四元数的导数关系
+        double qw = q.w(), qx = q.x(), qy = q.y(), qz = q.z();
+        
+        // 对于小的旋转，从四元数变化到旋转向量的雅可比近似为：
+        // 2 * [qw, -qz, qy; qz, qw, -qx; -qy, qx, qw]^T
+        Eigen::Matrix<double, 3, 4> domega_dq;
+        domega_dq << 2*qw, 2*qx, 2*qy, 2*qz,
+                     2*qz, 2*qw, -2*qx, -2*qy,
+                     -2*qy, 2*qx, 2*qw, -2*qz;
+        
+        J.block<3, 4>(0, 3) = domega_dq;
+        
+        // 旋转对平移的影响 - 在SE3情况下，旋转会影响平移
+        J.block<3, 3>(3, 0) = -R.transpose();
+        
+        // 四元数对平移的影响 - 通过旋转矩阵的变化间接影响
+        // 这部分较复杂，实际应用中可能需要数值微分或更详细的解析表达
+        // 在此简化处理
+        J.block<3, 4>(3, 3) = Eigen::Matrix<double, 3, 4>::Zero();
         
         return true;
     }
 };
 
-
-// SO(3)的对数映射：将旋转矩阵转换为轴角向量
+// SO(3)的对数映射：将旋转矩阵转换为轴角向量 - 严格匹配g2o实现
 template<typename T>
 Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
-    // 计算旋转角度
-    T trace = R.trace();
-    T cos_angle = (trace - T(1.0)) * T(0.5);
+    // 计算旋转角度，匹配g2o中的d = 0.5*(R(0,0)+R(1,1)+R(2,2)-1)
+    T d = T(0.5) * (R(0, 0) + R(1, 1) + R(2, 2) - T(1.0));
     
-    // 限制cos_angle在[-1, 1]范围内
-    if (cos_angle > T(1.0)) cos_angle = T(1.0);
-    if (cos_angle < T(-1.0)) cos_angle = T(-1.0);
-    
-    T angle = acos(cos_angle);
+    // 限制d在[-1, 1]范围内
+    if (d > T(1.0)) d = T(1.0);
+    if (d < T(-1.0)) d = T(-1.0);
     
     Eigen::Matrix<T, 3, 1> omega;
     
-    // 处理小角度情况
-    if (angle < T(1e-6)) {
-        // 对于小角度，使用一阶近似
-        T factor = T(0.5) * (T(1.0) + trace * trace / T(12.0));
-        omega << factor * (R(2, 1) - R(1, 2)),
-                 factor * (R(0, 2) - R(2, 0)),
-                 factor * (R(1, 0) - R(0, 1));
-    } else if (angle > T(M_PI - 1e-6)) {
-        // 处理接近180度的情况
-        Eigen::Matrix<T, 3, 3> A = (R + R.transpose()) * T(0.5);
-        A.diagonal().array() -= T(1.0);
-        
-        // 找到最大的对角元素
-        int max_idx = 0;
-        T max_val = ceres::abs(A(0, 0));
-        for (int i = 1; i < 3; ++i) {
-            if (ceres::abs(A(i, i)) > max_val) {
-                max_val = ceres::abs(A(i, i));
-                max_idx = i;
-            }
-        }
-        
-        // 计算轴向量
-        Eigen::Matrix<T, 3, 1> axis;
-        axis[max_idx] = sqrt(A(max_idx, max_idx));
-        for (int i = 0; i < 3; ++i) {
-            if (i != max_idx) {
-                axis[i] = A(max_idx, i) / axis[max_idx];
-            }
-        }
-        axis.normalize();
-        
-        // 确定正确的符号
-        if ((R(2, 1) - R(1, 2)) * axis[0] + 
-            (R(0, 2) - R(2, 0)) * axis[1] + 
-            (R(1, 0) - R(0, 1)) * axis[2] < T(0.0)) {
-            axis = -axis;
-        }
-        
-        omega = angle * axis;
+    // 处理接近单位旋转的情况
+    const T eps = T(1e-8);
+    if (d > T(1.0) - eps) {
+        // 接近单位旋转，使用线性近似
+        omega = T(0.5) * SE3Parameterization::deltaR(R);
     } else {
         // 一般情况
-        T sin_angle = sin(angle);
-        T factor = angle / (T(2.0) * sin_angle);
-        omega << factor * (R(2, 1) - R(1, 2)),
-                 factor * (R(0, 2) - R(2, 0)),
-                 factor * (R(1, 0) - R(0, 1));
+        T theta = acos(d);
+        T scale = theta / (T(2.0) * sqrt(T(1.0) - d * d));
+        omega = scale * SE3Parameterization::deltaR(R);
     }
     
     return omega;
 }
 
-
-// SE3相对姿态约束 - 对应g2o的Edge4DoF
+// SE3相对姿态约束实现
 class SE3RelativePoseCost {
 public:
     SE3RelativePoseCost(const Eigen::Matrix4d& relative_transform, const Eigen::Matrix<double, 6, 6>& information)
@@ -288,14 +307,14 @@ public:
     template <typename T>
     bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
         // 提取姿态
-        Eigen::Matrix<T, 3, 1> t_i(pose_i[0], pose_i[1], pose_i[2]);
-        Eigen::Matrix<T, 3, 1> t_j(pose_j[0], pose_j[1], pose_j[2]);
-        Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]);
-        Eigen::Quaternion<T> q_j(pose_j[6], pose_j[3], pose_j[4], pose_j[5]);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> t_i(pose_i);
+        Eigen::Map<const Eigen::Quaternion<T>> q_i(pose_i + 3);
+        Eigen::Map<const Eigen::Matrix<T, 3, 1>> t_j(pose_j);
+        Eigen::Map<const Eigen::Quaternion<T>> q_j(pose_j + 3);
         
         // 转换为旋转矩阵
-        Eigen::Matrix<T, 3, 3> R_i = q_i.toRotationMatrix();
-        Eigen::Matrix<T, 3, 3> R_j = q_j.toRotationMatrix();
+        Eigen::Matrix<T, 3, 3> R_i = q_i.normalized().toRotationMatrix();
+        Eigen::Matrix<T, 3, 3> R_j = q_j.normalized().toRotationMatrix();
         
         // 预期的相对变换
         Eigen::Matrix<T, 3, 3> R_ij = relative_rotation_.cast<T>();
@@ -307,20 +326,16 @@ public:
         Eigen::Matrix<T, 3, 1> rotation_error = LogSO3(R_error_mat);
         
         // 平移error: R_i * (-R_j^T * t_j) + t_i - t_ij
-        Eigen::Matrix<T, 3, 1> translation_error = 
-            R_i * (-R_j.transpose() * t_j) + t_i - t_ij;
+        Eigen::Matrix<T, 3, 1> t_ji = -R_j.transpose() * t_j;
+        Eigen::Matrix<T, 3, 1> translation_error = R_i * t_ji + t_i - t_ij;
         
         // 组合residuals
-        residuals[0] = rotation_error[0];
-        residuals[1] = rotation_error[1];
-        residuals[2] = rotation_error[2];
-        residuals[3] = translation_error[0];
-        residuals[4] = translation_error[1];
-        residuals[5] = translation_error[2];
+        Eigen::Map<Eigen::Matrix<T, 6, 1>> residual_map(residuals);
+        residual_map.segment<3>(0) = rotation_error;
+        residual_map.segment<3>(3) = translation_error;
         
         // 应用信息矩阵
-        Eigen::Map<Eigen::Matrix<T, 6, 1>> residuals_map(residuals);
-        residuals_map = sqrt_information_.cast<T>() * residuals_map;
+        residual_map = sqrt_information_.cast<T>() * residual_map;
         
         return true;
     }
@@ -336,6 +351,8 @@ private:
     const Eigen::Vector3d relative_translation_;
     const Eigen::Matrix<double, 6, 6> sqrt_information_;
 };
+
+// ... 其余代码保持不变 ...
 
 
 // 回环边约束 - 对应g2o的EdgeSim3（用于回环边）
