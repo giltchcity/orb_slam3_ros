@@ -826,103 +826,132 @@ public:
         std::cout << "\n开始添加回环约束..." << std::endl;
         
         const int minFeat = 100; // 最小特征点数阈值
-        
-        // 设置信息矩阵 - 与ORB-SLAM3保持一致，但维度调整为6x6
         Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
         
         int loop_edges_added = 0;
+        int attempted_loop = 0;
         std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
         
-        // 遍历所有回环连接 - 对应ORB-SLAM3的LoopConnections迭代
-        for (const auto& connection : data_.loop_connections) {
-            int kf_i_id = connection.first;
-            const auto& connected_kfs = connection.second;
+        // Directly following ORB-SLAM3's algorithm for adding loop edges
+        for (const auto& mit : data_.loop_connections) {
+            int kf_i_id = mit.first;  // 对应 pKF->mnId (nIDi)
+            const std::vector<int>& connected_kfs = mit.second;  // 对应 spConnections
             
-            // 检查关键帧i是否存在且不是坏帧
+            // Skip if keyframe is invalid
             if (data_.keyframes.find(kf_i_id) == data_.keyframes.end() || 
                 data_.keyframes[kf_i_id]->is_bad) {
                 continue;
             }
             
-            auto kf_i = data_.keyframes[kf_i_id];
-            
-            // 获取关键帧i的非修正姿态 (对应g2o代码中的Siw)
+            // Get Siw (pKF's Sim3 transformation)
             Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
             if (data_.non_corrected_poses.find(kf_i_id) != data_.non_corrected_poses.end()) {
                 const auto& non_corrected_i = data_.non_corrected_poses[kf_i_id];
                 T_i.block<3, 3>(0, 0) = non_corrected_i.quaternion.toRotationMatrix();
                 T_i.block<3, 1>(0, 3) = non_corrected_i.translation;
             } else {
+                auto& kf_i = data_.keyframes[kf_i_id];
                 T_i.block<3, 3>(0, 0) = kf_i->quaternion.toRotationMatrix();
                 T_i.block<3, 1>(0, 3) = kf_i->translation;
             }
-            Eigen::Matrix4d T_iw = T_i.inverse(); // 这就是Swi
+            Eigen::Matrix4d T_iw = T_i.inverse();  // 对应 Swi = Siw.inverse()
             
-            // 遍历与关键帧i连接的所有关键帧
+            std::cout << "KF" << kf_i_id << " connections: " << connected_kfs.size() << std::endl;
+            
+            // For each connected keyframe
             for (int kf_j_id : connected_kfs) {
-                // 检查关键帧j是否存在且不是坏帧
+                attempted_loop++;
+                
+                // Skip if keyframe is invalid
                 if (data_.keyframes.find(kf_j_id) == data_.keyframes.end() || 
                     data_.keyframes[kf_j_id]->is_bad) {
                     continue;
                 }
                 
-                auto kf_j = data_.keyframes[kf_j_id];
-                
-                // 严格匹配ORB-SLAM3的权重检查条件
+                // THIS IS THE CRITICAL PART - directly matching ORB-SLAM3's skip logic
+                // Check if this edge should be added - direct port of ORB-SLAM3 logic
+                bool skipEdge = false;
                 if ((kf_i_id != data_.current_kf_id || kf_j_id != data_.loop_kf_id)) {
-                    // 查询共视权重
+                    // Check weight between KF_i and KF_j
                     int weight = 0;
                     if (data_.covisibility.find(kf_i_id) != data_.covisibility.end() &&
                         data_.covisibility[kf_i_id].find(kf_j_id) != data_.covisibility[kf_i_id].end()) {
                         weight = data_.covisibility[kf_i_id][kf_j_id];
-                    } else if (data_.covisibility.find(kf_j_id) != data_.covisibility.end() &&
-                               data_.covisibility[kf_j_id].find(kf_i_id) != data_.covisibility[kf_j_id].end()) {
-                        weight = data_.covisibility[kf_j_id][kf_i_id];
                     }
                     
-                    // 应用minFeat阈值
-                    if (weight < minFeat) {
-                        continue;
+                    skipEdge = (weight < minFeat);
+                }
+                
+                if (skipEdge) {
+                    continue;
+                }
+                
+                // Determine the relative transformation to use
+                Eigen::Matrix4d T_ji;
+                
+                // For the main loop closure edge, use the pre-computed transformation
+                if (kf_i_id == data_.current_kf_id && kf_j_id == data_.loop_kf_id) {
+                    T_ji = data_.loop_transform_matrix;
+                } 
+                // For connected keyframes to the loop KF
+                else if (kf_i_id == data_.current_kf_id) {
+                    // We need to compute transformation from current KF to any other connected KF
+                    // First, get transformation from loop KF to this connected KF
+                    auto& kf_loop = data_.keyframes[data_.loop_kf_id];
+                    auto& kf_j = data_.keyframes[kf_j_id];
+                    
+                    // Compute T_loop_to_j = T_j * inv(T_loop)
+                    Eigen::Matrix4d T_loop = Eigen::Matrix4d::Identity();
+                    T_loop.block<3,3>(0,0) = kf_loop->quaternion.toRotationMatrix();
+                    T_loop.block<3,1>(0,3) = kf_loop->translation;
+                    
+                    Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
+                    T_j.block<3,3>(0,0) = kf_j->quaternion.toRotationMatrix();
+                    T_j.block<3,1>(0,3) = kf_j->translation;
+                    
+                    Eigen::Matrix4d T_loop_to_j = T_j * T_loop.inverse();
+                    
+                    // Compose with the loop transformation to get current_to_j
+                    T_ji = T_loop_to_j * data_.loop_transform_matrix;
+                }
+                // For all other edges, use standard computation
+                else {
+                    Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
+                    if (data_.non_corrected_poses.find(kf_j_id) != data_.non_corrected_poses.end()) {
+                        const auto& non_corrected_j = data_.non_corrected_poses[kf_j_id];
+                        T_j.block<3, 3>(0, 0) = non_corrected_j.quaternion.toRotationMatrix();
+                        T_j.block<3, 1>(0, 3) = non_corrected_j.translation;
+                    } else {
+                        auto& kf_j = data_.keyframes[kf_j_id];
+                        T_j.block<3, 3>(0, 0) = kf_j->quaternion.toRotationMatrix();
+                        T_j.block<3, 1>(0, 3) = kf_j->translation;
                     }
+                    
+                    // Standard computation: T_ji = T_j * T_iw (Sji = Sjw * Swi in ORB-SLAM3)
+                    T_ji = T_j * T_iw;
                 }
                 
-                // 获取关键帧j的非修正姿态 (对应g2o代码中的Sjw)
-                Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
-                if (data_.non_corrected_poses.find(kf_j_id) != data_.non_corrected_poses.end()) {
-                    const auto& non_corrected_j = data_.non_corrected_poses[kf_j_id];
-                    T_j.block<3, 3>(0, 0) = non_corrected_j.quaternion.toRotationMatrix();
-                    T_j.block<3, 1>(0, 3) = non_corrected_j.translation;
-                } else {
-                    T_j.block<3, 3>(0, 0) = kf_j->quaternion.toRotationMatrix();
-                    T_j.block<3, 1>(0, 3) = kf_j->translation;
-                }
-                
-                // 计算相对变换 T_ji = T_j * T_iw (完全对应ORB-SLAM3的 Sji = Sjw * Swi)
-                Eigen::Matrix4d T_ji = T_j * T_iw;
-                
-                // 使用专门的回环约束
+                // Add the constraint
                 ceres::CostFunction* cost_function = SE3LoopConstraintCost::Create(T_ji, information);
-                
-                // 添加到优化问题 - 顶点顺序与ORB-SLAM3一致
-                problem_->AddResidualBlock(cost_function,
-                                         nullptr,  // 不使用鲁棒核函数
-                                         kf_i->se3_state.data(),  // 对应vertex(0)
-                                         kf_j->se3_state.data()); // 对应vertex(1)
+                problem_->AddResidualBlock(cost_function, nullptr, 
+                                          data_.keyframes[kf_i_id]->se3_state.data(), 
+                                          data_.keyframes[kf_j_id]->se3_state.data());
                 
                 loop_edges_added++;
+                sInsertedEdges.insert(std::make_pair(std::min(kf_i_id, kf_j_id), 
+                                                    std::max(kf_i_id, kf_j_id)));
                 
-                // 完全匹配ORB-SLAM3的边记录方式
-                sInsertedEdges.insert(std::make_pair(std::min(kf_i_id, kf_j_id), std::max(kf_i_id, kf_j_id)));
-                
-                // 调试输出
-                if (loop_edges_added <= 5) {
-                    std::cout << "添加回环约束: " << kf_i_id << " <-> " << kf_j_id << std::endl;
-                }
+                // Print edge information (similar to ORB-SLAM3 output)
+                std::cout << "  Added Loop Edge: KF" << kf_i_id << " -> KF" << kf_j_id 
+                          << " | Weight: " << (data_.covisibility[kf_i_id][kf_j_id])
+                          << " | Translation: [" << T_ji.block<3,1>(0,3).transpose() << "]" 
+                          << " | Scale: 1" << std::endl;
             }
         }
         
-        std::cout << "共添加了 " << loop_edges_added << " 个回环约束" << std::endl;
-    }    
+        std::cout << "\nSuccessful Loop Edges: " << loop_edges_added << "/" << attempted_loop << std::endl;
+        std::cout << "Unique Edge Pairs: " << sInsertedEdges.size() << std::endl;
+    }
 
     void AddNormalEdgeConstraints() {
         std::cout << "\n开始添加正常边约束（生成树 + 回环边 + 共视）..." << std::endl;
