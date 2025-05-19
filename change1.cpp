@@ -1558,7 +1558,7 @@ int main() {
     
 
     // 添加正常边约束（生成树）
-    // optimizer.AddNormalEdgeConstraints();
+    optimizer.AddNormalEdgeConstraints();
     
     // 打印问题信息
     optimizer.PrintProblemInfo();
