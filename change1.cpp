@@ -822,136 +822,245 @@ public:
 
     // 添加回环约束
     // 添加回环约束 - 精确匹配ORB-SLAM3的Set Loop edges部分
+    // 修正后的回环约束添加函数 - 精确匹配ORB-SLAM3
+    // 修正后的回环约束添加函数 - 解决权重查询问题
     void AddLoopConstraints() {
-        std::cout << "\n开始添加回环约束..." << std::endl;
+        std::cout << "\n=== Adding Loop Edges ===" << std::endl;
         
         const int minFeat = 100; // 最小特征点数阈值
-        Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
-        
-        int loop_edges_added = 0;
-        int attempted_loop = 0;
         std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
+        Eigen::Matrix<double, 6, 6> matLambda = Eigen::Matrix<double, 6, 6>::Identity();
         
-        // Directly following ORB-SLAM3's algorithm for adding loop edges
+        int count_loop = 0;
+        int attempted_loop = 0;
+        
+        std::cout << "Minimum features for edge connection: " << minFeat << std::endl;
+        std::cout << "\n=== Information Matrix ===" << std::endl;
+        std::cout << matLambda << std::endl;
+        
+        // 遍历所有回环连接 - 精确匹配 ORB-SLAM3 的外层循环
         for (const auto& mit : data_.loop_connections) {
-            int kf_i_id = mit.first;  // 对应 pKF->mnId (nIDi)
-            const std::vector<int>& connected_kfs = mit.second;  // 对应 spConnections
+            int nIDi = mit.first;  // 对应 ORB-SLAM3 的 pKF->mnId
+            const auto& spConnections = mit.second;  // 对应 ORB-SLAM3 的 spConnections
             
-            // Skip if keyframe is invalid
-            if (data_.keyframes.find(kf_i_id) == data_.keyframes.end() || 
-                data_.keyframes[kf_i_id]->is_bad) {
+            // 检查关键帧i是否有效
+            if (data_.keyframes.find(nIDi) == data_.keyframes.end() || 
+                data_.keyframes[nIDi]->is_bad) {
                 continue;
             }
             
-            // Get Siw (pKF's Sim3 transformation)
-            Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
-            if (data_.non_corrected_poses.find(kf_i_id) != data_.non_corrected_poses.end()) {
-                const auto& non_corrected_i = data_.non_corrected_poses[kf_i_id];
-                T_i.block<3, 3>(0, 0) = non_corrected_i.quaternion.toRotationMatrix();
-                T_i.block<3, 1>(0, 3) = non_corrected_i.translation;
+            auto pKF = data_.keyframes[nIDi];
+            
+            std::cout << "KF" << nIDi << " connections: " << spConnections.size() << std::endl;
+            
+            // ========== 获取关键帧i的变换矩阵（对应 ORB-SLAM3 的 vScw[nIDi]） ==========
+            Eigen::Matrix4d Siw = Eigen::Matrix4d::Identity();
+            bool useCorrectedSim3_i = false;
+            
+            // 关键修正：按照 ORB-SLAM3 的逻辑选择姿态
+            if (data_.corrected_poses.find(nIDi) != data_.corrected_poses.end()) {
+                // 使用修正姿态 - 对应 ORB-SLAM3 的 it->second
+                const auto& corrected = data_.corrected_poses[nIDi];
+                Siw.block<3, 3>(0, 0) = corrected.quaternion.toRotationMatrix();
+                Siw.block<3, 1>(0, 3) = corrected.translation;
+                useCorrectedSim3_i = true;
             } else {
-                auto& kf_i = data_.keyframes[kf_i_id];
-                T_i.block<3, 3>(0, 0) = kf_i->quaternion.toRotationMatrix();
-                T_i.block<3, 1>(0, 3) = kf_i->translation;
+                // 使用原始姿态 - 对应 ORB-SLAM3 的 pKF->GetPose()
+                Siw.block<3, 3>(0, 0) = pKF->quaternion.toRotationMatrix();
+                Siw.block<3, 1>(0, 3) = pKF->translation;
             }
-            Eigen::Matrix4d T_iw = T_i.inverse();  // 对应 Swi = Siw.inverse()
             
-            std::cout << "KF" << kf_i_id << " connections: " << connected_kfs.size() << std::endl;
+            // ========== 计算逆变换（对应 ORB-SLAM3 的 Swi = Siw.inverse()） ==========
+            Eigen::Matrix4d Swi = Siw.inverse();
             
-            // For each connected keyframe
-            for (int kf_j_id : connected_kfs) {
+            // ========== 内层循环：遍历连接的关键帧 ==========
+            for (int nIDj : spConnections) {
                 attempted_loop++;
                 
-                // Skip if keyframe is invalid
-                if (data_.keyframes.find(kf_j_id) == data_.keyframes.end() || 
-                    data_.keyframes[kf_j_id]->is_bad) {
+                // 检查关键帧j是否有效
+                if (data_.keyframes.find(nIDj) == data_.keyframes.end() || 
+                    data_.keyframes[nIDj]->is_bad) {
                     continue;
                 }
                 
-                // THIS IS THE CRITICAL PART - directly matching ORB-SLAM3's skip logic
-                // Check if this edge should be added - direct port of ORB-SLAM3 logic
+                auto pKFj = data_.keyframes[nIDj];
+                
+                // ========== 权重检查（修正版本） ==========
                 bool skipEdge = false;
-                if ((kf_i_id != data_.current_kf_id || kf_j_id != data_.loop_kf_id)) {
-                    // Check weight between KF_i and KF_j
-                    int weight = 0;
-                    if (data_.covisibility.find(kf_i_id) != data_.covisibility.end() &&
-                        data_.covisibility[kf_i_id].find(kf_j_id) != data_.covisibility[kf_i_id].end()) {
-                        weight = data_.covisibility[kf_i_id][kf_j_id];
+                int weight = 0;
+                
+                // 检查是否是主要回环边
+                bool isMainLoopEdge = (nIDi == data_.current_kf_id && nIDj == data_.loop_kf_id);
+                
+                if (!isMainLoopEdge) {
+                    // 不是主要回环边，需要检查共视权重
+                    // 修正：双向查找权重，因为共视关系可能只存储在一个方向上
+                    
+                    // 首先尝试 i->j 方向
+                    auto it_i = data_.covisibility.find(nIDi);
+                    if (it_i != data_.covisibility.end()) {
+                        auto it_j = it_i->second.find(nIDj);
+                        if (it_j != it_i->second.end()) {
+                            weight = it_j->second;
+                        }
                     }
                     
-                    skipEdge = (weight < minFeat);
+                    // 如果没找到，尝试 j->i 方向
+                    if (weight == 0) {
+                        auto it_j = data_.covisibility.find(nIDj);
+                        if (it_j != data_.covisibility.end()) {
+                            auto it_i = it_j->second.find(nIDi);
+                            if (it_i != it_j->second.end()) {
+                                weight = it_i->second;
+                            }
+                        }
+                    }
+                    
+                    // 应用权重阈值检查
+                    if (weight < minFeat) {
+                        skipEdge = true;
+                        // 调试输出：显示为什么边被跳过
+                        if (nIDi == 456 && (nIDj == 0 || nIDj == 1 || nIDj == 2)) {
+                            std::cout << "  跳过边 KF" << nIDi << " -> KF" << nIDj 
+                                      << " | Weight: " << weight << " < " << minFeat << std::endl;
+                        }
+                    }
+                } else {
+                    // 主要回环边，获取权重但不进行阈值检查
+                    auto it_i = data_.covisibility.find(nIDi);
+                    if (it_i != data_.covisibility.end()) {
+                        auto it_j = it_i->second.find(nIDj);
+                        if (it_j != it_i->second.end()) {
+                            weight = it_j->second;
+                        }
+                    }
+                    if (weight == 0) {
+                        auto it_j = data_.covisibility.find(nIDj);
+                        if (it_j != data_.covisibility.end()) {
+                            auto it_i = it_j->second.find(nIDi);
+                            if (it_i != it_j->second.end()) {
+                                weight = it_i->second;
+                            }
+                        }
+                    }
                 }
                 
                 if (skipEdge) {
                     continue;
                 }
                 
-                // Determine the relative transformation to use
-                Eigen::Matrix4d T_ji;
+                // ========== 获取关键帧j的变换矩阵（对应 ORB-SLAM3 的 vScw[nIDj]） ==========
+                Eigen::Matrix4d Sjw = Eigen::Matrix4d::Identity();
+                bool useCorrectedSim3_j = false;
                 
-                // For the main loop closure edge, use the pre-computed transformation
-                if (kf_i_id == data_.current_kf_id && kf_j_id == data_.loop_kf_id) {
-                    T_ji = data_.loop_transform_matrix;
-                } 
-                // For connected keyframes to the loop KF
-                else if (kf_i_id == data_.current_kf_id) {
-                    // We need to compute transformation from current KF to any other connected KF
-                    // First, get transformation from loop KF to this connected KF
-                    auto& kf_loop = data_.keyframes[data_.loop_kf_id];
-                    auto& kf_j = data_.keyframes[kf_j_id];
-                    
-                    // Compute T_loop_to_j = T_j * inv(T_loop)
-                    Eigen::Matrix4d T_loop = Eigen::Matrix4d::Identity();
-                    T_loop.block<3,3>(0,0) = kf_loop->quaternion.toRotationMatrix();
-                    T_loop.block<3,1>(0,3) = kf_loop->translation;
-                    
-                    Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
-                    T_j.block<3,3>(0,0) = kf_j->quaternion.toRotationMatrix();
-                    T_j.block<3,1>(0,3) = kf_j->translation;
-                    
-                    Eigen::Matrix4d T_loop_to_j = T_j * T_loop.inverse();
-                    
-                    // Compose with the loop transformation to get current_to_j
-                    T_ji = T_loop_to_j * data_.loop_transform_matrix;
-                }
-                // For all other edges, use standard computation
-                else {
-                    Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
-                    if (data_.non_corrected_poses.find(kf_j_id) != data_.non_corrected_poses.end()) {
-                        const auto& non_corrected_j = data_.non_corrected_poses[kf_j_id];
-                        T_j.block<3, 3>(0, 0) = non_corrected_j.quaternion.toRotationMatrix();
-                        T_j.block<3, 1>(0, 3) = non_corrected_j.translation;
-                    } else {
-                        auto& kf_j = data_.keyframes[kf_j_id];
-                        T_j.block<3, 3>(0, 0) = kf_j->quaternion.toRotationMatrix();
-                        T_j.block<3, 1>(0, 3) = kf_j->translation;
-                    }
-                    
-                    // Standard computation: T_ji = T_j * T_iw (Sji = Sjw * Swi in ORB-SLAM3)
-                    T_ji = T_j * T_iw;
+                if (data_.corrected_poses.find(nIDj) != data_.corrected_poses.end()) {
+                    // 使用修正姿态
+                    const auto& corrected = data_.corrected_poses[nIDj];
+                    Sjw.block<3, 3>(0, 0) = corrected.quaternion.toRotationMatrix();
+                    Sjw.block<3, 1>(0, 3) = corrected.translation;
+                    useCorrectedSim3_j = true;
+                } else {
+                    // 使用原始姿态
+                    Sjw.block<3, 3>(0, 0) = pKFj->quaternion.toRotationMatrix();
+                    Sjw.block<3, 1>(0, 3) = pKFj->translation;
                 }
                 
-                // Add the constraint
-                ceres::CostFunction* cost_function = SE3LoopConstraintCost::Create(T_ji, information);
-                problem_->AddResidualBlock(cost_function, nullptr, 
-                                          data_.keyframes[kf_i_id]->se3_state.data(), 
-                                          data_.keyframes[kf_j_id]->se3_state.data());
+                // ========== 计算相对变换（对应 ORB-SLAM3 的 Sji = Sjw * Swi） ==========
+                Eigen::Matrix4d Sji = Sjw * Swi;
                 
-                loop_edges_added++;
-                sInsertedEdges.insert(std::make_pair(std::min(kf_i_id, kf_j_id), 
-                                                    std::max(kf_i_id, kf_j_id)));
+                // ========== 创建优化边 ==========
+                ceres::CostFunction* cost_function = SE3LoopConstraintCost::Create(Sji, matLambda);
                 
-                // Print edge information (similar to ORB-SLAM3 output)
-                std::cout << "  Added Loop Edge: KF" << kf_i_id << " -> KF" << kf_j_id 
-                          << " | Weight: " << (data_.covisibility[kf_i_id][kf_j_id])
-                          << " | Translation: [" << T_ji.block<3,1>(0,3).transpose() << "]" 
-                          << " | Scale: 1" << std::endl;
+                // ========== 添加残差块（注意顶点顺序） ==========
+                problem_->AddResidualBlock(cost_function,
+                                         nullptr,
+                                         pKF->se3_state.data(),   // 对应vertex(0) - 关键帧i
+                                         pKFj->se3_state.data()); // 对应vertex(1) - 关键帧j
+                
+                count_loop++;
+                
+                // ========== 记录边（与 ORB-SLAM3 完全一致） ==========
+                sInsertedEdges.insert(std::make_pair(std::min((long unsigned int)nIDi, (long unsigned int)nIDj), 
+                                                   std::max((long unsigned int)nIDi, (long unsigned int)nIDj)));
+                
+                // ========== 输出详细信息（匹配 ORB-SLAM3 格式） ==========
+                Eigen::Vector3d translation = Sji.block<3, 1>(0, 3);
+                std::cout << "  Added Loop Edge: KF" << nIDi << " -> KF" << nIDj 
+                          << " | Weight: " << weight
+                          << " | Translation: [" << translation.transpose() << "]" 
+                          << " | Scale: " << 1.0  // SE3没有尺度，固定为1
+                          << std::endl;
             }
         }
         
-        std::cout << "\nSuccessful Loop Edges: " << loop_edges_added << "/" << attempted_loop << std::endl;
+        std::cout << "\nSuccessful Loop Edges: " << count_loop << "/" << attempted_loop << std::endl;
         std::cout << "Unique Edge Pairs: " << sInsertedEdges.size() << std::endl;
     }
+    
+    // 添加一个调试函数来检查共视关系数据
+    void DebugCovisibilityData() {
+        std::cout << "\n=== 共视关系调试 ===" << std::endl;
+        
+        // 检查关键帧456的共视关系
+        int kf_id = 456;
+        std::cout << "检查KF456的共视关系：" << std::endl;
+        
+        // 检查456作为主键的情况
+        if (data_.covisibility.find(kf_id) != data_.covisibility.end()) {
+            const auto& connections = data_.covisibility[kf_id];
+            std::cout << "  KF456 -> 其他KF: " << connections.size() << " 个连接" << std::endl;
+            for (const auto& conn : connections) {
+                if (conn.first <= 5) {  // 只打印前几个
+                    std::cout << "    KF456 -> KF" << conn.first << ": " << conn.second << std::endl;
+                }
+            }
+        }
+        
+        // 检查其他关键帧指向456的情况
+        std::cout << "  其他KF -> KF456 的连接：" << std::endl;
+        for (const auto& kf_conn : data_.covisibility) {
+            int other_kf = kf_conn.first;
+            const auto& connections = kf_conn.second;
+            
+            if (connections.find(kf_id) != connections.end()) {
+                int weight = connections.at(kf_id);
+                if (other_kf <= 5) {  // 只打印前几个
+                    std::cout << "    KF" << other_kf << " -> KF456: " << weight << std::endl;
+                }
+            }
+        }
+        
+        // 具体检查456->0, 456->1, 456->2的权重
+        std::vector<int> target_kfs = {0, 1, 2};
+        for (int target_kf : target_kfs) {
+            int weight = 0;
+            
+            // 检查456->target方向
+            if (data_.covisibility.find(456) != data_.covisibility.end()) {
+                const auto& conn456 = data_.covisibility[456];
+                if (conn456.find(target_kf) != conn456.end()) {
+                    weight = conn456.at(target_kf);
+                    std::cout << "  KF456 -> KF" << target_kf << ": " << weight << " (方向1)" << std::endl;
+                }
+            }
+            
+            // 检查target->456方向
+            if (weight == 0 && data_.covisibility.find(target_kf) != data_.covisibility.end()) {
+                const auto& conn_target = data_.covisibility[target_kf];
+                if (conn_target.find(456) != conn_target.end()) {
+                    weight = conn_target.at(456);
+                    std::cout << "  KF" << target_kf << " -> KF456: " << weight << " (方向2)" << std::endl;
+                }
+            }
+            
+            if (weight == 0) {
+                std::cout << "  KF456 <-> KF" << target_kf << ": 未找到共视关系！" << std::endl;
+            }
+        }
+    }
+
+
+
 
     void AddNormalEdgeConstraints() {
         std::cout << "\n开始添加正常边约束（生成树）..." << std::endl;
@@ -1442,12 +1551,14 @@ int main() {
     // 设置优化问题
     optimizer.SetupOptimizationProblem();
     
+    // 调试共视关系数据
+    optimizer.DebugCovisibilityData();
     // 添加回环约束
     optimizer.AddLoopConstraints();
     
 
     // 添加正常边约束（生成树）
-    optimizer.AddNormalEdgeConstraints();
+    // optimizer.AddNormalEdgeConstraints();
     
     // 打印问题信息
     optimizer.PrintProblemInfo();
