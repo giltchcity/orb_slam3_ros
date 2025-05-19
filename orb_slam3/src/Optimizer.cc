@@ -21,7 +21,7 @@
 
 
 #include <complex>
-
+#include <algorithm>  
 #include <Eigen/StdVector>
 #include <Eigen/Dense>
 #include <unsupported/Eigen/MatrixFunctions>
@@ -1672,224 +1672,131 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     cout << "Total unique edge pairs: " << sInsertedEdges.size() << "\n";
 
     // Set normal edges
-    cout << "\n====== SKIPPING NORMAL EDGES IN THIS EXAMPLE ======\n";
-
-    cout << "\n====== RUNNING OPTIMIZATION ======\n";
-    optimizer.initializeOptimization();
-    optimizer.computeActiveErrors();
-    cout << "Initial error: " << optimizer.activeRobustChi2() << "\n";
+    // Set normal edges - 带详细调试信息
+    cout << "\n====== SETTING UP NORMAL EDGES ======\n";
+    int spanning_tree_count = 0;
+    int covisibility_count = 0;
     
-    optimizer.optimize(20);
+    cout << "\n--- Processing Spanning Tree Edges ---\n";
     
-    optimizer.computeActiveErrors();
-    cout << "Final error after optimization: " << optimizer.activeRobustChi2() << "\n";
-    
-    cout << "\n====== RECOVERING OPTIMIZED POSES ======\n";
-    unique_lock<mutex> lock(pMap->mMutexMapUpdate);
-
-    // SE3 Pose Recovering. Sim3:[sR t;0 1] -> SE3:[R t/s;0 1]
-    for(size_t i=0;i<vpKFs.size();i++)
-    {
-        KeyFrame* pKFi = vpKFs[i];
-
-        const int nIDi = pKFi->mnId;
-        
-        if(pKFi->isBad())
-            continue;
-
-        g2o::VertexSim3Expmap* VSim3 = static_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDi));
-        g2o::Sim3 CorrectedSiw =  VSim3->estimate();
-        vCorrectedSwc[nIDi]=CorrectedSiw.inverse();
-        double s = CorrectedSiw.scale();
-        
-        cout << "KF " << nIDi << " optimized transform:\n";
-        cout << "  Translation: " << CorrectedSiw.translation().transpose() << "\n";
-        cout << "  Rotation: " << CorrectedSiw.rotation().coeffs().transpose() << "\n";
-        cout << "  Scale: " << s << "\n";
-
-        Sophus::SE3f Tiw(CorrectedSiw.rotation().cast<float>(), CorrectedSiw.translation().cast<float>() / s);
-        pKFi->SetPose(Tiw);
-    }
-    
-    cout << "\n====== ESSENTIAL GRAPH OPTIMIZATION COMPLETE ======\n";
-}
-
-
-
-void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
-                                       const LoopClosing::KeyFrameAndPose &NonCorrectedSim3,
-                                       const LoopClosing::KeyFrameAndPose &CorrectedSim3,
-                                       const map<KeyFrame *, set<KeyFrame *> > &LoopConnections, const bool &bFixScale)
-{   
-    cout << "\n====== STARTING ESSENTIAL GRAPH OPTIMIZATION ======\n";
-    cout << "Current KF ID: " << pCurKF->mnId << ", Loop KF ID: " << pLoopKF->mnId << "\n";
-    cout << "Fixed Scale: " << (bFixScale ? "TRUE" : "FALSE") << "\n";
-    cout << "Number of Loop Connections: " << LoopConnections.size() << "\n";
-    cout << "Init KF ID: " << pMap->GetInitKFid() << "\n";
-    cout << "Max KF ID: " << pMap->GetMaxKFid() << "\n";
-
-    // Setup optimizer
-    g2o::SparseOptimizer optimizer;
-    optimizer.setVerbose(false);
-    g2o::BlockSolver_7_3::LinearSolverType * linearSolver =
-           new g2o::LinearSolverEigen<g2o::BlockSolver_7_3::PoseMatrixType>();
-    g2o::BlockSolver_7_3 * solver_ptr= new g2o::BlockSolver_7_3(linearSolver);
-    g2o::OptimizationAlgorithmLevenberg* solver = new g2o::OptimizationAlgorithmLevenberg(solver_ptr);
-
-    solver->setUserLambdaInit(1e-16);
-    optimizer.setAlgorithm(solver);
-
-    const vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
-    const vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
-
-    const unsigned int nMaxKFid = pMap->GetMaxKFid();
-
-    vector<g2o::Sim3,Eigen::aligned_allocator<g2o::Sim3> > vScw(nMaxKFid+1);
-    vector<g2o::Sim3,Eigen::aligned_allocator<g2o::Sim3> > vCorrectedSwc(nMaxKFid+1);
-    vector<g2o::VertexSim3Expmap*> vpVertices(nMaxKFid+1);
-
-    vector<Eigen::Vector3d> vZvectors(nMaxKFid+1); // For debugging
-    Eigen::Vector3d z_vec;
-    z_vec << 0.0, 0.0, 1.0;
-
-    const int minFeat = 100;
-    cout << "Min features threshold: " << minFeat << "\n";
-
-    // Set KeyFrame vertices
-    cout << "\n====== SETTING UP KEYFRAME VERTICES ======\n";
-    int vertex_count = 0;
-
-    for(size_t i=0, iend=vpKFs.size(); i<iend;i++)
+    for(size_t i=0, iend=vpKFs.size(); i<iend; i++)
     {
         KeyFrame* pKF = vpKFs[i];
-        if(pKF->isBad())
-            continue;
-        g2o::VertexSim3Expmap* VSim3 = new g2o::VertexSim3Expmap();
-
+    
         const int nIDi = pKF->mnId;
-        cout << "Setting up vertex for KF " << nIDi;
-
-        LoopClosing::KeyFrameAndPose::const_iterator it = CorrectedSim3.find(pKF);
-
-        if(it!=CorrectedSim3.end())
+        
+        // 跳过坏的关键帧
+        if(pKF->isBad()) {
+            cout << "Skipping bad KF " << nIDi << "\n";
+            continue;
+        }
+    
+        g2o::Sim3 Swi;
+    
+        // 获取关键帧i的变换 - 优先使用NonCorrectedSim3
+        LoopClosing::KeyFrameAndPose::const_iterator iti = NonCorrectedSim3.find(pKF);
+    
+        if(iti!=NonCorrectedSim3.end())
         {
-            vScw[nIDi] = it->second;
-            VSim3->setEstimate(it->second);
-            cout << " (CORRECTED):\n";
-            cout << "  Translation: " << it->second.translation().transpose() << "\n";
-            cout << "  Rotation quaternion: " << it->second.rotation().coeffs().transpose() << "\n";
-            cout << "  Scale: " << it->second.scale() << "\n";
+            Swi = (iti->second).inverse();
+            cout << "KF " << nIDi << " using NON-CORRECTED transform:\n";
+            cout << "  Siw translation: " << iti->second.translation().transpose() << "\n";
+            cout << "  Siw rotation: " << iti->second.rotation().coeffs().transpose() << "\n";
+            cout << "  Siw scale: " << iti->second.scale() << "\n";
         }
         else
         {
-            Sophus::SE3d Tcw = pKF->GetPose().cast<double>();
-            g2o::Sim3 Siw(Tcw.unit_quaternion(),Tcw.translation(),1.0);
-            vScw[nIDi] = Siw;
-            VSim3->setEstimate(Siw);
-            cout << " (ORIGINAL):\n";
-            cout << "  Translation: " << Siw.translation().transpose() << "\n";
-            cout << "  Rotation quaternion: " << Siw.rotation().coeffs().transpose() << "\n";
-            cout << "  Scale: 1.0 (fixed)\n";
+            Swi = vScw[nIDi].inverse();
+            cout << "KF " << nIDi << " using STANDARD transform (vScw):\n";
+            cout << "  Siw translation: " << vScw[nIDi].translation().transpose() << "\n";
+            cout << "  Siw rotation: " << vScw[nIDi].rotation().coeffs().transpose() << "\n";
+            cout << "  Siw scale: " << vScw[nIDi].scale() << "\n";
         }
-
-        if(pKF->mnId==pMap->GetInitKFid()) {
-            VSim3->setFixed(true);
-            cout << "  [FIXED VERTEX - Initial KF]\n";
-        }
-
-        VSim3->setId(nIDi);
-        VSim3->setMarginalized(false);
-        VSim3->_fix_scale = bFixScale;
-
-        optimizer.addVertex(VSim3);
-        vZvectors[nIDi]=vScw[nIDi].rotation()*z_vec; // For debugging
-
-        vpVertices[nIDi]=VSim3;
-        vertex_count++;
-    }
-
-    cout << "\nAdded " << vertex_count << " vertices to optimizer\n";
-
-    set<pair<long unsigned int,long unsigned int> > sInsertedEdges;
-
-    const Eigen::Matrix<double,7,7> matLambda = Eigen::Matrix<double,7,7>::Identity();
-    cout << "Information matrix:\n" << matLambda << "\n";
-
-    // Set Loop edges
-    cout << "\n====== SETTING UP LOOP EDGES ======\n";
-    int count_loop = 0;
-    for(map<KeyFrame *, set<KeyFrame *> >::const_iterator mit = LoopConnections.begin(), mend=LoopConnections.end(); mit!=mend; mit++)
-    {
-        KeyFrame* pKF = mit->first;
-        const long unsigned int nIDi = pKF->mnId;
-        const set<KeyFrame*> &spConnections = mit->second;
-        const g2o::Sim3 Siw = vScw[nIDi];
-        const g2o::Sim3 Swi = Siw.inverse();
-
-        cout << "\nProcessing loop connections for KF " << nIDi << "\n";
-        cout << "  Siw translation: " << Siw.translation().transpose() << "\n";
-        cout << "  Siw rotation: " << Siw.rotation().coeffs().transpose() << "\n";
-        cout << "  Siw scale: " << Siw.scale() << "\n";
-        cout << "  Connections count: " << spConnections.size() << "\n";
-
-        for(set<KeyFrame*>::const_iterator sit=spConnections.begin(), send=spConnections.end(); sit!=send; sit++)
+    
+        KeyFrame* pParentKF = pKF->GetParent();
+    
+        // Spanning tree edge 
+        if(pParentKF)
         {
-            const long unsigned int nIDj = (*sit)->mnId;
-            cout << "  Evaluating connection KF " << nIDi << " -> KF " << nIDj << "\n";
-            cout << "    Special pair check: (Current KF=" << pCurKF->mnId << ", Loop KF=" << pLoopKF->mnId << ")\n";
-            cout << "    Weight: " << pKF->GetWeight(*sit) << ", minFeat: " << minFeat << "\n";
+            int nIDj = pParentKF->mnId;
             
-            // This is the critical conditional check
-            if((nIDi!=pCurKF->mnId || nIDj!=pLoopKF->mnId) && pKF->GetWeight(*sit)<minFeat) {
-                cout << "    SKIPPING: Not the special pair AND weight < minFeat\n";
-                continue;
+            cout << "\n  Spanning Tree: KF " << nIDi << " -> Parent KF " << nIDj << "\n";
+    
+            g2o::Sim3 Sjw;
+    
+            // 获取父关键帧的变换 - 优先使用NonCorrectedSim3
+            LoopClosing::KeyFrameAndPose::const_iterator itj = NonCorrectedSim3.find(pParentKF);
+    
+            if(itj!=NonCorrectedSim3.end())
+            {
+                Sjw = itj->second;
+                cout << "    Parent KF " << nIDj << " using NON-CORRECTED transform:\n";
+                cout << "      Sjw translation: " << Sjw.translation().transpose() << "\n";
+                cout << "      Sjw rotation: " << Sjw.rotation().coeffs().transpose() << "\n";
+                cout << "      Sjw scale: " << Sjw.scale() << "\n";
             }
-
-            const g2o::Sim3 Sjw = vScw[nIDj];
-            const g2o::Sim3 Sji = Sjw * Swi;
-
-            cout << "    Sjw translation: " << Sjw.translation().transpose() << "\n";
-            cout << "    Sjw rotation: " << Sjw.rotation().coeffs().transpose() << "\n";
-            cout << "    Sjw scale: " << Sjw.scale() << "\n";
-            cout << "    Sji = Sjw * Swi (relative transform):\n";
+            else
+            {
+                Sjw = vScw[nIDj];
+                cout << "    Parent KF " << nIDj << " using STANDARD transform (vScw):\n";
+                cout << "      Sjw translation: " << Sjw.translation().transpose() << "\n";
+                cout << "      Sjw rotation: " << Sjw.rotation().coeffs().transpose() << "\n";
+                cout << "      Sjw scale: " << Sjw.scale() << "\n";
+            }
+    
+            // 计算相对变换
+            g2o::Sim3 Sji = Sjw * Swi;
+            
+            cout << "    Calculated relative transform Sji = Sjw * Swi:\n";
             cout << "      Translation: " << Sji.translation().transpose() << "\n";
             cout << "      Rotation: " << Sji.rotation().coeffs().transpose() << "\n";
             cout << "      Scale: " << Sji.scale() << "\n";
-
+    
+            // 创建并添加边
             g2o::EdgeSim3* e = new g2o::EdgeSim3();
             e->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDj)));
             e->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
             e->setMeasurement(Sji);
-
             e->information() = matLambda;
-
             optimizer.addEdge(e);
             
-            // DEBUG: Calculate and display initial edge error
-            // NOTE: This is not part of the original code but helps understand how g2o computes error
+            // 计算初始边误差（调试信息）
             g2o::Sim3 Si = dynamic_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDi))->estimate();
             g2o::Sim3 Sj = dynamic_cast<g2o::VertexSim3Expmap*>(optimizer.vertex(nIDj))->estimate();
             g2o::Sim3 error_Sim3 = Sji * Si * Sj.inverse();
             Eigen::Matrix<double,7,1> error_vector = error_Sim3.log();
             
-            cout << "    ADDED edge from KF " << nIDi << " to KF " << nIDj << "\n";
+            cout << "    ADDED Spanning Tree Edge: KF " << nIDi << " -> Parent KF " << nIDj << "\n";
             cout << "    Initial edge error (log(Sji * Si * Sj^-1)):\n";
             cout << "      Rotation part [0-2]: " << error_vector.head<3>().transpose() << "\n";
             cout << "      Translation part [3-5]: " << error_vector.segment<3>(3).transpose() << "\n";
             cout << "      Scale part [6]: " << error_vector(6) << "\n";
             cout << "      Error magnitude: " << error_vector.norm() << "\n";
             
-            count_loop++;
-            sInsertedEdges.insert(make_pair(min(nIDi,nIDj),max(nIDi,nIDj)));
+            spanning_tree_count++;
+            
+            // 检查这条边是否之前作为回环边已经添加过
+            // 正确的写法：
+            auto edge_pair = make_pair(min((long unsigned int)nIDi, (long unsigned int)nIDj), 
+                          max((long unsigned int)nIDi, (long unsigned int)nIDj));
+            if(sInsertedEdges.find(edge_pair) != sInsertedEdges.end()) {
+                cout << "    WARNING: This edge was already added as a loop edge!\n";
+            } else {
+                sInsertedEdges.insert(edge_pair);
+            }
+        }
+        else
+        {
+            if(nIDi != pMap->GetInitKFid()) {
+                cout << "KF " << nIDi << " has NO parent (not init KF - this might be unusual)\n";
+            } else {
+                cout << "KF " << nIDi << " is the initial keyframe (no parent expected)\n";
+            }
         }
     }
-
-    cout << "\nTotal loop edges added: " << count_loop << "\n";
-    cout << "Total unique edge pairs: " << sInsertedEdges.size() << "\n";
-
-    // Set normal edges
-    cout << "\n====== SKIPPING NORMAL EDGES IN THIS EXAMPLE ======\n";
-
+    
+    cout << "\nSpanning tree edges added: " << spanning_tree_count << "\n";
+    
     cout << "\n====== RUNNING OPTIMIZATION ======\n";
     optimizer.initializeOptimization();
     optimizer.computeActiveErrors();
@@ -1929,6 +1836,8 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     
     cout << "\n====== ESSENTIAL GRAPH OPTIMIZATION COMPLETE ======\n";
 }
+
+
 
 void Optimizer::OptimizeEssentialGraph(KeyFrame* pCurKF, vector<KeyFrame*> &vpFixedKFs, vector<KeyFrame*> &vpFixedCorrectedKFs,
                                        vector<KeyFrame*> &vpNonFixedKFs, vector<MapPoint*> &vpNonCorrectedMPs)
