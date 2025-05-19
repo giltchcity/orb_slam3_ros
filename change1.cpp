@@ -16,7 +16,6 @@
 #include <Eigen/Geometry>
 
 // SE3 李代数参数化 - 模仿 ORB-SLAM3 的 VertexSim3Expmap 
-// 但固定尺度为1，使用SE3李代数 [rho(3), phi(3)]
 // SE3 李代数参数化 - 基于g2o的Sim3实现，但固定尺度为1
 class SE3Parameterization : public ceres::Manifold {
 public:
