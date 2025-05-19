@@ -954,10 +954,87 @@ public:
     }
 
     void AddNormalEdgeConstraints() {
-        std::cout << "\n开始添加正常边约束（生成树 + 回环边 + 共视）..." << std::endl;
+        std::cout << "\n开始添加正常边约束（生成树）..." << std::endl;
         
-      
+        // 信息矩阵（与回环约束相同）
+        Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
+        
+        int normal_edges_added = 0;
+        int skipped_edges = 0;
+        
+        // 遍历所有关键帧
+        for (const auto& kf_pair : data_.keyframes) {
+            int kf_id = kf_pair.first;
+            auto& kf = kf_pair.second;
+            
+            // 跳过坏的关键帧
+            if (kf->is_bad) continue;
+            
+            // 获取父关键帧ID
+            int parent_id = kf->parent_id;
+            
+            // 如果没有父关键帧，或者父关键帧就是自己，跳过
+            if (parent_id < 0 || parent_id == kf_id || 
+                data_.keyframes.find(parent_id) == data_.keyframes.end() || 
+                data_.keyframes[parent_id]->is_bad) {
+                skipped_edges++;
+                continue;
+            }
+            
+            // 验证不是自循环（冗余检查）
+            if (data_.keyframes[kf_id]->se3_state.data() == data_.keyframes[parent_id]->se3_state.data()) {
+                std::cout << "  警告：检测到自循环约束 KF" << kf_id << " -> Parent" << parent_id << std::endl;
+                skipped_edges++;
+                continue;
+            }
+            
+            // 获取当前关键帧的逆变换 Swi
+            Eigen::Matrix4d T_iw = Eigen::Matrix4d::Identity();
+            
+            if (data_.non_corrected_poses.find(kf_id) != data_.non_corrected_poses.end()) {
+                const auto& non_corrected_i = data_.non_corrected_poses[kf_id];
+                Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
+                T_i.block<3, 3>(0, 0) = non_corrected_i.quaternion.toRotationMatrix();
+                T_i.block<3, 1>(0, 3) = non_corrected_i.translation;
+                T_iw = T_i.inverse();
+            } else {
+                Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
+                T_i.block<3, 3>(0, 0) = kf->quaternion.toRotationMatrix();
+                T_i.block<3, 1>(0, 3) = kf->translation;
+                T_iw = T_i.inverse();
+            }
+            
+            // 获取父关键帧的变换 Sjw
+            Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
+            
+            if (data_.non_corrected_poses.find(parent_id) != data_.non_corrected_poses.end()) {
+                const auto& non_corrected_parent = data_.non_corrected_poses[parent_id];
+                T_j.block<3, 3>(0, 0) = non_corrected_parent.quaternion.toRotationMatrix();
+                T_j.block<3, 1>(0, 3) = non_corrected_parent.translation;
+            } else {
+                T_j.block<3, 3>(0, 0) = data_.keyframes[parent_id]->quaternion.toRotationMatrix();
+                T_j.block<3, 1>(0, 3) = data_.keyframes[parent_id]->translation;
+            }
+            
+            // 计算相对变换 Sji = Sjw * Swi
+            Eigen::Matrix4d T_ji = T_j * T_iw;
+            
+            // 添加约束
+            ceres::CostFunction* cost_function = SE3LoopConstraintCost::Create(T_ji, information);
+            problem_->AddResidualBlock(cost_function, nullptr, 
+                                      data_.keyframes[kf_id]->se3_state.data(),      // 子节点
+                                      data_.keyframes[parent_id]->se3_state.data()); // 父节点
+            
+            normal_edges_added++;
+            
+            if (normal_edges_added % 100 == 0) {
+                std::cout << "  已添加 " << normal_edges_added << " 条生成树边约束..." << std::endl;
+            }
+        }
+        
+        std::cout << "添加了 " << normal_edges_added << " 条生成树边约束，跳过了 " << skipped_edges << " 条无效边" << std::endl;
     }
+
     // 获取参数块信息
     void PrintProblemInfo() {
         std::cout << "\n优化问题信息:" << std::endl;
@@ -1369,7 +1446,7 @@ int main() {
     optimizer.AddLoopConstraints();
     
 
-    // 添加正常边约束（生成树 + 回环边 + 共视）
+    // 添加正常边约束（生成树）
     optimizer.AddNormalEdgeConstraints();
     
     // 打印问题信息
