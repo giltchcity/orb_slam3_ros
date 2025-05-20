@@ -1671,6 +1671,11 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     int attempted_normal = 0;
     validKFCount = 0; // 计数有效的关键帧
     
+    // 添加以下变量
+    int total_covis_edges_attempted = 0;
+    int total_covis_edges_added = 0;
+    std::map<int, int> kf_covis_count;  // 记录每个KF添加了多少条共视边
+    
     for(size_t i=0, iend=vpKFs.size(); i<iend; i++)
     {
         KeyFrame* pKF = vpKFs[i];
@@ -1743,10 +1748,120 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
                 std::cout << "    Rotation Quaternion: [" << Sji.rotation().coeffs().transpose() << "]" << std::endl;
             }
         }
+
+        // Covisibility graph edges
+        const vector<KeyFrame*> vpConnectedKFs = pKF->GetCovisiblesByWeight(minFeat);
+        int covisEdgesAttempted = 0;
+        int covisEdgesAdded = 0;
+        
+        for(vector<KeyFrame*>::const_iterator vit=vpConnectedKFs.begin(); vit!=vpConnectedKFs.end(); vit++)
+        {
+            KeyFrame* pKFn = *vit;
+            if(pKFn && pKFn!=pParentKF && !pKF->hasChild(pKFn) /*&& !sLoopEdges.count(pKFn)*/)
+            {
+                if(!pKFn->isBad() && pKFn->mnId<pKF->mnId)
+                {
+                    covisEdgesAttempted++;
+                    if(sInsertedEdges.count(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId))))
+                        continue;
+        
+                    g2o::Sim3 Snw;
+                    LoopClosing::KeyFrameAndPose::const_iterator itn = NonCorrectedSim3.find(pKFn);
+                    if(itn!=NonCorrectedSim3.end())
+                        Snw = itn->second;
+                    else
+                        Snw = vScw[pKFn->mnId];
+        
+                    g2o::Sim3 Sni = Snw * Swi;
+        
+                    g2o::EdgeSim3* en = new g2o::EdgeSim3();
+                    en->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFn->mnId)));
+                    en->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
+                    en->setMeasurement(Sni);
+                    en->information() = matLambda;
+                    optimizer.addEdge(en);
+                    covisEdgesAdded++;
+                    count_normal++;
+                    
+                    // Print detailed info for some covisibility edges
+                    // if(printDetailedInfo && covisEdgesAdded <= 3) // Limit to first 3 covis edges per printed KF
+                    // {
+                    //     std::cout << "  Added Covisibility Edge: KF" << nIDi << " -> KF" << pKFn->mnId 
+                    //               << " | Common Features: " << pKF->GetWeight(pKFn)
+                    //               << " | Translation: [" << Sni.translation().transpose() << "]" 
+                    //               << " | Scale: " << Sni.scale() << std::endl;
+                                  
+                    //     // Add more detailed information
+                    //     Eigen::Vector3d z_dir_i = Swi.rotation() * z_vec;
+                    //     Eigen::Vector3d z_dir_n = Snw.inverse().rotation() * z_vec;
+                        
+                    //     // Calculate relative rotation angle
+                    //     double angle = acos(z_dir_i.dot(z_dir_n) / (z_dir_i.norm() * z_dir_n.norm())) * 180.0 / M_PI;
+                        
+                    //     std::cout << "    Camera Direction KF" << nIDi << ": [" << z_dir_i.transpose() << "]" << std::endl;
+                    //     std::cout << "    Camera Direction KF" << pKFn->mnId << ": [" << z_dir_n.transpose() << "]" << std::endl;
+                    //     std::cout << "    Relative Camera Angle: " << angle << " degrees" << std::endl;
+                    //     std::cout << "    Rotation Quaternion: [" << Sni.rotation().coeffs().transpose() << "]" << std::endl;
+                    // }
+                }
+            }
+        }
+        
+        if(printDetailedInfo)
+        {
+            std::cout << "  Covisibility Edges: " << covisEdgesAdded << "/" << covisEdgesAttempted 
+                      << " added from " << vpConnectedKFs.size() << " connected KFs" << std::endl;
+        }
+        
+        // 更新共视边总计数
+        total_covis_edges_attempted += covisEdgesAttempted;
+        total_covis_edges_added += covisEdgesAdded;
+        attempted_normal += covisEdgesAttempted;
+        
+        // 记录该关键帧添加的共视边数量
+        if(covisEdgesAdded > 0) {
+            kf_covis_count[nIDi] = covisEdgesAdded;
+        }
+        
+
+        
     }
     
     std::cout << "\nSuccessful Normal Edges: " << count_normal << "/" << attempted_normal << std::endl;
     std::cout << "Total KeyFrames Processed: " << validKFCount << "/" << vpKFs.size() << std::endl;
+
+    // 计算生成树边的数量（通常是节点数-1）
+    int tree_edges = count_normal - total_covis_edges_added;
+    
+    std::cout << "\n=== Covisibility Edges Summary ===" << std::endl;
+    std::cout << "Total Covisibility Edges: " << total_covis_edges_added << "/" << total_covis_edges_attempted << " added" << std::endl;
+    
+    // 找出添加共视边最多的10个关键帧
+    std::vector<std::pair<int, int>> kf_covis_vec(kf_covis_count.begin(), kf_covis_count.end());
+    std::sort(kf_covis_vec.begin(), kf_covis_vec.end(), 
+            [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                return a.second > b.second; // 降序排列
+            });
+    
+    int topK = std::min(10, (int)kf_covis_vec.size());
+    std::cout << "\nTop " << topK << " KeyFrames with Most Covisibility Edges:" << std::endl;
+    for(int i = 0; i < topK; i++) {
+        std::cout << "  KF" << kf_covis_vec[i].first << ": " << kf_covis_vec[i].second << " edges" << std::endl;
+    }
+    
+    // 计算平均每个关键帧的共视边数量
+    if(!kf_covis_count.empty()) {
+        double avg_edges = (double)total_covis_edges_added / kf_covis_count.size();
+        std::cout << "\nAverage Covisibility Edges per KeyFrame: " << avg_edges << std::endl;
+        std::cout << "KeyFrames with Covisibility Edges: " << kf_covis_count.size() 
+                  << " (" << (double)kf_covis_count.size() / validKFCount * 100.0 << "% of valid KFs)" << std::endl;
+    }
+    
+    // 各类边的比较
+    std::cout << "\nEdge Type Comparison:" << std::endl;
+    std::cout << "  Spanning Tree Edges: " << tree_edges << std::endl;
+    std::cout << "  Covisibility Edges: " << total_covis_edges_added << std::endl;
+    std::cout << "  Total Edges: " << (tree_edges + total_covis_edges_added + count_loop) << std::endl;
     
     // Initialize optimization
     std::cout << "\n=== Starting Optimization ===" << std::endl;
