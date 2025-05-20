@@ -1518,19 +1518,10 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     solver->setUserLambdaInit(1e-16);
     optimizer.setAlgorithm(solver);
 
-    // Print optimizer information
-    std::cout << "=== OptimizeEssentialGraph Initialization ===" << std::endl;
-    std::cout << "Lambda Init: " << 1e-16 << std::endl;
-    std::cout << "Algorithm: OptimizationAlgorithmLevenberg" << std::endl;
-    
     const vector<KeyFrame*> vpKFs = pMap->GetAllKeyFrames();
     const vector<MapPoint*> vpMPs = pMap->GetAllMapPoints();
 
-    std::cout << "Total KeyFrames: " << vpKFs.size() << std::endl;
-    std::cout << "Total MapPoints: " << vpMPs.size() << std::endl;
-
     const unsigned int nMaxKFid = pMap->GetMaxKFid();
-    std::cout << "Max KeyFrame ID: " << nMaxKFid << std::endl;
 
     vector<g2o::Sim3,Eigen::aligned_allocator<g2o::Sim3> > vScw(nMaxKFid+1);
     vector<g2o::Sim3,Eigen::aligned_allocator<g2o::Sim3> > vCorrectedSwc(nMaxKFid+1);
@@ -1541,40 +1532,23 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     z_vec << 0.0, 0.0, 1.0;
 
     const int minFeat = 100;
-    std::cout << "Minimum features for edge connection: " << minFeat << std::endl;
 
     // Set KeyFrame vertices
-    std::cout << "\n=== Adding KeyFrame Vertices ===" << std::endl;
-    int validKFCount = 0;
-    int batchCounter = 0;
-    std::cout << "Batch #1:" << std::endl;
-    
     for(size_t i=0, iend=vpKFs.size(); i<iend;i++)
     {
         KeyFrame* pKF = vpKFs[i];
         if(pKF->isBad())
             continue;
-        
-        validKFCount++;
-        batchCounter++;
-        
-        // Print batches of 20 KeyFrames
-        if(batchCounter > 20) {
-            batchCounter = 1;
-        }
-        
         g2o::VertexSim3Expmap* VSim3 = new g2o::VertexSim3Expmap();
 
         const int nIDi = pKF->mnId;
 
         LoopClosing::KeyFrameAndPose::const_iterator it = CorrectedSim3.find(pKF);
 
-        bool useCorrectedSim3 = false;
         if(it!=CorrectedSim3.end())
         {
             vScw[nIDi] = it->second;
             VSim3->setEstimate(it->second);
-            useCorrectedSim3 = true;
         }
         else
         {
@@ -1584,8 +1558,7 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
             VSim3->setEstimate(Siw);
         }
 
-        bool isFixed = (pKF->mnId==pMap->GetInitKFid());
-        if(isFixed)
+        if(pKF->mnId==pMap->GetInitKFid())
             VSim3->setFixed(true);
 
         VSim3->setId(nIDi);
@@ -1596,28 +1569,15 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         vZvectors[nIDi]=vScw[nIDi].rotation()*z_vec; // For debugging
 
         vpVertices[nIDi]=VSim3;
-        
-        // Print KeyFrame information
-        std::cout << "  KF" << nIDi << ": " 
-                  << (useCorrectedSim3 ? "CorrectedSim3" : "Regular") 
-                  << (isFixed ? " (FIXED)" : "") 
-                  << " Scale: " << (bFixScale ? "Fixed" : "Variable")
-                  << " Trans: [" << vScw[nIDi].translation().transpose() << "]" 
-                  << std::endl;
     }
 
-    std::cout << "\nValid KeyFrames added: " << validKFCount << "/" << vpKFs.size() << std::endl;
 
     set<pair<long unsigned int,long unsigned int> > sInsertedEdges;
 
     const Eigen::Matrix<double,7,7> matLambda = Eigen::Matrix<double,7,7>::Identity();
-    std::cout << "\n=== Information Matrix ===" << std::endl;
-    std::cout << matLambda << std::endl;
 
     // Set Loop edges
-    std::cout << "\n=== Adding Loop Edges ===" << std::endl;
     int count_loop = 0;
-    int attempted_loop = 0;
     for(map<KeyFrame *, set<KeyFrame *> >::const_iterator mit = LoopConnections.begin(), mend=LoopConnections.end(); mit!=mend; mit++)
     {
         KeyFrame* pKF = mit->first;
@@ -1626,17 +1586,10 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         const g2o::Sim3 Siw = vScw[nIDi];
         const g2o::Sim3 Swi = Siw.inverse();
 
-        std::cout << "KF" << nIDi << " connections: " << spConnections.size() << std::endl;
-
         for(set<KeyFrame*>::const_iterator sit=spConnections.begin(), send=spConnections.end(); sit!=send; sit++)
         {
             const long unsigned int nIDj = (*sit)->mnId;
-            attempted_loop++;
-            
-            // Check if this edge should be added
-            bool skipEdge = ((nIDi!=pCurKF->mnId || nIDj!=pLoopKF->mnId) && pKF->GetWeight(*sit)<minFeat);
-            
-            if(skipEdge)
+            if((nIDi!=pCurKF->mnId || nIDj!=pLoopKF->mnId) && pKF->GetWeight(*sit)<minFeat)
                 continue;
 
             const g2o::Sim3 Sjw = vScw[nIDj];
@@ -1652,50 +1605,27 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
             optimizer.addEdge(e);
             count_loop++;
             sInsertedEdges.insert(make_pair(min(nIDi,nIDj),max(nIDi,nIDj)));
-            
-            // Print successful edge information
-            std::cout << "  Added Loop Edge: KF" << nIDi << " -> KF" << nIDj 
-                      << " | Weight: " << pKF->GetWeight(*sit)
-                      << " | Translation: [" << Sji.translation().transpose() << "]" 
-                      << " | Scale: " << Sji.scale()
-                      << std::endl;
         }
     }
 
-    std::cout << "\nSuccessful Loop Edges: " << count_loop << "/" << attempted_loop << std::endl;
-    std::cout << "Unique Edge Pairs: " << sInsertedEdges.size() << std::endl;
-
     // Set normal edges
-    std::cout << "\n=== Adding Normal Edges ===" << std::endl;
-    int count_normal = 0;
-    int attempted_normal = 0;
-    validKFCount = 0; // 计数有效的关键帧
+    // 在 "Set normal edges" 循环之前添加计数器
+    int count_covis = 0;  // 添加到图中的共视边计数
+    int count_all_valid_covis = 0;  // 所有合格的共视关系（包括未添加的）
+    vector<int> covis_per_kf(nMaxKFid+1, 0);  // 每个关键帧的共视边数量
+    map<int, vector<pair<int, int>>> covis_weights;  // 存储共视关系的权重 <KF_ID, vector<neighbor_ID, weight>>
     
-    // 添加以下变量
-    int total_covis_edges_attempted = 0;
-    int total_covis_edges_added = 0;
-    std::map<int, int> kf_covis_count;  // 记录每个KF添加了多少条共视边
-    
+    // Set normal edges
     for(size_t i=0, iend=vpKFs.size(); i<iend; i++)
     {
         KeyFrame* pKF = vpKFs[i];
     
-        if(pKF->isBad())
-            continue;
-    
-        validKFCount++; // 增加有效KF计数
         const int nIDi = pKF->mnId;
-        
-        // 只有当处理到第20个、第40个、第60个等有效KF时才打印详细信息
-        bool printDetailedInfo = (validKFCount % 20 == 0);
-        
-        if(printDetailedInfo) {
-            std::cout << "Processing KF " << validKFCount << "/" << vpKFs.size() 
-                      << " (KF" << nIDi << ")" << std::endl;
-        }
     
         g2o::Sim3 Swi;
+    
         LoopClosing::KeyFrameAndPose::const_iterator iti = NonCorrectedSim3.find(pKF);
+    
         if(iti!=NonCorrectedSim3.end())
             Swi = (iti->second).inverse();
         else
@@ -1706,11 +1636,12 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         // Spanning tree edge
         if(pParentKF)
         {
-            attempted_normal++;
             int nIDj = pParentKF->mnId;
     
             g2o::Sim3 Sjw;
+    
             LoopClosing::KeyFrameAndPose::const_iterator itj = NonCorrectedSim3.find(pParentKF);
+    
             if(itj!=NonCorrectedSim3.end())
                 Sjw = itj->second;
             else
@@ -1724,187 +1655,95 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
             e->setMeasurement(Sji);
             e->information() = matLambda;
             optimizer.addEdge(e);
-            count_normal++;
-            
-            // 只有当应该打印详细信息时才打印
-            if(printDetailedInfo)
-            {
-                std::cout << "  Added Spanning Tree Edge: KF" << nIDi << " -> KF" << nIDj 
-                          << " | Translation: [" << Sji.translation().transpose() << "]" 
-                          << " | Scale: " << Sji.scale() << std::endl;
-                          
-                // 添加更多详细信息
-                Eigen::Vector3d z_vec;
-                z_vec << 0.0, 0.0, 1.0;
-                Eigen::Vector3d z_dir_i = Swi.rotation() * z_vec;
-                Eigen::Vector3d z_dir_j = Sjw.inverse().rotation() * z_vec;
-                
-                // 计算相对旋转角度
-                double angle = acos(z_dir_i.dot(z_dir_j) / (z_dir_i.norm() * z_dir_j.norm())) * 180.0 / M_PI;
-                
-                std::cout << "    Camera Direction KF" << nIDi << ": [" << z_dir_i.transpose() << "]" << std::endl;
-                std::cout << "    Camera Direction KF" << nIDj << ": [" << z_dir_j.transpose() << "]" << std::endl;
-                std::cout << "    Relative Camera Angle: " << angle << " degrees" << std::endl;
-                std::cout << "    Rotation Quaternion: [" << Sji.rotation().coeffs().transpose() << "]" << std::endl;
-            }
         }
-
+    
         // Covisibility graph edges
         const vector<KeyFrame*> vpConnectedKFs = pKF->GetCovisiblesByWeight(minFeat);
-        int covisEdgesAttempted = 0;
-        int covisEdgesAdded = 0;
-        
         for(vector<KeyFrame*>::const_iterator vit=vpConnectedKFs.begin(); vit!=vpConnectedKFs.end(); vit++)
         {
             KeyFrame* pKFn = *vit;
             if(pKFn && pKFn!=pParentKF && !pKF->hasChild(pKFn) /*&& !sLoopEdges.count(pKFn)*/)
             {
+                // 统计所有合格的共视关系
+                count_all_valid_covis++;
+                
+                // 存储共视权重信息
+                int weight = pKF->GetWeight(pKFn);
+                covis_weights[nIDi].push_back(make_pair(pKFn->mnId, weight));
+                
                 if(!pKFn->isBad() && pKFn->mnId<pKF->mnId)
                 {
-                    covisEdgesAttempted++;
                     if(sInsertedEdges.count(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId))))
                         continue;
-        
+    
                     g2o::Sim3 Snw;
+    
                     LoopClosing::KeyFrameAndPose::const_iterator itn = NonCorrectedSim3.find(pKFn);
+    
                     if(itn!=NonCorrectedSim3.end())
                         Snw = itn->second;
                     else
                         Snw = vScw[pKFn->mnId];
-        
+    
                     g2o::Sim3 Sni = Snw * Swi;
-        
+    
                     g2o::EdgeSim3* en = new g2o::EdgeSim3();
                     en->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFn->mnId)));
                     en->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
                     en->setMeasurement(Sni);
                     en->information() = matLambda;
                     optimizer.addEdge(en);
-                    covisEdgesAdded++;
-                    count_normal++;
                     
-                    // Print detailed info for some covisibility edges
-                    // if(printDetailedInfo && covisEdgesAdded <= 3) // Limit to first 3 covis edges per printed KF
-                    // {
-                    //     std::cout << "  Added Covisibility Edge: KF" << nIDi << " -> KF" << pKFn->mnId 
-                    //               << " | Common Features: " << pKF->GetWeight(pKFn)
-                    //               << " | Translation: [" << Sni.translation().transpose() << "]" 
-                    //               << " | Scale: " << Sni.scale() << std::endl;
-                                  
-                    //     // Add more detailed information
-                    //     Eigen::Vector3d z_dir_i = Swi.rotation() * z_vec;
-                    //     Eigen::Vector3d z_dir_n = Snw.inverse().rotation() * z_vec;
-                        
-                    //     // Calculate relative rotation angle
-                    //     double angle = acos(z_dir_i.dot(z_dir_n) / (z_dir_i.norm() * z_dir_n.norm())) * 180.0 / M_PI;
-                        
-                    //     std::cout << "    Camera Direction KF" << nIDi << ": [" << z_dir_i.transpose() << "]" << std::endl;
-                    //     std::cout << "    Camera Direction KF" << pKFn->mnId << ": [" << z_dir_n.transpose() << "]" << std::endl;
-                    //     std::cout << "    Relative Camera Angle: " << angle << " degrees" << std::endl;
-                    //     std::cout << "    Rotation Quaternion: [" << Sni.rotation().coeffs().transpose() << "]" << std::endl;
-                    // }
+                    // 增加添加到图中的共视边计数
+                    count_covis++;
+                    covis_per_kf[nIDi]++;
+                    covis_per_kf[pKFn->mnId]++;
+    
+                    sInsertedEdges.insert(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId)));
                 }
             }
         }
-        
-        if(printDetailedInfo)
-        {
-            std::cout << "  Covisibility Edges: " << covisEdgesAdded << "/" << covisEdgesAttempted 
-                      << " added from " << vpConnectedKFs.size() << " connected KFs" << std::endl;
+    }
+    
+    // 按ID间隔统计关键帧共视关系
+    cout << "按ID分组的关键帧共视关系统计:" << endl;
+    for(int id = 0; id <= nMaxKFid; id += 20) {
+        // 检查是否存在该ID的关键帧
+        bool found = false;
+        for(size_t i=0; i<vpKFs.size(); i++) {
+            if(vpKFs[i]->mnId == id && !vpKFs[i]->isBad()) {
+                found = true;
+                break;
+            }
         }
         
-        // 更新共视边总计数
-        total_covis_edges_attempted += covisEdgesAttempted;
-        total_covis_edges_added += covisEdgesAdded;
-        attempted_normal += covisEdgesAttempted;
-        
-        // 记录该关键帧添加的共视边数量
-        if(covisEdgesAdded > 0) {
-            kf_covis_count[nIDi] = covisEdgesAdded;
+        if(found) {
+            cout << "KF ID " << id << ": 添加到图的共视边数量 = " << covis_per_kf[id] << endl;
+            
+            // 输出该关键帧的所有合格共视关系和权重
+            if(covis_weights.find(id) != covis_weights.end()) {
+                cout << "  所有合格共视关系 (ID, 权重):" << endl;
+                for(const auto& pair : covis_weights[id]) {
+                    cout << "  -> KF " << pair.first << ", 权重: " << pair.second << endl;
+                }
+                cout << "  合格共视关系总数: " << covis_weights[id].size() << endl;
+            } else {
+                cout << "  没有合格的共视关系" << endl;
+            }
         }
-        
+    }
+    
+    // 在循环结束后添加最终总结
+    cout << "总共添加到图中的共视边数量: " << count_covis << endl;
+    cout << "所有合格的共视关系总数(包括未添加到图中的): " << count_all_valid_covis << endl;
 
-        
-    }
-    
-    std::cout << "\nSuccessful Normal Edges: " << count_normal << "/" << attempted_normal << std::endl;
-    std::cout << "Total KeyFrames Processed: " << validKFCount << "/" << vpKFs.size() << std::endl;
 
-    // 计算生成树边的数量（通常是节点数-1）
-    int tree_edges = count_normal - total_covis_edges_added;
-    
-    std::cout << "\n=== Covisibility Edges Summary ===" << std::endl;
-    std::cout << "Total Covisibility Edges: " << total_covis_edges_added << "/" << total_covis_edges_attempted << " added" << std::endl;
-    
-    // 找出添加共视边最多的10个关键帧
-    std::vector<std::pair<int, int>> kf_covis_vec(kf_covis_count.begin(), kf_covis_count.end());
-    std::sort(kf_covis_vec.begin(), kf_covis_vec.end(), 
-            [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                return a.second > b.second; // 降序排列
-            });
-    
-    int topK = std::min(10, (int)kf_covis_vec.size());
-    std::cout << "\nTop " << topK << " KeyFrames with Most Covisibility Edges:" << std::endl;
-    for(int i = 0; i < topK; i++) {
-        std::cout << "  KF" << kf_covis_vec[i].first << ": " << kf_covis_vec[i].second << " edges" << std::endl;
-    }
-    
-    // 计算平均每个关键帧的共视边数量
-    if(!kf_covis_count.empty()) {
-        double avg_edges = (double)total_covis_edges_added / kf_covis_count.size();
-        std::cout << "\nAverage Covisibility Edges per KeyFrame: " << avg_edges << std::endl;
-        std::cout << "KeyFrames with Covisibility Edges: " << kf_covis_count.size() 
-                  << " (" << (double)kf_covis_count.size() / validKFCount * 100.0 << "% of valid KFs)" << std::endl;
-    }
-    
-    // 各类边的比较
-    std::cout << "\nEdge Type Comparison:" << std::endl;
-    std::cout << "  Spanning Tree Edges: " << tree_edges << std::endl;
-    std::cout << "  Covisibility Edges: " << total_covis_edges_added << std::endl;
-    std::cout << "  Total Edges: " << (tree_edges + total_covis_edges_added + count_loop) << std::endl;
-    
-    // Initialize optimization
-    std::cout << "\n=== Starting Optimization ===" << std::endl;
     optimizer.initializeOptimization();
     optimizer.computeActiveErrors();
-    double initialChi2 = optimizer.activeRobustChi2();
-    int initialEdges = optimizer.activeEdges().size();
-    std::cout << "Initial Active Edges: " << initialEdges << std::endl;
-    std::cout << "Initial Chi2: " << initialChi2 << std::endl;
-    
-    // Add this line to declare previousChi2
-    double previousChi2 = initialChi2;
-    
-    // Perform optimization with detailed iteration output
-    std::cout << "\n=== Optimization Progress ===" << std::endl;
-    for(int i=0; i<20; i++) {
-        optimizer.optimize(1);  // Single iteration
-        double currentChi2 = optimizer.activeRobustChi2();
-        int currentEdges = optimizer.activeEdges().size();
-        double improvement = (i==0) ? (initialChi2 - currentChi2) : (previousChi2 - currentChi2);
-        double percentImprovement = (i==0) ? (improvement/initialChi2*100.0) : (improvement/previousChi2*100.0);
-        
-        std::cout << "Iteration " << i+1 << ": "
-                  << "Chi2=" << currentChi2 
-                  << " | Active Edges=" << currentEdges
-                  << " | Improvement=" << improvement
-                  << " (" << percentImprovement << "%)"
-                  << std::endl;
-        
-        previousChi2 = currentChi2;
-    }
-    
-    // Compute final errors
+    optimizer.optimize(20);
     optimizer.computeActiveErrors();
-    double finalChi2 = optimizer.activeRobustChi2();
-    std::cout << "\n=== Optimization Complete ===" << std::endl;
-    std::cout << "Final Chi2: " << finalChi2 << std::endl;
-    std::cout << "Overall Improvement: " << initialChi2 - finalChi2 
-              << " (" << (initialChi2 - finalChi2)/initialChi2*100.0 << "%)" << std::endl;
-    
     unique_lock<mutex> lock(pMap->mMutexMapUpdate);
 
-    std::cout << "\n=== Recovering Poses ===" << std::endl;
     // SE3 Pose Recovering. Sim3:[sR t;0 1] -> SE3:[R t/s;0 1]
     for(size_t i=0;i<vpKFs.size();i++)
     {
@@ -1919,17 +1758,8 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
 
         Sophus::SE3f Tiw(CorrectedSiw.rotation().cast<float>(), CorrectedSiw.translation().cast<float>() / s);
         pKFi->SetPose(Tiw);
-        
-        // Print some corrected poses (only first 5 and last 5)
-        if(i < 5 || i >= vpKFs.size()-5) {
-            std::cout << "  KF" << nIDi << " Corrected Scale: " << s 
-                      << " | Translation: [" << CorrectedSiw.translation().transpose() << "]" 
-                      << std::endl;
-        }
     }
 
-    std::cout << "\n=== Correcting Map Points ===" << std::endl;
-    int correctedMP = 0;
     // Correct points. Transform to "non-optimized" reference keyframe pose and transform back with optimized pose
     for(size_t i=0, iend=vpMPs.size(); i<iend; i++)
     {
@@ -1938,7 +1768,6 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         if(pMP->isBad())
             continue;
 
-        correctedMP++;
         int nIDr;
         if(pMP->mnCorrectedByKF==pCurKF->mnId)
         {
@@ -1950,6 +1779,7 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
             nIDr = pRefKF->mnId;
         }
 
+
         g2o::Sim3 Srw = vScw[nIDr];
         g2o::Sim3 correctedSwr = vCorrectedSwc[nIDr];
 
@@ -1958,16 +1788,11 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         pMP->SetWorldPos(eigCorrectedP3Dw.cast<float>());
 
         pMP->UpdateNormalAndDepth();
-        
     }
-    
+
     // TODO Check this changeindex
     pMap->IncreaseChangeIndex();
-    std::cout << "Map Change Index Increased" << std::endl;
-    std::cout << "=== Essential Graph Optimization Complete ===\n" << std::endl;
 }
-
-
 
 
 void Optimizer::OptimizeEssentialGraph(KeyFrame* pCurKF, vector<KeyFrame*> &vpFixedKFs, vector<KeyFrame*> &vpFixedCorrectedKFs,
