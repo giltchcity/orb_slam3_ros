@@ -1501,7 +1501,6 @@ void Optimizer::LocalBundleAdjustment(KeyFrame *pKF, bool* pbStopFlag, Map* pMap
 
 
 
-
 void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* pCurKF,
                                        const LoopClosing::KeyFrameAndPose &NonCorrectedSim3,
                                        const LoopClosing::KeyFrameAndPose &CorrectedSim3,
@@ -1614,6 +1613,28 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     int count_all_valid_covis = 0;  // 所有合格的共视关系（包括未添加的）
     vector<int> covis_per_kf(nMaxKFid+1, 0);  // 每个关键帧的共视边数量
     map<int, vector<pair<int, int>>> covis_weights;  // 存储共视关系的权重 <KF_ID, vector<neighbor_ID, weight>>
+
+    // 确定要特别详细调试的关键帧ID
+    std::set<int> detailed_debug_kf_ids;
+    detailed_debug_kf_ids.insert(pMap->GetInitKFid());  // 初始关键帧(通常是0)
+
+    // 添加初始关键帧后的3个关键帧
+    for(int i=1; i<=3; i++) {
+        detailed_debug_kf_ids.insert(pMap->GetInitKFid() + i);
+    }
+
+    // 添加最后3个关键帧
+    for(int i = std::max(0, (int)nMaxKFid - 2); i <= nMaxKFid; i++) {
+        detailed_debug_kf_ids.insert(i);
+    }
+
+    // 添加回环和当前关键帧
+    detailed_debug_kf_ids.insert(pLoopKF->mnId);
+    detailed_debug_kf_ids.insert(pCurKF->mnId);
+
+    std::cout << "\n=== 将特别详细跟踪以下关键帧：";
+    for(int id : detailed_debug_kf_ids) std::cout << " KF" << id;
+    std::cout << " ===" << std::endl;
     
     // Set normal edges
     for(size_t i=0, iend=vpKFs.size(); i<iend; i++)
@@ -1632,6 +1653,12 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
             Swi = vScw[nIDi].inverse();
     
         KeyFrame* pParentKF = pKF->GetParent();
+
+        // 为特定关键帧添加详细调试
+        bool is_detailed_debug = detailed_debug_kf_ids.count(nIDi) > 0;
+        
+        // 每20个关键帧或特定关键帧打印详细信息
+        bool print_detailed = is_detailed_debug || (nIDi % 20 == 0);
     
         // Spanning tree edge
         if(pParentKF)
@@ -1658,10 +1685,61 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
         }
     
         // Covisibility graph edges
+        if(print_detailed) {
+            std::cout << "\n=== 处理KF" << nIDi << "的共视关系 ===" << std::endl;
+            
+            // 打印父关键帧
+            int parent_id = pParentKF ? pParentKF->mnId : -1;
+            std::cout << "父关键帧: " << parent_id << std::endl;
+            
+            // 打印子关键帧
+            std::cout << "子关键帧: ";
+            const std::set<KeyFrame*>& children = pKF->GetChilds();
+            for(KeyFrame* child : children) {
+                std::cout << child->mnId << " ";
+            }
+            std::cout << std::endl;
+            
+            // 打印回环边
+            std::cout << "回环边: ";
+            const std::set<KeyFrame*>& loops = pKF->GetLoopEdges();
+            for(KeyFrame* loop : loops) {
+                std::cout << loop->mnId << " ";
+            }
+            std::cout << std::endl;
+        }
+
         const vector<KeyFrame*> vpConnectedKFs = pKF->GetCovisiblesByWeight(minFeat);
+
+        if(print_detailed) {
+            std::cout << "获取到共视关键帧(权重>=" << minFeat << "): " << vpConnectedKFs.size() << "个" << std::endl;
+            
+            // 简化为只输出基本信息
+            if(is_detailed_debug) {
+                std::cout << "详细共视关系:" << std::endl;
+                
+                // 只打印已经获取到的共视关键帧
+                for(size_t j=0; j<vpConnectedKFs.size(); j++) {
+                    KeyFrame* pKFn = vpConnectedKFs[j];
+                    int weight = pKF->GetWeight(pKFn);
+                    std::cout << "  KF" << pKFn->mnId << ", 权重:" << weight << std::endl;
+                }
+            }
+        }
+        
         for(vector<KeyFrame*>::const_iterator vit=vpConnectedKFs.begin(); vit!=vpConnectedKFs.end(); vit++)
         {
             KeyFrame* pKFn = *vit;
+            if(!pKFn) continue;
+            
+            // 检查是否是要调试的共视关系
+            bool is_debug_edge = print_detailed || detailed_debug_kf_ids.count(pKFn->mnId) > 0;
+            
+            if(is_debug_edge) {
+                std::cout << "\n  检查边KF" << nIDi << " <-> KF" << pKFn->mnId << ":" << std::endl;
+                std::cout << "    权重: " << pKF->GetWeight(pKFn) << std::endl;
+            }
+            
             if(pKFn && pKFn!=pParentKF && !pKF->hasChild(pKFn) /*&& !sLoopEdges.count(pKFn)*/)
             {
                 // 统计所有合格的共视关系
@@ -1671,42 +1749,97 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
                 int weight = pKF->GetWeight(pKFn);
                 covis_weights[nIDi].push_back(make_pair(pKFn->mnId, weight));
                 
+                if(is_debug_edge) {
+                    std::cout << "    非父关键帧: " << (pKFn != pParentKF ? "是" : "否") << std::endl;
+                    std::cout << "    非子关键帧: " << (!pKF->hasChild(pKFn) ? "是" : "否") << std::endl;
+                    std::cout << "    非回环边: " 
+                              << (!pKF->GetLoopEdges().count(pKFn) ? "是" : "否(但被注释)") << std::endl;
+                }
+                
                 if(!pKFn->isBad() && pKFn->mnId<pKF->mnId)
                 {
-                    if(sInsertedEdges.count(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId))))
-                        continue;
-    
-                    g2o::Sim3 Snw;
-    
-                    LoopClosing::KeyFrameAndPose::const_iterator itn = NonCorrectedSim3.find(pKFn);
-    
-                    if(itn!=NonCorrectedSim3.end())
-                        Snw = itn->second;
-                    else
-                        Snw = vScw[pKFn->mnId];
-    
-                    g2o::Sim3 Sni = Snw * Swi;
-    
-                    g2o::EdgeSim3* en = new g2o::EdgeSim3();
-                    en->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFn->mnId)));
-                    en->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
-                    en->setMeasurement(Sni);
-                    en->information() = matLambda;
-                    optimizer.addEdge(en);
+                    if(is_debug_edge) {
+                        std::cout << "    非坏关键帧: " << (!pKFn->isBad() ? "是" : "否") << std::endl;
+                        std::cout << "    ID比较(pKFn->mnId < pKF->mnId): " 
+                                  << (pKFn->mnId < pKF->mnId ? "通过" : "不通过") << std::endl;
+                    }
                     
-                    // 增加添加到图中的共视边计数
-                    count_covis++;
-                    covis_per_kf[nIDi]++;
-                    covis_per_kf[pKFn->mnId]++;
-    
-                    sInsertedEdges.insert(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId)));
+                    // 检查是否已经添加过
+                    bool already_inserted = sInsertedEdges.count(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId)));
+                    
+                    if(is_debug_edge) {
+                        std::cout << "    边是否已存在: " << (already_inserted ? "是" : "否") << std::endl;
+                    }
+                    
+                    if(!already_inserted)
+                    {
+                        if(is_debug_edge) {
+                            std::cout << "    --> 添加边KF" << nIDi << " <-> KF" << pKFn->mnId << std::endl;
+                        }
+                        
+                        g2o::Sim3 Snw;
+            
+                        LoopClosing::KeyFrameAndPose::const_iterator itn = NonCorrectedSim3.find(pKFn);
+            
+                        if(itn!=NonCorrectedSim3.end())
+                            Snw = itn->second;
+                        else
+                            Snw = vScw[pKFn->mnId];
+            
+                        g2o::Sim3 Sni = Snw * Swi;
+            
+                        g2o::EdgeSim3* en = new g2o::EdgeSim3();
+                        en->setVertex(1, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(pKFn->mnId)));
+                        en->setVertex(0, dynamic_cast<g2o::OptimizableGraph::Vertex*>(optimizer.vertex(nIDi)));
+                        en->setMeasurement(Sni);
+                        en->information() = matLambda;
+                        optimizer.addEdge(en);
+                        
+                        // 增加添加到图中的共视边计数
+                        count_covis++;
+                        covis_per_kf[nIDi]++;
+                        covis_per_kf[pKFn->mnId]++;
+                        
+                        if(is_debug_edge) {
+                            std::cout << "    KF" << nIDi << "边数增至: " << covis_per_kf[nIDi] << std::endl;
+                            std::cout << "    KF" << pKFn->mnId << "边数增至: " << covis_per_kf[pKFn->mnId] << std::endl;
+                        }
+            
+                        sInsertedEdges.insert(make_pair(min(pKF->mnId,pKFn->mnId),max(pKF->mnId,pKFn->mnId)));
+                    }
                 }
             }
         }
     }
     
+    // 在共视边处理完成后添加详细统计
+    std::cout << "\n=== 特殊关键帧共视边统计 ===" << std::endl;
+
+    for(int debug_id : detailed_debug_kf_ids) {
+        if(debug_id <= nMaxKFid) {
+            std::cout << "KF" << debug_id << ": " << covis_per_kf[debug_id] << " 条共视边" << std::endl;
+            
+            // 打印该关键帧的所有共视关系
+            if(covis_weights.find(debug_id) != covis_weights.end()) {
+                std::cout << "  所有合格共视关系: ";
+                
+                // 先按权重排序
+                std::vector<std::pair<int, int>> sorted_weights = covis_weights[debug_id];
+                std::sort(sorted_weights.begin(), sorted_weights.end(), 
+                         [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                             return a.second > b.second;
+                         });
+                
+                for(const auto& pair : sorted_weights) {
+                    std::cout << "KF" << pair.first << "(" << pair.second << ") ";
+                }
+                std::cout << std::endl;
+            }
+        }
+    }
+    
     // 按ID间隔统计关键帧共视关系
-    cout << "按ID分组的关键帧共视关系统计:" << endl;
+    cout << "\n按ID分组的关键帧共视关系统计:" << endl;
     for(int id = 0; id <= nMaxKFid; id += 20) {
         // 检查是否存在该ID的关键帧
         bool found = false;
@@ -1736,7 +1869,6 @@ void Optimizer::OptimizeEssentialGraph(Map* pMap, KeyFrame* pLoopKF, KeyFrame* p
     // 在循环结束后添加最终总结
     cout << "总共添加到图中的共视边数量: " << count_covis << endl;
     cout << "所有合格的共视关系总数(包括未添加到图中的): " << count_all_valid_covis << endl;
-
 
     optimizer.initializeOptimization();
     optimizer.computeActiveErrors();
