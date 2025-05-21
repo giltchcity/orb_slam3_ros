@@ -1265,11 +1265,6 @@ public:
             
             normal_edges_added++;
             
-            // 记录已添加的边对，避免重复
-            // sInsertedEdges.insert(std::make_pair(
-            //     std::min((long unsigned int)kf_id, (long unsigned int)parent_id),
-            //     std::max((long unsigned int)kf_id, (long unsigned int)parent_id)
-            // ));
             
             // 打印详细信息
             if(printDetailedInfo) {
@@ -1305,53 +1300,7 @@ public:
         // 第二阶段：添加共视图边
          std::cout << "\n=== Adding Covisibility Graph Edges ===" << std::endl;
         
-        // 添加KF 0特殊关系检查
-        std::cout << "检查KF 0的特殊关系:" << std::endl;
-        // 检查KF 0与KF 3的关系
-        if (data_.keyframes.find(0) != data_.keyframes.end() && 
-            data_.keyframes.find(3) != data_.keyframes.end()) {
-            bool is_parent = data_.keyframes[3]->parent_id == 0;
-            bool is_child = false;
-            if (data_.spanning_tree.find(0) != data_.spanning_tree.end()) {
-                is_child = std::find(data_.spanning_tree[0].begin(), data_.spanning_tree[0].end(), 3) != data_.spanning_tree[0].end();
-            }
-            bool is_loop_edge = false;
-            if (data_.loop_edges.find(0) != data_.loop_edges.end()) {
-                is_loop_edge = data_.loop_edges[0].find(3) != data_.loop_edges[0].end();
-            }
-            int weight = 0;
-            if (data_.covisibility.find(0) != data_.covisibility.end() && 
-                data_.covisibility[0].find(3) != data_.covisibility[0].end()) {
-                weight = data_.covisibility[0][3];
-            }
-            std::cout << "KF 0 - KF 3: 父子关系=" << (is_parent || is_child ? "是" : "否")
-                      << ", 回环边=" << (is_loop_edge ? "是" : "否")
-                      << ", 权重=" << weight << std::endl;
-        }
-        // 检查KF 0与KF 461的关系
-        if (data_.keyframes.find(0) != data_.keyframes.end() && 
-            data_.keyframes.find(461) != data_.keyframes.end()) {
-            bool is_parent = data_.keyframes[461]->parent_id == 0;
-            bool is_child = false;
-            if (data_.spanning_tree.find(0) != data_.spanning_tree.end()) {
-                is_child = std::find(data_.spanning_tree[0].begin(), data_.spanning_tree[0].end(), 461) != data_.spanning_tree[0].end();
-            }
-            bool is_loop_edge = false;
-            if (data_.loop_edges.find(0) != data_.loop_edges.end()) {
-                is_loop_edge = data_.loop_edges[0].find(461) != data_.loop_edges[0].end();
-            }
-            int weight = 0;
-            if (data_.covisibility.find(0) != data_.covisibility.end() && 
-                data_.covisibility[0].find(461) != data_.covisibility[0].end()) {
-                weight = data_.covisibility[0][461];
-            }
-            std::cout << "KF 0 - KF 461: 父子关系=" << (is_parent || is_child ? "是" : "否")
-                      << ", 回环边=" << (is_loop_edge ? "是" : "否")
-                      << ", 权重=" << weight << std::endl;
-        }
-
-
-
+       
         
         const int minFeat = 100;  // 最小特征点阈值（与ORB-SLAM3一致）
         int count_covis = 0;      // 添加到图中的共视边计数
@@ -1440,11 +1389,6 @@ public:
                     isChild = std::find(children.begin(), children.end(), nIDj) != children.end();
                 }
                 
-                // 检查是否是回环边（从loop_edges判断）
-                bool isLoopEdge = false;
-                if (data_.loop_edges.find(nIDi) != data_.loop_edges.end()) {
-                    isLoopEdge = data_.loop_edges[nIDi].find(nIDj) != data_.loop_edges[nIDi].end();
-                }
 
                 // 在这里添加KF 0的调试代码
                 if (nIDi == 0 || nIDj == 0) {
