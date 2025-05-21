@@ -519,6 +519,9 @@ class ORBSlamLoopOptimizer {
 private:
     OptimizationData data_;
     std::unique_ptr<ceres::Problem> problem_;
+
+    // 添加这一行 - 确保两个函数间共享
+    std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
     
 public:
     ORBSlamLoopOptimizer() {
@@ -952,7 +955,7 @@ public:
         std::cout << "\n=== Adding Loop Edges ===" << std::endl;
         
         const int minFeat = 100; // 最小特征点数阈值
-        std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
+        // std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
         Eigen::Matrix<double, 6, 6> matLambda = Eigen::Matrix<double, 6, 6>::Identity();
         
         int count_loop = 0;
@@ -1141,7 +1144,7 @@ public:
         std::cout << information << std::endl;
         
         // 用于记录已添加的边（避免重复）
-        std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
+        // std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
         
         int normal_edges_added = 0;
         int attempted_normal = 0;
@@ -1263,10 +1266,10 @@ public:
             normal_edges_added++;
             
             // 记录已添加的边对，避免重复
-            sInsertedEdges.insert(std::make_pair(
-                std::min((long unsigned int)kf_id, (long unsigned int)parent_id),
-                std::max((long unsigned int)kf_id, (long unsigned int)parent_id)
-            ));
+            // sInsertedEdges.insert(std::make_pair(
+            //     std::min((long unsigned int)kf_id, (long unsigned int)parent_id),
+            //     std::max((long unsigned int)kf_id, (long unsigned int)parent_id)
+            // ));
             
             // 打印详细信息
             if(printDetailedInfo) {
@@ -1300,9 +1303,276 @@ public:
         std::cout << "\nSpanning Tree Edges Added: " << normal_edges_added << "/" << attempted_normal << std::endl;
         
         // 第二阶段：添加共视图边
+         std::cout << "\n=== Adding Covisibility Graph Edges ===" << std::endl;
         
+        // 添加KF 0特殊关系检查
+        std::cout << "检查KF 0的特殊关系:" << std::endl;
+        // 检查KF 0与KF 3的关系
+        if (data_.keyframes.find(0) != data_.keyframes.end() && 
+            data_.keyframes.find(3) != data_.keyframes.end()) {
+            bool is_parent = data_.keyframes[3]->parent_id == 0;
+            bool is_child = false;
+            if (data_.spanning_tree.find(0) != data_.spanning_tree.end()) {
+                is_child = std::find(data_.spanning_tree[0].begin(), data_.spanning_tree[0].end(), 3) != data_.spanning_tree[0].end();
+            }
+            bool is_loop_edge = false;
+            if (data_.loop_edges.find(0) != data_.loop_edges.end()) {
+                is_loop_edge = data_.loop_edges[0].find(3) != data_.loop_edges[0].end();
+            }
+            int weight = 0;
+            if (data_.covisibility.find(0) != data_.covisibility.end() && 
+                data_.covisibility[0].find(3) != data_.covisibility[0].end()) {
+                weight = data_.covisibility[0][3];
+            }
+            std::cout << "KF 0 - KF 3: 父子关系=" << (is_parent || is_child ? "是" : "否")
+                      << ", 回环边=" << (is_loop_edge ? "是" : "否")
+                      << ", 权重=" << weight << std::endl;
+        }
+        // 检查KF 0与KF 461的关系
+        if (data_.keyframes.find(0) != data_.keyframes.end() && 
+            data_.keyframes.find(461) != data_.keyframes.end()) {
+            bool is_parent = data_.keyframes[461]->parent_id == 0;
+            bool is_child = false;
+            if (data_.spanning_tree.find(0) != data_.spanning_tree.end()) {
+                is_child = std::find(data_.spanning_tree[0].begin(), data_.spanning_tree[0].end(), 461) != data_.spanning_tree[0].end();
+            }
+            bool is_loop_edge = false;
+            if (data_.loop_edges.find(0) != data_.loop_edges.end()) {
+                is_loop_edge = data_.loop_edges[0].find(461) != data_.loop_edges[0].end();
+            }
+            int weight = 0;
+            if (data_.covisibility.find(0) != data_.covisibility.end() && 
+                data_.covisibility[0].find(461) != data_.covisibility[0].end()) {
+                weight = data_.covisibility[0][461];
+            }
+            std::cout << "KF 0 - KF 461: 父子关系=" << (is_parent || is_child ? "是" : "否")
+                      << ", 回环边=" << (is_loop_edge ? "是" : "否")
+                      << ", 权重=" << weight << std::endl;
+        }
+
+
+
+        
+        const int minFeat = 100;  // 最小特征点阈值（与ORB-SLAM3一致）
+        int count_covis = 0;      // 添加到图中的共视边计数
+        int count_all_valid_covis = 0;  // 所有合格的共视关系（包括未添加的）
+        std::vector<int> covis_per_kf(data_.max_kf_id + 1, 0);  // 每个关键帧的共视边数量
+        std::map<int, std::vector<std::pair<int, int>>> covis_weights;  // 存储共视关系的权重
+        
+        std::cout << "Minimum features for covisibility edge: " << minFeat << std::endl;
+        
+        // 遍历所有关键帧
+        for (const auto& kf_pair : data_.keyframes) {
+            int nIDi = kf_pair.first;  // 当前关键帧ID
+            auto& pKF = kf_pair.second;
+            
+            // 跳过坏的关键帧
+            if (pKF->is_bad) continue;
+            
+            // 获取当前关键帧的逆变换 Swi
+            Eigen::Matrix4d Swi = Eigen::Matrix4d::Identity();
+            
+            if (data_.non_corrected_poses.find(nIDi) != data_.non_corrected_poses.end()) {
+                const auto& non_corrected = data_.non_corrected_poses[nIDi];
+                Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+                T.block<3, 3>(0, 0) = non_corrected.quaternion.toRotationMatrix();
+                T.block<3, 1>(0, 3) = non_corrected.translation;
+                Swi = T.inverse();
+            } 
+            else if (data_.vertex_initial_poses_Twc.find(nIDi) != data_.vertex_initial_poses_Twc.end()) {
+                Swi = data_.vertex_initial_poses_Twc[nIDi];
+            }
+            else {
+                Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+                T.block<3, 3>(0, 0) = pKF->quaternion.toRotationMatrix();
+                T.block<3, 1>(0, 3) = pKF->translation;
+                Swi = T.inverse();
+            }
+            
+            // 获取父关键帧ID
+            int pParentKF = pKF->parent_id;
+            
+            // 获取与当前关键帧有共视关系且权重>=minFeat的关键帧
+            // 这里模拟ORB-SLAM3的GetCovisiblesByWeight函数
+            std::vector<std::pair<int, int>> orderedConnections;
+            if (data_.covisibility.find(nIDi) != data_.covisibility.end()) {
+                // 从共视图中获取所有连接的关键帧
+                for (const auto& covis_pair : data_.covisibility[nIDi]) {
+                    int connected_id = covis_pair.first;
+                    int weight = covis_pair.second;
+                    
+                    // 只保留权重大于等于minFeat的关键帧
+                    if (weight >= minFeat) {
+                        orderedConnections.push_back(std::make_pair(connected_id, weight));
+                    }
+                }
+                
+                // 按权重降序排序（重要！与ORB-SLAM3保持一致）
+                std::sort(orderedConnections.begin(), orderedConnections.end(), 
+                    [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
+                        return a.second > b.second; // 按权重降序
+                    });
+            }
+            
+            // 提取排序后的关键帧ID
+            std::vector<int> vpConnectedKFs;
+            for (const auto& pair : orderedConnections) {
+                vpConnectedKFs.push_back(pair.first);
+            }
+            
+            // 遍历共视关键帧
+            for (int nIDj : vpConnectedKFs) {
+                // 检查连接的关键帧是否有效
+                if (data_.keyframes.find(nIDj) == data_.keyframes.end() || 
+                    data_.keyframes[nIDj]->is_bad)
+                    continue;
+                
+                auto pKFn = data_.keyframes[nIDj];
+                
+
+                
+                // 检查是否满足条件：
+                // 1. 不是父关键帧
+                // 2. 不是当前关键帧的子关键帧（这需要从spanning_tree判断）
+                bool isChild = false;
+                if (data_.spanning_tree.find(nIDi) != data_.spanning_tree.end()) {
+                    const auto& children = data_.spanning_tree[nIDi];
+                    isChild = std::find(children.begin(), children.end(), nIDj) != children.end();
+                }
+                
+                // 检查是否是回环边（从loop_edges判断）
+                bool isLoopEdge = false;
+                if (data_.loop_edges.find(nIDi) != data_.loop_edges.end()) {
+                    isLoopEdge = data_.loop_edges[nIDi].find(nIDj) != data_.loop_edges[nIDi].end();
+                }
+
+                // 在这里添加KF 0的调试代码
+                if (nIDi == 0 || nIDj == 0) {
+                    // 获取共视权重
+                    int weight = 0;
+                    if (data_.covisibility.find(nIDi) != data_.covisibility.end() &&
+                        data_.covisibility[nIDi].find(nIDj) != data_.covisibility[nIDi].end()) {
+                        weight = data_.covisibility[nIDi][nIDj];
+                    }
+                    
+                    std::cout << "DEBUG KF0: ";
+                    std::cout << "处理 KF" << nIDi << " - KF" << nIDj 
+                            << ", 权重=" << weight
+                            << ", 父子关系:" << (nIDj == pParentKF || isChild ? "是" : "否")
+                            << ", nIDj < nIDi:" << (nIDj < nIDi ? "是" : "否")
+                            << ", 已在边集合:" << (sInsertedEdges.count(std::make_pair(std::min(nIDi, nIDj), std::max(nIDi, nIDj))) ? "是" : "否")
+                            << std::endl;
+                }
+                
+                
+
+
+
+                
+                if (nIDj != pParentKF && !isChild) {
+                    // 统计所有合格的共视关系
+                    count_all_valid_covis++;
+                    
+                    // 获取共视权重
+                    int weight = 0;
+                    if (data_.covisibility.find(nIDi) != data_.covisibility.end() &&
+                        data_.covisibility[nIDi].find(nIDj) != data_.covisibility[nIDi].end()) {
+                        weight = data_.covisibility[nIDi][nIDj];
+                    }
+                    
+                    // 存储共视权重信息
+                    covis_weights[nIDi].push_back(std::make_pair(nIDj, weight));
+                    
+                    // 只处理ID小于当前ID的关键帧（避免重复）
+                    if (!pKFn->is_bad && nIDj < nIDi) {
+                        // 检查是否已经添加过这条边
+                        if (sInsertedEdges.count(std::make_pair(
+                            std::min(nIDi, nIDj),
+                            std::max(nIDi, nIDj))))
+                            continue;
+                        
+                        // 获取连接关键帧的变换 Snw
+                        Eigen::Matrix4d Snw = Eigen::Matrix4d::Identity();
+                        
+                        if (data_.non_corrected_poses.find(nIDj) != data_.non_corrected_poses.end()) {
+                            const auto& non_corrected = data_.non_corrected_poses[nIDj];
+                            Snw.block<3, 3>(0, 0) = non_corrected.quaternion.toRotationMatrix();
+                            Snw.block<3, 1>(0, 3) = non_corrected.translation;
+                        }
+                        else if (data_.vertex_initial_poses_Tcw.find(nIDj) != data_.vertex_initial_poses_Tcw.end()) {
+                            Snw = data_.vertex_initial_poses_Tcw[nIDj];
+                        }
+                        else {
+                            Snw.block<3, 3>(0, 0) = pKFn->quaternion.toRotationMatrix();
+                            Snw.block<3, 1>(0, 3) = pKFn->translation;
+                        }
+                        
+                        // 计算相对变换 Sni = Snw * Swi
+                        Eigen::Matrix4d Sni = Snw * Swi;
+                        
+                        // 添加约束
+                        ceres::CostFunction* en = SE3LoopConstraintCost::Create(Sni, information);
+                        problem_->AddResidualBlock(en, nullptr, 
+                                                 data_.keyframes[nIDi]->se3_state.data(),
+                                                 data_.keyframes[nIDj]->se3_state.data());
+                        
+                        // 在这里添加KF 0的边添加调试代码
+                        if (nIDi == 0 || nIDj == 0) {
+                            std::cout << "DEBUG KF0: 添加边 KF" << nIDi << " - KF" << nIDj 
+                                    << ", KF" << nIDi << "当前边数:" << covis_per_kf[nIDi] + 1
+                                    << ", KF" << nIDj << "当前边数:" << covis_per_kf[nIDj] + 1
+                                    << std::endl;
+                        }
+                        
+                        // 增加添加到图中的共视边计数
+                        count_covis++;
+                        covis_per_kf[nIDi]++;
+                        covis_per_kf[nIDj]++;
+                        normal_edges_added++;  // 包含在总的normal边计数中
+                        
+                        // 记录已添加的边
+                        sInsertedEdges.insert(std::make_pair(
+                            std::min(nIDi, nIDj),
+                            std::max(nIDi, nIDj)
+                        ));
+                    }
+                }
+            }
+        }
+
         // 按ID间隔统计关键帧共视关系
+        std::cout << "\n按ID分组的关键帧共视关系统计:" << std::endl;
+        for (int id = 0; id <= data_.max_kf_id; id += 20) {
+            // 检查是否存在该ID的关键帧
+            bool found = false;
+            for (const auto& kf_pair : data_.keyframes) {
+                if (kf_pair.first == id && !kf_pair.second->is_bad) {
+                    found = true;
+                    break;
+                }
+            }
+            
+            if (found) {
+                std::cout << "KF ID " << id << ": 添加到图的共视边数量 = " << covis_per_kf[id] << std::endl;
+                
+                // 输出该关键帧的所有合格共视关系和权重
+                if (covis_weights.find(id) != covis_weights.end()) {
+                    std::cout << "  所有合格共视关系 (ID, 权重):" << std::endl;
+                    for (const auto& pair : covis_weights[id]) {
+                        std::cout << "  -> KF " << pair.first << ", 权重: " << pair.second << std::endl;
+                    }
+                    std::cout << "  合格共视关系总数: " << covis_weights[id].size() << std::endl;
+                } else {
+                    std::cout << "  没有合格的共视关系" << std::endl;
+                }
+            }
+        }
         
+        std::cout << "\n总共添加到图中的共视边数量: " << count_covis << std::endl;
+        std::cout << "所有合格的共视关系总数(包括未添加到图中的): " << count_all_valid_covis << std::endl;
+
+        std::cout << "\nSuccessful Normal Edges: " << normal_edges_added << "/" << (attempted_normal + count_all_valid_covis) << std::endl;
+        std::cout << "Total KeyFrames Processed: " << validKFCount << "/" << data_.keyframes.size() << std::endl;
     }
         
     
