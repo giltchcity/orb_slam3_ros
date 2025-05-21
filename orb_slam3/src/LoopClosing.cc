@@ -272,10 +272,9 @@ void LoopClosing::SaveOptimizationData(const string& baseDir,
     loopEdgesFile.close();
     
     // 5.3 保存共视图
+    // 5.3 保存共视图
     ofstream covisFile(optimDir + "covisibility.txt");
     covisFile << "# KF_ID Connected_KF_ID Weight" << endl;
-    
-    set<pair<unsigned long, unsigned long>> processedEdges;
     
     for(KeyFrame* pKF : vpKFs) {
         if(pKF->isBad()) continue;
@@ -283,16 +282,6 @@ void LoopClosing::SaveOptimizationData(const string& baseDir,
         vector<KeyFrame*> vpConnected = pKF->GetVectorCovisibleKeyFrames();
         for(KeyFrame* pKFConn : vpConnected) {
             if(pKFConn->isBad()) continue;
-            
-            // 处理方向，确保每条边只保存一次
-            unsigned long id1 = pKF->mnId;
-            unsigned long id2 = pKFConn->mnId;
-            
-            pair<unsigned long, unsigned long> edge = id1 < id2 ? 
-                make_pair(id1, id2) : make_pair(id2, id1);
-                
-            if(processedEdges.count(edge)) continue;
-            processedEdges.insert(edge);
             
             int weight = pKF->GetWeight(pKFConn);
             covisFile << pKF->mnId << " " << pKFConn->mnId << " " << weight << endl;
