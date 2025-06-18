@@ -969,7 +969,7 @@ bool SE3Parameterization::MinusJacobian(const double* x, double* jacobian) const
 int main() {
     // 文件路径
     std::string optimized_poses = "/Datasets/CERES_Work/output/trajectory_after_optimization.txt";
-    std::string raycast_data = "/path/to/raycast_combined_points_no_loop.txt";  // 替换为实际路径
+    std::string raycast_data = "/Datasets/CERES_Work/3DPintput/raycast_combined_points_no_loop.txt";  // 替换为实际路径
     std::string output_dir = "/Datasets/CERES_Work/output/mesh_optimization";
     
     // 创建输出目录
