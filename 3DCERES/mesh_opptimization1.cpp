@@ -495,8 +495,11 @@ public:
         
         // 旋转差异（四元数）
         Eigen::Quaternion<T> q_current(pose[6], pose[3], pose[4], pose[5]);
-        Eigen::Quaternion<T> q_prior(T(prior_pose_[6]), T(prior_pose_[3]), 
-                                    T(prior_pose_[4]), T(prior_pose_[5]));
+        Eigen::Quaternion<T> q_prior;
+        q_prior.w() = T(prior_pose_[6]);
+        q_prior.x() = T(prior_pose_[3]);
+        q_prior.y() = T(prior_pose_[4]);
+        q_prior.z() = T(prior_pose_[5]);
         
         // 计算旋转差异
         Eigen::Quaternion<T> q_diff = q_prior.inverse() * q_current;
@@ -935,35 +938,9 @@ public:
     }
 };
 
-// SE3Parameterization的实现（复制你之前的代码）
-bool SE3Parameterization::Plus(const double* x, const double* delta, double* x_plus_delta) const {
-    // ... 复制你之前的实现
-    return true;
-}
 
-bool SE3Parameterization::PlusJacobian(const double* x, double* jacobian) const {
-    // ... 复制你之前的实现
-    return true;
-}
 
-Eigen::Matrix3d SE3Parameterization::skew(const Eigen::Vector3d& v) {
-    // ... 复制你之前的实现
-    Eigen::Matrix3d m;
-    m << 0, -v(2), v(1),
-         v(2), 0, -v(0),
-         -v(1), v(0), 0;
-    return m;
-}
 
-bool SE3Parameterization::Minus(const double* y, const double* x, double* y_minus_x) const {
-    // ... 复制你之前的实现
-    return true;
-}
-
-bool SE3Parameterization::MinusJacobian(const double* x, double* jacobian) const {
-    // ... 复制你之前的实现
-    return true;
-}
 
 // 主函数
 int main() {
