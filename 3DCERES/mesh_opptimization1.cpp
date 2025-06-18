@@ -21,10 +21,6 @@ const double FY = 377.209841379;
 const double CX = 328.193371286;
 const double CY = 240.426878936;
 
-
-
-// 复用你之前的SE3Parameterization类
-// SE3 李代数参数化 - 模仿 ORB-SLAM3 的 VertexSim3Expmap 
 // SE3 李代数参数化 - 基于g2o的Sim3实现，但固定尺度为1
 class SE3Parameterization : public ceres::Manifold {
 public:
@@ -303,75 +299,6 @@ public:
     }
 };
 
-
-// SO(3)的对数映射：将旋转矩阵转换为轴角向量
-template<typename T>
-Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
-    // 计算旋转角度
-    T trace = R.trace();
-    T cos_angle = (trace - T(1.0)) * T(0.5);
-    
-    // 限制cos_angle在[-1, 1]范围内
-    if (cos_angle > T(1.0)) cos_angle = T(1.0);
-    if (cos_angle < T(-1.0)) cos_angle = T(-1.0);
-    
-    T angle = acos(cos_angle);
-    
-    Eigen::Matrix<T, 3, 1> omega;
-    
-    // 处理小角度情况
-    if (angle < T(1e-6)) {
-        // 对于小角度，使用一阶近似
-        T factor = T(0.5) * (T(1.0) + trace * trace / T(12.0));
-        omega << factor * (R(2, 1) - R(1, 2)),
-                 factor * (R(0, 2) - R(2, 0)),
-                 factor * (R(1, 0) - R(0, 1));
-    } else if (angle > T(M_PI - 1e-6)) {
-        // 处理接近180度的情况
-        Eigen::Matrix<T, 3, 3> A = (R + R.transpose()) * T(0.5);
-        A.diagonal().array() -= T(1.0);
-        
-        // 找到最大的对角元素
-        int max_idx = 0;
-        T max_val = ceres::abs(A(0, 0));
-        for (int i = 1; i < 3; ++i) {
-            if (ceres::abs(A(i, i)) > max_val) {
-                max_val = ceres::abs(A(i, i));
-                max_idx = i;
-            }
-        }
-        
-        // 计算轴向量
-        Eigen::Matrix<T, 3, 1> axis;
-        axis[max_idx] = sqrt(A(max_idx, max_idx));
-        for (int i = 0; i < 3; ++i) {
-            if (i != max_idx) {
-                axis[i] = A(max_idx, i) / axis[max_idx];
-            }
-        }
-        axis.normalize();
-        
-        // 确定正确的符号
-        if ((R(2, 1) - R(1, 2)) * axis[0] + 
-            (R(0, 2) - R(2, 0)) * axis[1] + 
-            (R(1, 0) - R(0, 1)) * axis[2] < T(0.0)) {
-            axis = -axis;
-        }
-        
-        omega = angle * axis;
-    } else {
-        // 一般情况
-        T sin_angle = sin(angle);
-        T factor = angle / (T(2.0) * sin_angle);
-        omega << factor * (R(2, 1) - R(1, 2)),
-                 factor * (R(0, 2) - R(2, 0)),
-                 factor * (R(1, 0) - R(0, 1));
-    }
-    
-    return omega;
-}
-
-
 // Ray casting观测数据
 struct RayCastObservation {
     int frame_id;
@@ -480,69 +407,72 @@ private:
     Eigen::Vector2d observed_pixel_;
 };
 
-// 位姿先验约束（保持位姿接近初始值）
-class PosePriorCost {
+// 深度一致性约束
+class DepthConsistencyCost {
 public:
-    PosePriorCost(const std::vector<double>& prior_pose, double weight)
-        : prior_pose_(prior_pose), weight_(weight) {}
+    DepthConsistencyCost(const Eigen::Vector3d& depth_point, double weight)
+        : depth_point_(depth_point), weight_(weight) {}
     
     template <typename T>
-    bool operator()(const T* const pose, T* residuals) const {
-        // 位置差异
-        for (int i = 0; i < 3; ++i) {
-            residuals[i] = weight_ * (pose[i] - T(prior_pose_[i]));
-        }
-        
-        // 旋转差异（四元数）
-        Eigen::Quaternion<T> q_current(pose[6], pose[3], pose[4], pose[5]);
-        Eigen::Quaternion<T> q_prior;
-        q_prior.w() = T(prior_pose_[6]);
-        q_prior.x() = T(prior_pose_[3]);
-        q_prior.y() = T(prior_pose_[4]);
-        q_prior.z() = T(prior_pose_[5]);
-        
-        // 计算旋转差异
-        Eigen::Quaternion<T> q_diff = q_prior.inverse() * q_current;
-        
-        // 使用轴角表示
-        T angle = T(2.0) * acos(q_diff.w());
-        residuals[3] = weight_ * angle;
-        residuals[4] = T(0.0);
-        residuals[5] = T(0.0);
-        
+    bool operator()(const T* const point_3d, T* residuals) const {
+        residuals[0] = weight_ * (point_3d[0] - T(depth_point_[0]));
+        residuals[1] = weight_ * (point_3d[1] - T(depth_point_[1]));
+        residuals[2] = weight_ * (point_3d[2] - T(depth_point_[2]));
         return true;
     }
     
-    static ceres::CostFunction* Create(const std::vector<double>& prior_pose, double weight) {
-        return new ceres::AutoDiffCostFunction<PosePriorCost, 6, 7>(
-            new PosePriorCost(prior_pose, weight));
-    }
-    
 private:
-    std::vector<double> prior_pose_;
+    Eigen::Vector3d depth_point_;
     double weight_;
 };
 
 // Mesh优化器主类
 class MeshOptimizer {
 private:
-    std::map<int, CameraPose> camera_poses_;
+    // 成员变量
+    std::map<int, CameraPose> bad_camera_poses_;   // 坏位姿（生成mesh时的）
+    std::map<int, CameraPose> good_camera_poses_;  // 好位姿（优化后的目标）
     std::map<int, std::shared_ptr<Point3D>> points_;
     std::unique_ptr<ceres::Problem> problem_;
     
-    // 用于3D点聚类
-    std::vector<std::vector<Eigen::Vector3d>> point_clusters_;
+    // 基于depth point的聚类结构
+    struct DepthPointCluster {
+        Eigen::Vector3d center_depth_point;  // 聚类中心（depth point）
+        Eigen::Vector3d center_mesh_point;   // 对应的mesh point中心
+        std::vector<RayCastObservation> observations;
+    };
+    std::vector<DepthPointCluster> depth_clusters_;
     
-public:
-    MeshOptimizer() {
-        problem_ = std::make_unique<ceres::Problem>();
+    // 辅助函数：计算重投影误差
+    double ComputeReprojectionError(const Eigen::Vector3d& point_3d,
+                                   const std::vector<double>& camera_pose,
+                                   const Eigen::Vector2d& observed_pixel) {
+        // 提取相机位姿
+        Eigen::Vector3d t_cw(camera_pose[0], camera_pose[1], camera_pose[2]);
+        Eigen::Quaterniond q_cw(camera_pose[6], camera_pose[3], camera_pose[4], camera_pose[5]);
+        
+        // 转换到相机坐标系
+        Eigen::Vector3d P_c = q_cw * point_3d + t_cw;
+        
+        if (P_c[2] <= 0) return std::numeric_limits<double>::max();
+        
+        // 投影
+        double u = FX * (P_c[0] / P_c[2]) + CX;
+        double v = FY * (P_c[1] / P_c[2]) + CY;
+        
+        // 计算像素误差
+        return std::sqrt(std::pow(u - observed_pixel[0], 2) + 
+                        std::pow(v - observed_pixel[1], 2));
     }
     
-    // 加载优化后的相机位姿（TUM格式）
-    bool LoadOptimizedPoses(const std::string& pose_file) {
+public:
+    MeshOptimizer() : problem_(std::make_unique<ceres::Problem>()) {}
+    
+    // 加载坏位姿
+    bool LoadBadPoses(const std::string& pose_file) {
         std::ifstream file(pose_file);
         if (!file.is_open()) {
-            std::cerr << "无法打开位姿文件: " << pose_file << std::endl;
+            std::cerr << "无法打开坏位姿文件: " << pose_file << std::endl;
             return false;
         }
         
@@ -560,21 +490,56 @@ public:
                 pose.frame_id = frame_id;
                 pose.timestamp = timestamp;
                 
-                // TUM格式是Twc，需要转换
+                // TUM格式是Twc
                 Eigen::Vector3d t_wc(tx, ty, tz);
                 Eigen::Quaterniond q_wc(qw, qx, qy, qz);
                 pose.SetFromTwc(t_wc, q_wc);
                 
-                camera_poses_[frame_id] = pose;
+                bad_camera_poses_[frame_id] = pose;
                 frame_id++;
             }
         }
         
-        std::cout << "加载了 " << camera_poses_.size() << " 个相机位姿" << std::endl;
+        std::cout << "加载了 " << bad_camera_poses_.size() << " 个坏位姿" << std::endl;
         return true;
     }
     
-    // 加载Ray Casting数据
+    // 加载好位姿
+    bool LoadGoodPoses(const std::string& pose_file) {
+        std::ifstream file(pose_file);
+        if (!file.is_open()) {
+            std::cerr << "无法打开好位姿文件: " << pose_file << std::endl;
+            return false;
+        }
+        
+        std::string line;
+        int frame_id = 0;
+        
+        while (std::getline(file, line)) {
+            if (line.empty() || line[0] == '#') continue;
+            
+            std::istringstream iss(line);
+            double timestamp, tx, ty, tz, qx, qy, qz, qw;
+            
+            if (iss >> timestamp >> tx >> ty >> tz >> qx >> qy >> qz >> qw) {
+                CameraPose pose;
+                pose.frame_id = frame_id;
+                pose.timestamp = timestamp;
+                
+                Eigen::Vector3d t_wc(tx, ty, tz);
+                Eigen::Quaterniond q_wc(qw, qx, qy, qz);
+                pose.SetFromTwc(t_wc, q_wc);
+                
+                good_camera_poses_[frame_id] = pose;
+                frame_id++;
+            }
+        }
+        
+        std::cout << "加载了 " << good_camera_poses_.size() << " 个好位姿" << std::endl;
+        return true;
+    }
+    
+    // 加载ray casting数据
     bool LoadRayCastData(const std::string& raycast_file) {
         std::ifstream file(raycast_file);
         if (!file.is_open()) {
@@ -585,7 +550,7 @@ public:
         std::string line;
         std::vector<RayCastObservation> all_observations;
         
-        // 第一遍：读取所有观测
+        // 读取所有观测
         while (std::getline(file, line)) {
             if (line.empty()) continue;
             
@@ -606,64 +571,88 @@ public:
         
         std::cout << "读取了 " << all_observations.size() << " 个ray casting观测" << std::endl;
         
-        // 第二遍：聚类3D点（合并相近的点）
-        const double MERGE_THRESHOLD = 0.01;  // 10mm
+        // 基于depth point聚类
+        const double DEPTH_MERGE_THRESHOLD = 0.05;  // 50mm - 对depth point更宽松
+        const double MESH_MERGE_THRESHOLD = 0.1;    // 100mm - 对mesh point也宽松
         
         for (const auto& obs : all_observations) {
-            // 查找是否有相近的已存在点
+            // 查找基于depth point的最近簇
             int best_cluster = -1;
-            double min_dist = MERGE_THRESHOLD;
+            double min_depth_dist = DEPTH_MERGE_THRESHOLD;
             
-            for (size_t i = 0; i < point_clusters_.size(); ++i) {
-                double dist = (point_clusters_[i][0] - obs.mesh_point).norm();
-                if (dist < min_dist) {
-                    min_dist = dist;
+            for (size_t i = 0; i < depth_clusters_.size(); ++i) {
+                // 主要基于depth point的距离
+                double depth_dist = (depth_clusters_[i].center_depth_point - obs.depth_point).norm();
+                
+                // 也考虑mesh point，但权重较低
+                double mesh_dist = (depth_clusters_[i].center_mesh_point - obs.mesh_point).norm();
+                
+                // 综合评分：depth point权重更高
+                if (depth_dist < min_depth_dist && mesh_dist < MESH_MERGE_THRESHOLD) {
+                    min_depth_dist = depth_dist;
                     best_cluster = i;
                 }
             }
             
             if (best_cluster >= 0) {
                 // 添加到现有簇
-                point_clusters_[best_cluster].push_back(obs.mesh_point);
+                depth_clusters_[best_cluster].observations.push_back(obs);
+                
+                // 更新簇中心（增量平均）
+                int n = depth_clusters_[best_cluster].observations.size();
+                depth_clusters_[best_cluster].center_depth_point = 
+                    (depth_clusters_[best_cluster].center_depth_point * (n-1) + obs.depth_point) / n;
+                depth_clusters_[best_cluster].center_mesh_point = 
+                    (depth_clusters_[best_cluster].center_mesh_point * (n-1) + obs.mesh_point) / n;
             } else {
                 // 创建新簇
-                point_clusters_.push_back({obs.mesh_point});
+                DepthPointCluster new_cluster;
+                new_cluster.center_depth_point = obs.depth_point;
+                new_cluster.center_mesh_point = obs.mesh_point;
+                new_cluster.observations.push_back(obs);
+                depth_clusters_.push_back(new_cluster);
             }
         }
         
-        // 第三遍：创建3D点并关联观测
-        for (size_t cluster_id = 0; cluster_id < point_clusters_.size(); ++cluster_id) {
+        // 过滤掉观测太少的簇
+        std::cout << "聚类前: " << depth_clusters_.size() << " 个簇" << std::endl;
+        
+        auto it = std::remove_if(depth_clusters_.begin(), depth_clusters_.end(),
+            [](const DepthPointCluster& cluster) { return cluster.observations.size() < 2; });
+        depth_clusters_.erase(it, depth_clusters_.end());
+        
+        std::cout << "过滤后: " << depth_clusters_.size() << " 个有效簇" << std::endl;
+        
+        // 创建3D点（使用mesh point作为初始位置）
+        for (size_t cluster_id = 0; cluster_id < depth_clusters_.size(); ++cluster_id) {
             auto point = std::make_shared<Point3D>();
             point->id = cluster_id;
             
-            // 计算簇的平均位置
-            Eigen::Vector3d avg_pos = Eigen::Vector3d::Zero();
-            for (const auto& pos : point_clusters_[cluster_id]) {
-                avg_pos += pos;
-            }
-            avg_pos /= point_clusters_[cluster_id].size();
-            point->SetPosition(avg_pos);
-            
-            // 关联观测
-            for (const auto& obs : all_observations) {
-                double dist = (obs.mesh_point - avg_pos).norm();
-                if (dist < MERGE_THRESHOLD) {
-                    point->observations.push_back(obs);
-                }
-            }
+            // 使用mesh point中心作为初始位置
+            point->SetPosition(depth_clusters_[cluster_id].center_mesh_point);
+            point->observations = depth_clusters_[cluster_id].observations;
             
             points_[cluster_id] = point;
         }
         
-        std::cout << "创建了 " << points_.size() << " 个唯一3D点" << std::endl;
-        
         // 统计信息
         int total_observations = 0;
+        std::map<int, int> obs_count_dist;
         for (const auto& p : points_) {
-            total_observations += p.second->observations.size();
+            int count = p.second->observations.size();
+            total_observations += count;
+            obs_count_dist[count]++;
         }
+        
+        std::cout << "创建了 " << points_.size() << " 个唯一3D点" << std::endl;
         std::cout << "平均每个3D点有 " << (double)total_observations / points_.size() 
                   << " 个观测" << std::endl;
+        
+        std::cout << "观测数量分布：" << std::endl;
+        for (const auto& item : obs_count_dist) {
+            std::cout << "  " << item.first << " 个观测: " 
+                     << item.second << " 个点" << std::endl;
+        }
         
         return true;
     }
@@ -672,21 +661,19 @@ public:
     void SetupOptimization() {
         std::cout << "\n设置优化问题..." << std::endl;
         
-        // 1. 添加相机位姿参数
-        for (auto& pose_pair : camera_poses_) {
+        // 1. 固定所有相机位姿（使用坏位姿，且不优化它们）
+        for (auto& pose_pair : bad_camera_poses_) {
             auto& pose = pose_pair.second;
             
             // 添加位姿参数块
             problem_->AddParameterBlock(pose.se3_state.data(), 7);
             problem_->SetManifold(pose.se3_state.data(), new SE3Parameterization());
             
-            // 添加位姿先验（强约束，避免位姿大幅变化）
-            std::vector<double> prior_pose = pose.se3_state;
-            ceres::CostFunction* prior_cost = PosePriorCost::Create(prior_pose, 100.0);
-            problem_->AddResidualBlock(prior_cost, nullptr, pose.se3_state.data());
+            // 固定相机位姿
+            problem_->SetParameterBlockConstant(pose.se3_state.data());
         }
         
-        std::cout << "添加了 " << camera_poses_.size() << " 个相机位姿参数" << std::endl;
+        std::cout << "添加了 " << bad_camera_poses_.size() << " 个相机位姿参数（全部固定）" << std::endl;
         
         // 2. 添加3D点参数和重投影约束
         int constraint_count = 0;
@@ -696,10 +683,26 @@ public:
             // 添加3D点参数块
             problem_->AddParameterBlock(point->position.data(), 3);
             
+            // 添加深度一致性约束
+            if (point->observations.size() > 0) {
+                Eigen::Vector3d avg_depth_point = Eigen::Vector3d::Zero();
+                for (const auto& obs : point->observations) {
+                    avg_depth_point += obs.depth_point;
+                }
+                avg_depth_point /= point->observations.size();
+                
+                // 深度一致性代价函数
+                ceres::CostFunction* depth_cost = 
+                    new ceres::AutoDiffCostFunction<DepthConsistencyCost, 3, 3>(
+                        new DepthConsistencyCost(avg_depth_point, 0.1)  // 权重0.1
+                    );
+                problem_->AddResidualBlock(depth_cost, nullptr, point->position.data());
+            }
+            
             // 为每个观测添加重投影约束
             for (const auto& obs : point->observations) {
-                // 检查是否有对应的相机位姿
-                if (camera_poses_.find(obs.frame_id) == camera_poses_.end()) {
+                // 检查是否有对应的坏相机位姿
+                if (bad_camera_poses_.find(obs.frame_id) == bad_camera_poses_.end()) {
                     continue;
                 }
                 
@@ -713,7 +716,7 @@ public:
                 problem_->AddResidualBlock(
                     cost, 
                     loss,
-                    camera_poses_[obs.frame_id].se3_state.data(),
+                    bad_camera_poses_[obs.frame_id].se3_state.data(),
                     point->position.data()
                 );
                 
@@ -745,157 +748,184 @@ public:
         return summary.IsSolutionUsable();
     }
     
-  // 替换原来的OutputOptimizedPoints函数
-  void OutputOptimizedPointsComparison(const std::string& output_file) {
-      std::ofstream file(output_file);
-      if (!file.is_open()) {
-          std::cerr << "无法创建输出文件: " << output_file << std::endl;
-          return;
-      }
-      
-      // 写入头部
-      file << "# Optimized 3D points comparison" << std::endl;
-      file << "# Format: point_id x_before y_before z_before x_after y_after z_after movement_distance num_observations" << std::endl;
-      file << std::fixed << std::setprecision(6);
-      
-      // 统计信息
-      double total_movement = 0.0;
-      double max_movement = 0.0;
-      int min_observations = INT_MAX;
-      int max_observations = 0;
-      
-      // 输出每个点的优化前后对比
-      for (const auto& point_pair : points_) {
-          const auto& point = point_pair.second;
-          int point_id = point->id;
-          
-          // 获取初始位置（从第一个观测的mesh_point）
-          Eigen::Vector3d initial_pos = point_clusters_[point_id][0];
-          
-          // 获取优化后位置
-          Eigen::Vector3d final_pos = point->GetPosition();
-          
-          // 计算移动距离
-          double movement = (final_pos - initial_pos).norm();
-          total_movement += movement;
-          max_movement = std::max(max_movement, movement);
-          
-          // 统计观测数量
-          int num_obs = point->observations.size();
-          min_observations = std::min(min_observations, num_obs);
-          max_observations = std::max(max_observations, num_obs);
-          
-          // 写入文件
-          file << point_id << " "
-               << initial_pos[0] << " " << initial_pos[1] << " " << initial_pos[2] << " "
-               << final_pos[0] << " " << final_pos[1] << " " << final_pos[2] << " "
-               << movement << " "
-               << num_obs << std::endl;
-      }
-      
-      file.close();
-      
-      // 输出统计摘要
-      std::cout << "\n=== 3D点优化统计 ===" << std::endl;
-      std::cout << "总共优化了 " << points_.size() << " 个采样3D点" << std::endl;
-      std::cout << "平均移动距离: " << total_movement / points_.size() << " 米" << std::endl;
-      std::cout << "最大移动距离: " << max_movement << " 米" << std::endl;
-      std::cout << "观测数量范围: [" << min_observations << ", " << max_observations << "]" << std::endl;
-      std::cout << "结果已保存到: " << output_file << std::endl;
-  }
-  
-  // 额外输出一个简化版本，只包含优化后的位置
-  void OutputOptimizedPointsSimple(const std::string& output_file) {
-      std::ofstream file(output_file);
-      if (!file.is_open()) {
-          std::cerr << "无法创建输出文件: " << output_file << std::endl;
-          return;
-      }
-      
-      // 写入头部
-      file << "# Optimized 3D points" << std::endl;
-      file << "# Format: x y z" << std::endl;
-      file << std::fixed << std::setprecision(6);
-      
-      // 按ID排序输出
-      std::vector<int> sorted_ids;
-      for (const auto& p : points_) {
-          sorted_ids.push_back(p.first);
-      }
-      std::sort(sorted_ids.begin(), sorted_ids.end());
-      
-      for (int id : sorted_ids) {
-          const auto& point = points_[id];
-          Eigen::Vector3d pos = point->GetPosition();
-          file << pos[0] << " " << pos[1] << " " << pos[2] << std::endl;
-      }
-      
-      std::cout << "优化后的3D点位置已保存到: " << output_file << std::endl;
-  }
-  
-  // 输出详细的观测信息（用于验证）
-  void OutputDetailedObservations(const std::string& output_file) {
-      std::ofstream file(output_file);
-      if (!file.is_open()) {
-          std::cerr << "无法创建输出文件: " << output_file << std::endl;
-          return;
-      }
-      
-      file << "# Detailed observations for each 3D point" << std::endl;
-      file << "# Format: point_id frame_id u v reprojection_error_before reprojection_error_after" << std::endl;
-      file << std::fixed << std::setprecision(6);
-      
-      for (const auto& point_pair : points_) {
-          const auto& point = point_pair.second;
-          Eigen::Vector3d initial_pos = point_clusters_[point->id][0];
-          Eigen::Vector3d final_pos = point->GetPosition();
-          
-          for (const auto& obs : point->observations) {
-              if (camera_poses_.find(obs.frame_id) == camera_poses_.end()) continue;
-              
-              const auto& pose = camera_poses_[obs.frame_id];
-              
-              // 计算优化前的重投影误差
-              double error_before = ComputeReprojectionError(
-                  initial_pos, pose.se3_state, obs.pixel);
-              
-              // 计算优化后的重投影误差
-              double error_after = ComputeReprojectionError(
-                  final_pos, pose.se3_state, obs.pixel);
-              
-              file << point->id << " "
-                   << obs.frame_id << " "
-                   << obs.pixel[0] << " " << obs.pixel[1] << " "
-                   << error_before << " "
-                   << error_after << std::endl;
-          }
-      }
-      
-      std::cout << "详细观测信息已保存到: " << output_file << std::endl;
-  }
-  
-  private:
-      // 辅助函数：计算重投影误差
-      double ComputeReprojectionError(const Eigen::Vector3d& point_3d,
-                                     const std::vector<double>& camera_pose,
-                                     const Eigen::Vector2d& observed_pixel) {
-          // 提取相机位姿
-          Eigen::Vector3d t_cw(camera_pose[0], camera_pose[1], camera_pose[2]);
-          Eigen::Quaterniond q_cw(camera_pose[6], camera_pose[3], camera_pose[4], camera_pose[5]);
-          
-          // 转换到相机坐标系
-          Eigen::Vector3d P_c = q_cw * point_3d + t_cw;
-          
-          if (P_c[2] <= 0) return std::numeric_limits<double>::max();
-          
-          // 投影
-          double u = FX * (P_c[0] / P_c[2]) + CX;
-          double v = FY * (P_c[1] / P_c[2]) + CY;
-          
-          // 计算像素误差
-          return std::sqrt(std::pow(u - observed_pixel[0], 2) + 
-                          std::pow(v - observed_pixel[1], 2));
-      }
+    // 将点从坏坐标系变换到好坐标系
+    void TransformPointsToGoodCoordinateSystem() {
+        std::cout << "\n将优化后的点从坏坐标系变换到好坐标系..." << std::endl;
+        
+        // 使用第一个关键帧的变换关系
+        if (bad_camera_poses_.find(0) != bad_camera_poses_.end() && 
+            good_camera_poses_.find(0) != good_camera_poses_.end()) {
+            
+            // 获取第0帧的两个位姿（都是Tcw格式）
+            auto& bad_pose = bad_camera_poses_[0];
+            auto& good_pose = good_camera_poses_[0];
+            
+            // 构建变换矩阵
+            Eigen::Matrix4d T_bad = Eigen::Matrix4d::Identity();
+            Eigen::Matrix4d T_good = Eigen::Matrix4d::Identity();
+            
+            // 从SE3状态构建变换矩阵
+            Eigen::Vector3d t_bad(bad_pose.se3_state[0], bad_pose.se3_state[1], bad_pose.se3_state[2]);
+            Eigen::Quaterniond q_bad(bad_pose.se3_state[6], bad_pose.se3_state[3], 
+                                    bad_pose.se3_state[4], bad_pose.se3_state[5]);
+            T_bad.block<3,3>(0,0) = q_bad.toRotationMatrix();
+            T_bad.block<3,1>(0,3) = t_bad;
+            
+            Eigen::Vector3d t_good(good_pose.se3_state[0], good_pose.se3_state[1], good_pose.se3_state[2]);
+            Eigen::Quaterniond q_good(good_pose.se3_state[6], good_pose.se3_state[3], 
+                                     good_pose.se3_state[4], good_pose.se3_state[5]);
+            T_good.block<3,3>(0,0) = q_good.toRotationMatrix();
+            T_good.block<3,1>(0,3) = t_good;
+            
+            // 计算从坏到好的变换
+            Eigen::Matrix4d T_good_bad = T_good.inverse() * T_bad;
+            
+            // 应用变换到所有3D点
+            for (auto& point_pair : points_) {
+                auto& point = point_pair.second;
+                Eigen::Vector4d P_bad(point->position[0], point->position[1], 
+                                     point->position[2], 1.0);
+                Eigen::Vector4d P_good = T_good_bad * P_bad;
+                
+                point->position[0] = P_good[0];
+                point->position[1] = P_good[1];
+                point->position[2] = P_good[2];
+            }
+            
+            std::cout << "变换完成！" << std::endl;
+        } else {
+            std::cerr << "警告：无法找到参考帧进行坐标系变换" << std::endl;
+        }
+    }
+    
+    // 输出优化前后对比
+    void OutputOptimizedPointsComparison(const std::string& output_file) {
+        std::ofstream file(output_file);
+        if (!file.is_open()) {
+            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            return;
+        }
+        
+        // 写入头部
+        file << "# Optimized 3D points comparison" << std::endl;
+        file << "# Format: point_id x_before y_before z_before x_after y_after z_after movement_distance num_observations" << std::endl;
+        file << std::fixed << std::setprecision(6);
+        
+        // 统计信息
+        double total_movement = 0.0;
+        double max_movement = 0.0;
+        int min_observations = INT_MAX;
+        int max_observations = 0;
+        
+        // 输出每个点的优化前后对比
+        for (const auto& point_pair : points_) {
+            const auto& point = point_pair.second;
+            int point_id = point->id;
+            
+            // 获取初始位置（从聚类中心）
+            Eigen::Vector3d initial_pos = depth_clusters_[point_id].center_mesh_point;
+            
+            // 获取优化后位置
+            Eigen::Vector3d final_pos = point->GetPosition();
+            
+            // 计算移动距离
+            double movement = (final_pos - initial_pos).norm();
+            total_movement += movement;
+            max_movement = std::max(max_movement, movement);
+            
+            // 统计观测数量
+            int num_obs = point->observations.size();
+            min_observations = std::min(min_observations, num_obs);
+            max_observations = std::max(max_observations, num_obs);
+            
+            // 写入文件
+            file << point_id << " "
+                 << initial_pos[0] << " " << initial_pos[1] << " " << initial_pos[2] << " "
+                 << final_pos[0] << " " << final_pos[1] << " " << final_pos[2] << " "
+                 << movement << " "
+                 << num_obs << std::endl;
+        }
+        
+        file.close();
+        
+        // 输出统计摘要
+        std::cout << "\n=== 3D点优化统计 ===" << std::endl;
+        std::cout << "总共优化了 " << points_.size() << " 个采样3D点" << std::endl;
+        std::cout << "平均移动距离: " << total_movement / points_.size() << " 米" << std::endl;
+        std::cout << "最大移动距离: " << max_movement << " 米" << std::endl;
+        std::cout << "观测数量范围: [" << min_observations << ", " << max_observations << "]" << std::endl;
+        std::cout << "结果已保存到: " << output_file << std::endl;
+    }
+    
+    // 输出优化后的点位置
+    void OutputOptimizedPointsSimple(const std::string& output_file) {
+        std::ofstream file(output_file);
+        if (!file.is_open()) {
+            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            return;
+        }
+        
+        // 写入头部
+        file << "# Optimized 3D points" << std::endl;
+        file << "# Format: x y z" << std::endl;
+        file << std::fixed << std::setprecision(6);
+        
+        // 按ID排序输出
+        std::vector<int> sorted_ids;
+        for (const auto& p : points_) {
+            sorted_ids.push_back(p.first);
+        }
+        std::sort(sorted_ids.begin(), sorted_ids.end());
+        
+        for (int id : sorted_ids) {
+            const auto& point = points_[id];
+            Eigen::Vector3d pos = point->GetPosition();
+            file << pos[0] << " " << pos[1] << " " << pos[2] << std::endl;
+        }
+        
+        std::cout << "优化后的3D点位置已保存到: " << output_file << std::endl;
+    }
+    
+    // 输出详细的观测信息
+    void OutputDetailedObservations(const std::string& output_file) {
+        std::ofstream file(output_file);
+        if (!file.is_open()) {
+            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            return;
+        }
+        
+        file << "# Detailed observations for each 3D point" << std::endl;
+        file << "# Format: point_id frame_id u v reprojection_error_before reprojection_error_after" << std::endl;
+        file << std::fixed << std::setprecision(6);
+        
+        for (const auto& point_pair : points_) {
+            const auto& point = point_pair.second;
+            Eigen::Vector3d initial_pos = depth_clusters_[point->id].center_mesh_point;
+            Eigen::Vector3d final_pos = point->GetPosition();
+            
+            for (const auto& obs : point->observations) {
+                if (bad_camera_poses_.find(obs.frame_id) == bad_camera_poses_.end()) continue;
+                
+                const auto& pose = bad_camera_poses_[obs.frame_id];
+                
+                // 计算优化前的重投影误差
+                double error_before = ComputeReprojectionError(
+                    initial_pos, pose.se3_state, obs.pixel);
+                
+                // 计算优化后的重投影误差
+                double error_after = ComputeReprojectionError(
+                    final_pos, pose.se3_state, obs.pixel);
+                
+                file << point->id << " "
+                     << obs.frame_id << " "
+                     << obs.pixel[0] << " " << obs.pixel[1] << " "
+                     << error_before << " "
+                     << error_after << std::endl;
+            }
+        }
+        
+        std::cout << "详细观测信息已保存到: " << output_file << std::endl;
+    }
     
     // 输出统计信息
     void PrintStatistics() {
@@ -905,9 +935,9 @@ public:
         double total_movement = 0.0;
         double max_movement = 0.0;
         
-        for (size_t i = 0; i < point_clusters_.size(); ++i) {
+        for (size_t i = 0; i < depth_clusters_.size(); ++i) {
             if (points_.find(i) != points_.end()) {
-                Eigen::Vector3d initial_pos = point_clusters_[i][0];  // 初始位置
+                Eigen::Vector3d initial_pos = depth_clusters_[i].center_mesh_point;
                 Eigen::Vector3d final_pos = points_[i]->GetPosition();
                 double movement = (final_pos - initial_pos).norm();
                 
@@ -926,7 +956,7 @@ public:
             if (count++ >= 5) break;  // 只显示前5个
             
             const auto& point = point_pair.second;
-            Eigen::Vector3d initial_pos = point_clusters_[point->id][0];
+            Eigen::Vector3d initial_pos = depth_clusters_[point->id].center_mesh_point;
             Eigen::Vector3d final_pos = point->GetPosition();
             
             std::cout << "点 " << point->id << ":" << std::endl;
@@ -938,16 +968,13 @@ public:
     }
 };
 
-
-
-
-
-// 主函数
+// main函数
 int main() {
     // 文件路径
-    std::string optimized_poses = "/Datasets/CERES_Work/output/trajectory_after_optimization.txt";
-    std::string raycast_data = "/Datasets/CERES_Work/3DPintput/raycast_combined_points_no_loop.txt";  // 替换为实际路径
-    std::string output_dir = "/Datasets/CERES_Work/output/mesh_optimization";
+    std::string bad_poses = "/Datasets/CERES_Work/Vis_Result/standard_trajectory_no_loop.txt";  // 坏位姿
+    std::string good_poses = "/Datasets/CERES_Work/Vis_Result/trajectory_after_optimization.txt";  // 好位姿
+    std::string raycast_data = "/Datasets/CERES_Work/3DPinput/raycast_combined_points_no_loop.txt";
+    std::string output_dir = "/Datasets/CERES_Work/output/mesh_optimization_v2";
     
     // 创建输出目录
     system(("mkdir -p " + output_dir).c_str());
@@ -955,12 +982,18 @@ int main() {
     // 创建优化器
     MeshOptimizer optimizer;
     
-    // 加载数据
-    if (!optimizer.LoadOptimizedPoses(optimized_poses)) {
-        std::cerr << "加载优化后的位姿失败" << std::endl;
+    // 加载两套位姿
+    if (!optimizer.LoadBadPoses(bad_poses)) {
+        std::cerr << "加载坏位姿失败" << std::endl;
         return -1;
     }
     
+    if (!optimizer.LoadGoodPoses(good_poses)) {
+        std::cerr << "加载好位姿失败" << std::endl;
+        return -1;
+    }
+    
+    // 加载ray casting数据
     if (!optimizer.LoadRayCastData(raycast_data)) {
         std::cerr << "加载ray casting数据失败" << std::endl;
         return -1;
@@ -970,18 +1003,20 @@ int main() {
     optimizer.SetupOptimization();
     
     // 执行优化
-    // 在main函数中，替换输出部分
     if (optimizer.Optimize()) {
         std::cout << "\n优化成功完成！" << std::endl;
         
-        // 输出多种格式的结果
-        optimizer.OutputOptimizedPointsComparison(output_dir + "/points_comparison.txt");
-        optimizer.OutputOptimizedPointsSimple(output_dir + "/points_optimized.txt");
+        // 在输出前，将点变换到好坐标系
+        optimizer.TransformPointsToGoodCoordinateSystem();
+        
+        // 输出结果
+        optimizer.OutputOptimizedPointsComparison(output_dir + "/points_comparison_good_coord.txt");
+        optimizer.OutputOptimizedPointsSimple(output_dir + "/points_optimized_good_coord.txt");
         optimizer.OutputDetailedObservations(output_dir + "/observations_detail.txt");
         
         std::cout << "\n输出文件说明：" << std::endl;
-        std::cout << "1. points_comparison.txt - 3D点优化前后对比" << std::endl;
-        std::cout << "2. points_optimized.txt - 仅包含优化后的3D点坐标" << std::endl;
+        std::cout << "1. points_comparison_good_coord.txt - 3D点优化前后对比（好坐标系）" << std::endl;
+        std::cout << "2. points_optimized_good_coord.txt - 优化后的3D点坐标（好坐标系）" << std::endl;
         std::cout << "3. observations_detail.txt - 详细的观测和重投影误差" << std::endl;
     } else {
         std::cerr << "优化失败" << std::endl;
