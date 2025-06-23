@@ -16,16 +16,16 @@
 #include <Eigen/Dense>
 #include <Eigen/Geometry>
 
-// SE3 李代数参数化 - 模仿 ORB-SLAM3 的 VertexSim3Expmap 
-// SE3 李代数参数化 - 基于g2o的Sim3实现，但固定尺度为1
+// SE3 Lie Algebraic Parameterization - VertexSim3Expmap mimicking ORB-SLAM3 
+// SE3 Lie Algebraic Parameterization - Sim3 implementation based on g2o but with fixed scale of 1
 class SE3Parameterization : public ceres::Manifold {
 public:
     ~SE3Parameterization() {}
-    
-    // 7维环境空间：[tx, ty, tz, qx, qy, qz, qw] 
+
+    // 7-dimensional ambient space: [tx, ty, tz, qx, qy, qz, qw]
     int AmbientSize() const override { return 7; }
     
-    // 6维切空间：[rho(3), phi(3)] - 我们实际上是使用Sim3参数化但忽略尺度
+    // 6-dimensional tangent space: [rho(3), phi(3)] - we're actually using the Sim3 parameterization but ignoring the scale
     int TangentSize() const override { return 6; }
     
     // 基于g2o::Sim3的指数映射实现
