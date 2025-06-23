@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <iomanip>
 
+
 #include <ceres/ceres.h>
 #include <ceres/rotation.h>
 #include <Eigen/Dense>
