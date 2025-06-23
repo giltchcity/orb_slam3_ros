@@ -28,45 +28,44 @@ public:
     // 6-dimensional tangent space: [rho(3), phi(3)] - we're actually using the Sim3 parameterization but ignoring the scale
     int TangentSize() const override { return 6; }
     
-    // 基于g2o::Sim3的指数映射实现
+    // Exponential map implementation based on g2o::Sim3
     bool Plus(const double* x, const double* delta, double* x_plus_delta) const override {
-        // 提取当前状态
+        // Extract current state
         Eigen::Vector3d t_current(x[0], x[1], x[2]);
         Eigen::Quaterniond q_current(x[6], x[3], x[4], x[5]);
         q_current.normalize();
         
-        // 提取李代数增量，按照g2o::Sim3格式：[rotation(3), translation(3), scale(1)]
-        // 但我们忽略尺度增量（设为0）
-        Eigen::Vector3d omega(delta[0], delta[1], delta[2]);    // 旋转部分
-        Eigen::Vector3d upsilon(delta[3], delta[4], delta[5]);  // 平移部分
-        double sigma = 0.0;                                     // 固定尺度，增量为0
+        // Extract Lie algebra increment in g2o::Sim3 format: [rotation(3), translation(3), scale(1)]
+        // But we ignore scale increment (set to 0)
+        Eigen::Vector3d omega(delta[0], delta[1], delta[2]);    // Rotation part
+        Eigen::Vector3d upsilon(delta[3], delta[4], delta[5]);  // Translation part
+        double sigma = 0.0;                                     // Fixed scale, increment is 0
         
-        // ---------- 以下计算逻辑完全复制自g2o::Sim3构造函数 ----------
         
         double theta = omega.norm();
-        double s = std::exp(sigma);  // s始终为1（因为sigma=0）
+        double s = std::exp(sigma);  // s is always 1 (since sigma=0)
         
-        // 计算旋转矩阵
+        // Compute rotation matrix
         Eigen::Matrix3d Omega = skew(omega);
         Eigen::Matrix3d Omega2 = Omega * Omega;
         Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
         Eigen::Matrix3d R;
         
-        // A, B, C系数，照抄g2o的计算方式
+        // A, B, C coefficients, following g2o's calculation
         double eps = 1e-5;
         double A, B, C;
         
-        // 处理不同情况（小角度、大角度、尺度接近1等）
+        // Handle different cases (small angle, large angle, scale near 1, etc.)
         if (fabs(sigma) < eps) {
-            // 尺度变化接近于0（我们的情况）
+            // Scale change close to 0 (our case)
             C = 1;
             if (theta < eps) {
-                // 小角度情况
+                // Small angle case
                 A = 0.5;
                 B = 1.0/6.0;
                 R = I + Omega + Omega2 * 0.5;
             } else {
-                // 较大角度情况
+                // Larger angle case
                 double theta2 = theta * theta;
                 A = (1.0 - std::cos(theta)) / theta2;
                 B = (theta - std::sin(theta)) / (theta2 * theta);
@@ -74,16 +73,16 @@ public:
                     (1.0 - std::cos(theta)) / (theta * theta) * Omega2;
             }
         } else {
-            // 尺度变化明显（不是我们的情况，但保留g2o的完整逻辑）
+            // Significant scale change (not our case, but keep g2o's complete logic)
             C = (s - 1.0) / sigma;
             if (theta < eps) {
-                // 尺度变化明显但角度很小
+                // Significant scale change but small angle
                 double sigma2 = sigma * sigma;
                 A = ((sigma - 1.0) * s + 1.0) / sigma2;
                 B = ((0.5 * sigma2 - sigma + 1.0) * s - 1.0) / (sigma2 * sigma);
                 R = I + Omega + Omega2 * 0.5;
             } else {
-                // 尺度变化明显且角度明显
+                // Significant scale change and angle
                 R = I + std::sin(theta) / theta * Omega + 
                     (1.0 - std::cos(theta)) / (theta * theta) * Omega2;
                 double a = s * std::sin(theta);
@@ -96,22 +95,21 @@ public:
             }
         }
         
-        // 计算平移增量
+        // Compute translation increment
         Eigen::Matrix3d W = A * Omega + B * Omega2 + C * I;
         Eigen::Vector3d t_delta = W * upsilon;
         
-        // ---------- 结束g2o::Sim3构造函数逻辑复制 ----------
         
-        // 应用增量：注意这里使用g2o::Sim3的乘法公式
+        // Apply increment: note using g2o::Sim3's multiplication formula
         Eigen::Matrix3d R_current = q_current.toRotationMatrix();
-        Eigen::Matrix3d R_new = R * R_current;          // 旋转更新
-        Eigen::Vector3d t_new = s * (R * t_current) + t_delta;  // 平移更新，s=1
+        Eigen::Matrix3d R_new = R * R_current;          // Rotation update
+        Eigen::Vector3d t_new = s * (R * t_current) + t_delta;  // Translation update, s=1
         
-        // 转换回四元数
+        // Convert back to quaternion
         Eigen::Quaterniond q_new(R_new);
         q_new.normalize();
         
-        // 输出新状态
+        // Output new state
         x_plus_delta[0] = t_new(0);
         x_plus_delta[1] = t_new(1);
         x_plus_delta[2] = t_new(2);
@@ -124,17 +122,17 @@ public:
     }
     
     bool PlusJacobian(const double* x, double* jacobian) const override {
-        // 计算Plus操作的雅可比矩阵
+        // Compute Jacobian of Plus operation
         Eigen::Map<Eigen::Matrix<double, 7, 6, Eigen::RowMajor>> J(jacobian);
         J.setZero();
         
-        // 数值微分计算雅可比(简化实现)
+        // Numerical differentiation for Jacobian (simplified implementation)
         const double eps = 1e-8;
         double x_plus_eps[7], x_minus_eps[7];
         double delta_plus[6], delta_minus[6];
         
         for (int i = 0; i < 6; ++i) {
-            // 正向扰动
+            // Forward perturbation
             for (int j = 0; j < 6; ++j) {
                 delta_plus[j] = (i == j) ? eps : 0.0;
                 delta_minus[j] = (i == j) ? -eps : 0.0;
@@ -143,7 +141,7 @@ public:
             Plus(x, delta_plus, x_plus_eps);
             Plus(x, delta_minus, x_minus_eps);
             
-            // 数值微分
+            // Numerical differentiation
             for (int k = 0; k < 7; ++k) {
                 J(k, i) = (x_plus_eps[k] - x_minus_eps[k]) / (2.0 * eps);
             }
@@ -152,7 +150,7 @@ public:
         return true;
     }
     
-    // 辅助函数：计算反对称矩阵
+    // Helper function: compute skew-symmetric matrix
     static Eigen::Matrix3d skew(const Eigen::Vector3d& v) {
         Eigen::Matrix3d m;
         m << 0, -v(2), v(1),
@@ -161,9 +159,9 @@ public:
         return m;
     }
     
-    // Sim3的对数映射，用于计算两个位姿之间的差
+    // Sim3 logarithmic map for computing difference between two poses
     bool Minus(const double* y, const double* x, double* y_minus_x) const override {
-        // 提取两个位姿
+        // Extract two poses
         Eigen::Vector3d t_x(x[0], x[1], x[2]);
         Eigen::Vector3d t_y(y[0], y[1], y[2]);
         Eigen::Quaterniond q_x(x[6], x[3], x[4], x[5]);
@@ -172,19 +170,19 @@ public:
         q_x.normalize();
         q_y.normalize();
         
-        // 计算相对变换
+        // Compute relative transformation
         Eigen::Matrix3d R_x = q_x.toRotationMatrix();
         Eigen::Matrix3d R_y = q_y.toRotationMatrix();
         Eigen::Matrix3d R_rel = R_x.transpose() * R_y;
         Eigen::Vector3d t_rel = R_x.transpose() * (t_y - t_x);
         
-        // 计算旋转的对数映射（SO3部分）
+        // Compute logarithmic map of rotation (SO3 part)
         Eigen::Vector3d omega;
         double trace = R_rel.trace();
         
-        // 处理不同角度情况
+        // Handle different angle cases
         if (trace > 3.0 - 1e-6) {
-            // 接近单位矩阵的情况
+            // Case close to identity matrix
             omega = 0.5 * Eigen::Vector3d(
                 R_rel(2,1) - R_rel(1,2),
                 R_rel(0,2) - R_rel(2,0),
@@ -192,18 +190,18 @@ public:
             );
         } else {
             double d = 0.5 * (trace - 1.0);
-            // 限制d在[-1,1]范围内
+            // Limit d to [-1,1] range
             d = d > 1.0 ? 1.0 : (d < -1.0 ? -1.0 : d);
             double angle = std::acos(d);
-            // 计算旋转轴
+            // Compute rotation axis
             Eigen::Vector3d axis;
             axis << R_rel(2,1) - R_rel(1,2), 
                     R_rel(0,2) - R_rel(2,0), 
                     R_rel(1,0) - R_rel(0,1);
             
             if (axis.norm() < 1e-10) {
-                // 处理接近180度的特殊情况
-                // 根据g2o实现查找最大的对角元素
+                // Handle special case near 180 degrees
+                // Find largest diagonal element per g2o implementation
                 int max_idx = 0;
                 for (int i = 1; i < 3; ++i) {
                     if ((R_rel(i,i) > R_rel(max_idx,max_idx)) && (R_rel(i,i) > 0)) {
@@ -220,32 +218,32 @@ public:
                     omega.setZero();
                 }
             } else {
-                // 正常情况
+                // Normal case
                 axis.normalize();
                 omega = angle * axis;
             }
         }
         
-        // 计算平移的对数映射（根据g2o的Sim3::log实现）
+        // Compute logarithmic map of translation (following g2o's Sim3::log implementation)
         double angle = omega.norm();
-        double scale = 1.0; // 固定尺度为1
+        double scale = 1.0; // Fixed scale is 1
         
-        // 计算系数A、B、C（遵照g2o实现）
+        // Compute coefficients A, B, C (following g2o implementation)
         double A, B, C;
         double eps = 1e-6;
         
-        C = 1.0; // 因为scale=1
+        C = 1.0; // Since scale=1
         Eigen::Matrix3d Omega = skew(omega);
         Eigen::Matrix3d I = Eigen::Matrix3d::Identity();
         Eigen::Matrix3d W;
         
         if (angle < eps) {
-            // 小角度情况
+            // Small angle case
             A = 0.5;
             B = 1.0/6.0;
             W = I + 0.5 * Omega + (1.0/6.0) * Omega * Omega;
         } else {
-            // 正常角度情况
+            // Normal angle case
             double s = sin(angle);
             double c = cos(angle);
             A = (1.0 - c) / (angle * angle);
@@ -253,10 +251,10 @@ public:
             W = I + A * Omega + B * Omega * Omega;
         }
         
-        // 计算平移部分的李代数
+        // Compute Lie algebra of translation part
         Eigen::Vector3d upsilon = W.inverse() * t_rel;
         
-        // 设置输出
+        // Set output
         y_minus_x[0] = omega(0);
         y_minus_x[1] = omega(1);
         y_minus_x[2] = omega(2);
@@ -268,7 +266,7 @@ public:
     }
     
     bool MinusJacobian(const double* x, double* jacobian) const override {
-        // 数值微分计算MinusJacobian
+        // Numerical differentiation for MinusJacobian
         Eigen::Map<Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J(jacobian);
         J.setZero();
         
@@ -277,7 +275,7 @@ public:
         double diff_plus[6], diff_minus[6];
         
         for (int i = 0; i < 7; ++i) {
-            // 对y的第i个分量进行扰动
+            // Perturb the i-th component of y
             for (int j = 0; j < 7; ++j) {
                 y_plus[j] = x[j] + ((i == j) ? eps : 0.0);
                 y_minus[j] = x[j] - ((i == j) ? eps : 0.0);
@@ -296,14 +294,14 @@ public:
 };
 
 
-// SO(3)的对数映射：将旋转矩阵转换为轴角向量
+// SO(3) logarithmic map: convert rotation matrix to axis-angle vector
 template<typename T>
 Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
-    // 计算旋转角度
+    // Compute rotation angle
     T trace = R.trace();
     T cos_angle = (trace - T(1.0)) * T(0.5);
     
-    // 限制cos_angle在[-1, 1]范围内
+    // Limit cos_angle to [-1, 1] range
     if (cos_angle > T(1.0)) cos_angle = T(1.0);
     if (cos_angle < T(-1.0)) cos_angle = T(-1.0);
     
@@ -311,19 +309,19 @@ Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
     
     Eigen::Matrix<T, 3, 1> omega;
     
-    // 处理小角度情况
+    // Handle small angle case
     if (angle < T(1e-6)) {
-        // 对于小角度，使用一阶近似
+        // For small angles, use first-order approximation
         T factor = T(0.5) * (T(1.0) + trace * trace / T(12.0));
         omega << factor * (R(2, 1) - R(1, 2)),
                  factor * (R(0, 2) - R(2, 0)),
                  factor * (R(1, 0) - R(0, 1));
     } else if (angle > T(M_PI - 1e-6)) {
-        // 处理接近180度的情况
+        // Handle case near 180 degrees
         Eigen::Matrix<T, 3, 3> A = (R + R.transpose()) * T(0.5);
         A.diagonal().array() -= T(1.0);
         
-        // 找到最大的对角元素
+        // Find largest diagonal element
         int max_idx = 0;
         T max_val = ceres::abs(A(0, 0));
         for (int i = 1; i < 3; ++i) {
@@ -333,7 +331,7 @@ Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
             }
         }
         
-        // 计算轴向量
+        // Compute axis vector
         Eigen::Matrix<T, 3, 1> axis;
         axis[max_idx] = sqrt(A(max_idx, max_idx));
         for (int i = 0; i < 3; ++i) {
@@ -343,7 +341,7 @@ Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
         }
         axis.normalize();
         
-        // 确定正确的符号
+        // Determine correct sign
         if ((R(2, 1) - R(1, 2)) * axis[0] + 
             (R(0, 2) - R(2, 0)) * axis[1] + 
             (R(1, 0) - R(0, 1)) * axis[2] < T(0.0)) {
@@ -352,7 +350,7 @@ Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
         
         omega = angle * axis;
     } else {
-        // 一般情况
+        // General case
         T sin_angle = sin(angle);
         T factor = angle / (T(2.0) * sin_angle);
         omega << factor * (R(2, 1) - R(1, 2)),
@@ -365,7 +363,7 @@ Eigen::Matrix<T, 3, 1> LogSO3(const Eigen::Matrix<T, 3, 3>& R) {
 
 
 
-// 专门用于回环约束的类 - 对应g2o的EdgeSim3
+// Class specifically for loop constraints - corresponding to g2o's EdgeSim3
 class SE3LoopConstraintCost {
 public:
     SE3LoopConstraintCost(const Eigen::Matrix4d& relative_transform, const Eigen::Matrix<double, 6, 6>& information)
@@ -376,35 +374,35 @@ public:
     
     template <typename T>
     bool operator()(const T* const pose_i, const T* const pose_j, T* residuals) const {
-        // pose_i: 第一个关键帧, pose_j: 第二个关键帧
-        // 格式: [tx, ty, tz, qx, qy, qz, qw]
+        // pose_i: first keyframe, pose_j: second keyframe
+        // Format: [tx, ty, tz, qx, qy, qz, qw]
         
-        // 提取姿态
+        // Extract poses
         Eigen::Matrix<T, 3, 1> t_i(pose_i[0], pose_i[1], pose_i[2]);
         Eigen::Matrix<T, 3, 1> t_j(pose_j[0], pose_j[1], pose_j[2]);
         Eigen::Quaternion<T> q_i(pose_i[6], pose_i[3], pose_i[4], pose_i[5]);
         Eigen::Quaternion<T> q_j(pose_j[6], pose_j[3], pose_j[4], pose_j[5]);
         
-        // 转换为旋转矩阵
+        // Convert to rotation matrices
         Eigen::Matrix<T, 3, 3> R_i = q_i.toRotationMatrix();
         Eigen::Matrix<T, 3, 3> R_j = q_j.toRotationMatrix();
         
-        // 计算相对变换 T_ji = T_j * T_i^{-1} (对应ORB-SLAM3的 Sji = Sjw * Swi)
+        // Compute relative transformation T_ji = T_j * T_i^{-1} (corresponding to ORB-SLAM3's Sji = Sjw * Swi)
         Eigen::Matrix<T, 3, 3> R_ji = R_j * R_i.transpose();
         Eigen::Matrix<T, 3, 1> t_ji = R_j * (R_i.transpose() * (-t_i)) + t_j;
         
-        // 预期的相对变换
+        // Expected relative transformation
         Eigen::Matrix<T, 3, 3> R_expected = relative_rotation_.cast<T>();
         Eigen::Matrix<T, 3, 1> t_expected = relative_translation_.cast<T>();
         
-        // 计算旋转误差
+        // Compute rotation error
         Eigen::Matrix<T, 3, 3> R_error_mat = R_expected.transpose() * R_ji;
         Eigen::Matrix<T, 3, 1> rotation_error = LogSO3(R_error_mat);
         
-        // 计算平移误差
+        // Compute translation error
         Eigen::Matrix<T, 3, 1> translation_error = t_ji - t_expected;
         
-        // 组合残差
+        // Combine residuals
         residuals[0] = rotation_error[0];
         residuals[1] = rotation_error[1];
         residuals[2] = rotation_error[2];
@@ -412,7 +410,7 @@ public:
         residuals[4] = translation_error[1];
         residuals[5] = translation_error[2];
         
-        // 应用信息矩阵
+        // Apply information matrix
         Eigen::Map<Eigen::Matrix<T, 6, 1>> residuals_map(residuals);
         residuals_map = sqrt_information_.cast<T>() * residuals_map;
         
@@ -433,10 +431,7 @@ private:
 
 
 
-
-
-
-// 关键帧结构
+// KeyFrame structure
 struct KeyFrame {
     int id;
     double timestamp;
@@ -449,7 +444,7 @@ struct KeyFrame {
     bool is_inertial;
     bool is_virtual;
     
-    // SE3 状态 [tx, ty, tz, qx, qy, qz, qw]
+    // SE3 state [tx, ty, tz, qx, qy, qz, qw]
     std::vector<double> se3_state;
     
     KeyFrame() {
@@ -462,7 +457,7 @@ struct KeyFrame {
     void SetPose(const Eigen::Vector3d& t, const Eigen::Quaterniond& q) {
         translation = t;
         quaternion = q.normalized();
-        // 更新SE3状态
+        // Update SE3 state
         se3_state[0] = t.x();
         se3_state[1] = t.y();
         se3_state[2] = t.z();
@@ -479,7 +474,7 @@ struct KeyFrame {
         return T;
     }
     
-    // 从SE3状态更新translation和quaternion
+    // Update translation and quaternion from SE3 state
     void UpdateFromState() {
         translation = Eigen::Vector3d(se3_state[0], se3_state[1], se3_state[2]);
         quaternion = Eigen::Quaterniond(se3_state[6], se3_state[3], se3_state[4], se3_state[5]);
@@ -487,14 +482,14 @@ struct KeyFrame {
     }
 };
 
-// 数据结构
+// Data structures
 struct OptimizationData {
     std::map<int, std::shared_ptr<KeyFrame>> keyframes;
     std::map<int, std::vector<int>> spanning_tree;
     std::map<int, std::map<int, int>> covisibility;
     std::map<int, std::vector<int>> loop_connections;
 
-    // 回环边信息
+    // Loop edge information
     std::map<int, std::set<int>> loop_edges;  // KF_ID -> {Loop_KF_IDs}
     
     int loop_kf_id;
@@ -503,16 +498,16 @@ struct OptimizationData {
     int init_kf_id;
     int max_kf_id;
     
-    // 回环匹配相对变换
+    // Loop match relative transformation
     Eigen::Matrix4d loop_transform_matrix;
     
-    // SE3 修正姿态
+    // SE3 corrected poses
     std::map<int, KeyFrame> corrected_poses;
     std::map<int, KeyFrame> non_corrected_poses;
 
-    // 添加新的成员变量来存储顶点初始位姿
-    std::map<int, Eigen::Matrix4d> vertex_initial_poses_Tcw; // 世界到相机的位姿
-    std::map<int, Eigen::Matrix4d> vertex_initial_poses_Twc; // 相机到世界的位姿
+    // Store vertex initial poses
+    std::map<int, Eigen::Matrix4d> vertex_initial_poses_Tcw; // World to camera
+    std::map<int, Eigen::Matrix4d> vertex_initial_poses_Twc; // Camera to world
 
 };
 
@@ -521,7 +516,7 @@ private:
     OptimizationData data_;
     std::unique_ptr<ceres::Problem> problem_;
 
-    // 添加这一行 - 确保两个函数间共享
+    // Shared between functions
     std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
     
 public:
@@ -529,11 +524,11 @@ public:
         problem_ = std::make_unique<ceres::Problem>();
     }
     
-    // 解析关键帧姿态文件
+    // Parse keyframe pose file
     bool ParseKeyFramePoses(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -558,15 +553,15 @@ public:
             }
         }
         
-        std::cout << "解析关键帧姿态: " << data_.keyframes.size() << " 个关键帧" << std::endl;
+        std::cout << "Parsed keyframe poses: " << data_.keyframes.size() << " keyframes" << std::endl;
         return true;
     }
     
-    // 解析关键帧信息文件
+    // Parse keyframe info file
     bool ParseKeyFrameInfo(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -590,15 +585,15 @@ public:
             }
         }
         
-        std::cout << "解析关键帧信息完成" << std::endl;
+        std::cout << "Keyframe info parsing complete" << std::endl;
         return true;
     }
     
-    // 解析地图信息
+    // Parse map info
     bool ParseMapInfo(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -617,16 +612,16 @@ public:
             }
         }
         
-        std::cout << "解析地图信息: INIT_KF_ID=" << data_.init_kf_id 
+        std::cout << "Map info: INIT_KF_ID=" << data_.init_kf_id 
                   << ", MAX_KF_ID=" << data_.max_kf_id << std::endl;
         return true;
     }
     
-    // 解析关键帧ID信息
+    // Parse keyframe IDs
     bool ParseKeyFrameIds(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -647,17 +642,17 @@ public:
             }
         }
         
-        std::cout << "解析关键帧ID: LOOP_KF_ID=" << data_.loop_kf_id 
+        std::cout << "Keyframe IDs: LOOP_KF_ID=" << data_.loop_kf_id 
                   << ", CURRENT_KF_ID=" << data_.current_kf_id 
                   << ", FIXED_SCALE=" << data_.fixed_scale << std::endl;
         return true;
     }
     
-    // 解析回环匹配
+    // Parse loop match
     bool ParseLoopMatch(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -669,17 +664,17 @@ public:
             if (line.empty() || line[0] == '#') continue;
             
             if (line_count == 0) {
-                // 第一行是关键帧ID，已经从keyframe_ids.txt读取
+                // First line contains keyframe IDs, already read from keyframe_ids.txt
                 line_count++;
                 continue;
             }
             
             std::istringstream iss(line);
-            // 读取4x4变换矩阵
+            // Read 4x4 transformation matrix
             for (int i = 0; i < 4; i++) {
                 for (int j = 0; j < 4; j++) {
                     if (!(iss >> data_.loop_transform_matrix(i, j))) {
-                        std::cerr << "错误：无法解析变换矩阵" << std::endl;
+                        std::cerr << "Error: Cannot parse transformation matrix" << std::endl;
                         return false;
                     }
                 }
@@ -687,16 +682,16 @@ public:
             break;
         }
         
-        std::cout << "解析回环匹配变换矩阵：" << std::endl;
+        std::cout << "Loop match transformation matrix:" << std::endl;
         std::cout << data_.loop_transform_matrix << std::endl;
         return true;
     }
     
-    // 解析修正的Sim3（转为SE3，忽略尺度）
+    // Parse corrected Sim3 (convert to SE3, ignore scale)
     bool ParseCorrectedSim3(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -718,15 +713,15 @@ public:
             }
         }
         
-        std::cout << "解析修正SE3: " << data_.corrected_poses.size() << " 个关键帧" << std::endl;
+        std::cout << "Corrected SE3: " << data_.corrected_poses.size() << " keyframes" << std::endl;
         return true;
     }
     
-    // 解析非修正的Sim3（转为SE3，忽略尺度）
+    // Parse non-corrected Sim3 (convert to SE3, ignore scale)
     bool ParseNonCorrectedSim3(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -748,15 +743,15 @@ public:
             }
         }
         
-        std::cout << "解析非修正SE3: " << data_.non_corrected_poses.size() << " 个关键帧" << std::endl;
+        std::cout << "Non-corrected SE3: " << data_.non_corrected_poses.size() << " keyframes" << std::endl;
         return true;
     }
     
-    // 解析生成树
+    // Parse spanning tree
     bool ParseSpanningTree(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -772,15 +767,15 @@ public:
             }
         }
         
-        std::cout << "解析生成树: " << data_.spanning_tree.size() << " 个父节点" << std::endl;
+        std::cout << "Spanning tree: " << data_.spanning_tree.size() << " parent nodes" << std::endl;
         return true;
     }
 
-    // 解析回环边文件
+    // Parse loop edges file
     bool ParseLoopEdges(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -794,22 +789,22 @@ public:
             int kf_id, loop_kf_id;
             
             if (iss >> kf_id >> loop_kf_id) {
-                // 双向添加回环边
+                // Add bidirectional loop edges
                 data_.loop_edges[kf_id].insert(loop_kf_id);
                 data_.loop_edges[loop_kf_id].insert(kf_id);
                 loop_edge_count++;
             }
         }
         
-        std::cout << "解析回环边: " << loop_edge_count << " 条边，涉及 " << data_.loop_edges.size() << " 个关键帧" << std::endl;
+        std::cout << "Loop edges: " << loop_edge_count << " edges, involving " << data_.loop_edges.size() << " keyframes" << std::endl;
         return true;
     }
 
-    // 解析共视关系
+    // Parse covisibility
     bool ParseCovisibility(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -825,15 +820,15 @@ public:
             }
         }
         
-        std::cout << "解析共视关系: " << data_.covisibility.size() << " 个关键帧" << std::endl;
+        std::cout << "Covisibility: " << data_.covisibility.size() << " keyframes" << std::endl;
         return true;
     }
     
-    // 解析回环连接
+    // Parse loop connections
     bool ParseLoopConnections(const std::string& filename) {
         std::ifstream file(filename);
         if (!file.is_open()) {
-            std::cerr << "无法打开文件: " << filename << std::endl;
+            std::cerr << "Cannot open file: " << filename << std::endl;
             return false;
         }
         
@@ -851,16 +846,16 @@ public:
             }
         }
         
-        std::cout << "解析回环连接: " << data_.loop_connections.size() << " 个关键帧" << std::endl;
+        std::cout << "Loop connections: " << data_.loop_connections.size() << " keyframes" << std::endl;
         return true;
     }
     
-    // 解析所有数据文件
+    // Parse all data files
     bool ParseAllData(const std::string& data_dir) {
         std::string base_path = data_dir;
         if (base_path.back() != '/') base_path += "/";
         
-        // 解析各种数据文件
+        // Parse data files
         if (!ParseKeyFramePoses(base_path + "keyframe_poses.txt")) return false;
         if (!ParseKeyFrameInfo(base_path + "keyframes.txt")) return false;
         if (!ParseMapInfo(base_path + "map_info.txt")) return false;
@@ -871,92 +866,87 @@ public:
         if (!ParseSpanningTree(base_path + "spanning_tree.txt")) return false;
         if (!ParseCovisibility(base_path + "covisibility.txt")) return false;
         if (!ParseLoopConnections(base_path + "loop_connections.txt")) return false;
-        if (!ParseLoopEdges(base_path + "loop_edges.txt")) return false;  // 新添加
+        if (!ParseLoopEdges(base_path + "loop_edges.txt")) return false;
         
-        std::cout << "\n所有数据文件解析完成" << std::endl;
+        std::cout << "\nAll data files parsed successfully" << std::endl;
         return true;
     }
     
-    // 设置优化问题并添加关键帧顶点
+    // Setup optimization problem and add keyframe vertices
     void SetupOptimizationProblem() {
-        std::cout << "\n开始设置优化问题..." << std::endl;
+        std::cout << "\nSetting up optimization problem..." << std::endl;
         
-        // 清空之前的位姿存储
+        // Clear previous poses
         data_.vertex_initial_poses_Tcw.clear();
         data_.vertex_initial_poses_Twc.clear();
         
-        // 为每个关键帧添加顶点
+        // Add vertex for each keyframe
         for (auto& kf_pair : data_.keyframes) {
             auto& kf = kf_pair.second;
             
-            // 跳过坏的关键帧
+            // Skip bad keyframes
             if (kf->is_bad) continue;
             
-            // 定义Tcw矩阵 (相机在世界坐标系的位姿)
+            // Define Tcw matrix (camera pose in world coordinates)
             Eigen::Matrix4d Tcw = Eigen::Matrix4d::Identity();
             bool useCorrected = false;
             
-            // 检查是否有修正的姿态
+            // Check for corrected pose
             if (data_.corrected_poses.find(kf->id) != data_.corrected_poses.end()) {
-                // 使用修正的SE3
+                // Use corrected SE3
                 const auto& corrected = data_.corrected_poses[kf->id];
                 for (int i = 0; i < 7; ++i) {
                     kf->se3_state[i] = corrected.se3_state[i];
                 }
                 kf->UpdateFromState();
                 
-                // 保存修正后的姿态作为初始值
+                // Save corrected pose as initial value
                 Tcw.block<3, 3>(0, 0) = corrected.quaternion.toRotationMatrix();
                 Tcw.block<3, 1>(0, 3) = corrected.translation;
                 useCorrected = true;
             } else {
-                // 使用当前关键帧的状态
+                // Use current keyframe state
                 Tcw.block<3, 3>(0, 0) = kf->quaternion.toRotationMatrix();
                 Tcw.block<3, 1>(0, 3) = kf->translation;
             }
             
-            // 计算Twc (世界在相机坐标系的位姿)
+            // Compute Twc (world pose in camera coordinates)
             Eigen::Matrix4d Twc = Tcw.inverse();
             
-            // 保存这些位姿
+            // Save poses
             data_.vertex_initial_poses_Tcw[kf->id] = Tcw;
             data_.vertex_initial_poses_Twc[kf->id] = Twc;
             
-            // 添加参数块到优化问题
+            // Add parameter block to optimization problem
             problem_->AddParameterBlock(kf->se3_state.data(), 7);
             
-            // 设置SE3参数化（流形）- 类似 ORB-SLAM3 的 VertexSim3Expmap
+            // Set SE3 parameterization (manifold) - similar to ORB-SLAM3's VertexSim3Expmap
             problem_->SetManifold(kf->se3_state.data(), new SE3Parameterization());
             
-            // 固定初始关键帧
+            // Fix initial keyframe
             if (kf->id == data_.init_kf_id || kf->is_fixed) {
                 problem_->SetParameterBlockConstant(kf->se3_state.data());
-                std::cout << "固定关键帧 " << kf->id << std::endl;
+                std::cout << "Fixed keyframe " << kf->id << std::endl;
             }
             
             if (kf->id % 100 == 0 || kf->id == data_.init_kf_id || kf->id == data_.current_kf_id || kf->id == data_.loop_kf_id) {
-                std::cout << "  添加关键帧顶点 KF" << kf->id << ": "
-                         << (useCorrected ? "使用CorrectedPose" : "使用原始位姿") 
-                         << " 位置: [" << Tcw.block<3, 1>(0, 3).transpose() << "]" 
+                std::cout << "  Added keyframe vertex KF" << kf->id << ": "
+                         << (useCorrected ? "using CorrectedPose" : "using original pose") 
+                         << " position: [" << Tcw.block<3, 1>(0, 3).transpose() << "]" 
                          << std::endl;
             }
         }
         
-        std::cout << "添加了 " << data_.keyframes.size() << " 个关键帧顶点" << std::endl;
-        std::cout << "保存了 " << data_.vertex_initial_poses_Tcw.size() << " 个初始位姿" << std::endl;
-        std::cout << "优化问题设置完成，参数块数量: " << problem_->NumParameterBlocks() << std::endl;
+        std::cout << "Added " << data_.keyframes.size() << " keyframe vertices" << std::endl;
+        std::cout << "Saved " << data_.vertex_initial_poses_Tcw.size() << " initial poses" << std::endl;
+        std::cout << "Optimization setup complete, parameter blocks: " << problem_->NumParameterBlocks() << std::endl;
     }
 
-
-    // 添加回环约束
-    // 添加回环约束 - 精确匹配ORB-SLAM3的Set Loop edges部分
-    // 修正后的回环约束添加函数 - 精确匹配ORB-SLAM3
-    // 修正后的回环约束添加函数 - 解决权重查询问题
+// Add loop constraints
     void AddLoopConstraints() {
         std::cout << "\n=== Adding Loop Edges ===" << std::endl;
         
-        const int minFeat = 100; // 最小特征点数阈值
-        // std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
+        const int minFeat = 100; // Minimum feature threshold
         Eigen::Matrix<double, 6, 6> matLambda = Eigen::Matrix<double, 6, 6>::Identity();
         
         int count_loop = 0;
@@ -966,18 +956,18 @@ public:
         std::cout << "\n=== Information Matrix ===" << std::endl;
         std::cout << matLambda << std::endl;
         
-        // 检查是否有保存的顶点位姿
+        // Check for saved vertex poses
         if (data_.vertex_initial_poses_Tcw.empty()) {
-            std::cerr << "错误：没有找到保存的顶点初始位姿！" << std::endl;
+            std::cerr << "Error: No saved vertex initial poses found!" << std::endl;
             return;
         }
         
-        // 遍历所有回环连接
+        // Iterate through all loop connections
         for (const auto& mit : data_.loop_connections) {
-            int nIDi = mit.first;  // 对应 ORB-SLAM3 的 pKF->mnId
-            const auto& spConnections = mit.second;  // 对应 ORB-SLAM3 的 spConnections
+            int nIDi = mit.first;  // Corresponds to ORB-SLAM3's pKF->mnId
+            const auto& spConnections = mit.second;  // Corresponds to ORB-SLAM3's spConnections
             
-            // 检查关键帧i是否有效
+            // Check if keyframe i is valid
             if (data_.keyframes.find(nIDi) == data_.keyframes.end() || 
                 data_.keyframes[nIDi]->is_bad) {
                 continue;
@@ -987,37 +977,35 @@ public:
             
             std::cout << "KF" << nIDi << " connections: " << spConnections.size() << std::endl;
             
-            // 获取关键帧i的变换矩阵
+            // Get transformation matrix for keyframe i
             Eigen::Matrix4d Siw = Eigen::Matrix4d::Identity();
             bool useCorrectedSim3_i = false;
             
-            // 优先使用修正位姿
+            // Prefer corrected pose
             if (data_.corrected_poses.find(nIDi) != data_.corrected_poses.end()) {
-                // 使用修正姿态
                 const auto& corrected = data_.corrected_poses[nIDi];
                 Siw.block<3, 3>(0, 0) = corrected.quaternion.toRotationMatrix();
                 Siw.block<3, 1>(0, 3) = corrected.translation;
                 useCorrectedSim3_i = true;
             } 
             else if (data_.vertex_initial_poses_Tcw.find(nIDi) != data_.vertex_initial_poses_Tcw.end()) {
-                // 使用保存的初始顶点位姿
                 Siw = data_.vertex_initial_poses_Tcw[nIDi];
             }
             else {
-                // 使用当前位姿（不应该到达这里）
+                // Should not reach here
                 Siw.block<3, 3>(0, 0) = pKF->quaternion.toRotationMatrix();
                 Siw.block<3, 1>(0, 3) = pKF->translation;
-                std::cerr << "警告：KF" << nIDi << "没有找到保存的初始位姿" << std::endl;
+                std::cerr << "Warning: KF" << nIDi << " has no saved initial pose" << std::endl;
             }
             
-            // 计算逆变换
+            // Compute inverse transformation
             Eigen::Matrix4d Swi = Siw.inverse();
             
-            // 遍历连接的关键帧
+            // Iterate through connected keyframes
             for (int nIDj : spConnections) {
                 attempted_loop++;
                 
-                // 检查关键帧j是否有效
+                // Check if keyframe j is valid
                 if (data_.keyframes.find(nIDj) == data_.keyframes.end() || 
                     data_.keyframes[nIDj]->is_bad) {
                     continue;
@@ -1025,15 +1013,15 @@ public:
                 
                 auto pKFj = data_.keyframes[nIDj];
                 
-                // 权重检查
+                // Weight check
                 bool skipEdge = false;
                 int weight = 0;
                 
-                // 检查是否是主要回环边
+                // Check if main loop edge
                 bool isMainLoopEdge = (nIDi == data_.current_kf_id && nIDj == data_.loop_kf_id);
                 
                 if (!isMainLoopEdge) {
-                    // 双向查找权重
+                    // Bidirectional weight lookup
                     auto it_i = data_.covisibility.find(nIDi);
                     if (it_i != data_.covisibility.end()) {
                         auto it_j = it_i->second.find(nIDj);
@@ -1056,7 +1044,7 @@ public:
                         skipEdge = true;
                     }
                 } else {
-                    // 主要回环边，获取权重但不进行阈值检查
+                    // Main loop edge - get weight but no threshold check
                     auto it_i = data_.covisibility.find(nIDi);
                     if (it_i != data_.covisibility.end()) {
                         auto it_j = it_i->second.find(nIDj);
@@ -1079,47 +1067,45 @@ public:
                     continue;
                 }
                 
-                // 获取关键帧j的变换矩阵
+                // Get transformation matrix for keyframe j
                 Eigen::Matrix4d Sjw = Eigen::Matrix4d::Identity();
                 bool useCorrectedSim3_j = false;
                 
                 if (data_.corrected_poses.find(nIDj) != data_.corrected_poses.end()) {
-                    // 使用修正姿态
                     const auto& corrected = data_.corrected_poses[nIDj];
                     Sjw.block<3, 3>(0, 0) = corrected.quaternion.toRotationMatrix();
                     Sjw.block<3, 1>(0, 3) = corrected.translation;
                     useCorrectedSim3_j = true;
                 } 
                 else if (data_.vertex_initial_poses_Tcw.find(nIDj) != data_.vertex_initial_poses_Tcw.end()) {
-                    // 使用保存的初始顶点位姿
                     Sjw = data_.vertex_initial_poses_Tcw[nIDj];
                 }
                 else {
-                    // 使用当前位姿（不应该到达这里）
+                    // Should not reach here
                     Sjw.block<3, 3>(0, 0) = pKFj->quaternion.toRotationMatrix();
                     Sjw.block<3, 1>(0, 3) = pKFj->translation;
-                    std::cerr << "警告：KF" << nIDj << "没有找到保存的初始位姿" << std::endl;
+                    std::cerr << "Warning: KF" << nIDj << " has no saved initial pose" << std::endl;
                 }
                 
-                // 计算相对变换
+                // Compute relative transformation
                 Eigen::Matrix4d Sji = Sjw * Swi;
                 
-                // 创建优化边
+                // Create optimization edge
                 ceres::CostFunction* cost_function = SE3LoopConstraintCost::Create(Sji, matLambda);
                 
-                // 添加残差块
+                // Add residual block
                 problem_->AddResidualBlock(cost_function,
                                          nullptr,
-                                         pKF->se3_state.data(),   // 关键帧i
-                                         pKFj->se3_state.data()); // 关键帧j
+                                         pKF->se3_state.data(),   // Keyframe i
+                                         pKFj->se3_state.data()); // Keyframe j
                 
                 count_loop++;
                 
-                // 记录边
+                // Record edge
                 sInsertedEdges.insert(std::make_pair(std::min((long unsigned int)nIDi, (long unsigned int)nIDj), 
                                                    std::max((long unsigned int)nIDi, (long unsigned int)nIDj)));
                 
-                // 输出详细信息
+                // Output details
                 Eigen::Vector3d translation = Sji.block<3, 1>(0, 3);
                 std::cout << "  Added Loop Edge: KF" << nIDi << " -> KF" << nIDj 
                           << " | Weight: " << weight
@@ -1139,45 +1125,42 @@ public:
     void AddNormalEdgeConstraints() {
         std::cout << "\n=== Adding Normal Edges ===" << std::endl;
         
-        // 信息矩阵（与回环约束相同）
+        // Information matrix (same as loop constraints)
         Eigen::Matrix<double, 6, 6> information = Eigen::Matrix<double, 6, 6>::Identity();
         std::cout << "\n=== Information Matrix ===" << std::endl;
         std::cout << information << std::endl;
         
-        // 用于记录已添加的边（避免重复）
-        // std::set<std::pair<long unsigned int, long unsigned int>> sInsertedEdges;
-        
         int normal_edges_added = 0;
         int attempted_normal = 0;
-        int validKFCount = 0;  // 有效关键帧计数
+        int validKFCount = 0;  // Valid keyframe count
         
-        // 检查是否有保存的顶点位姿
+        // Check for saved vertex poses
         if (data_.vertex_initial_poses_Tcw.empty()) {
-            std::cerr << "错误：没有找到保存的顶点初始位姿！" << std::endl;
+            std::cerr << "Error: No saved vertex initial poses found!" << std::endl;
             return;
         }
         
-        // 第一阶段：添加生成树边（parent-child edges）
+        // Phase 1: Add spanning tree edges (parent-child edges)
         std::cout << "\n=== Adding Spanning Tree Edges ===" << std::endl;
         
-        // 遍历所有关键帧
+        // Iterate through all keyframes
         for (const auto& kf_pair : data_.keyframes) {
             int kf_id = kf_pair.first;
             auto& kf = kf_pair.second;
             
-            // 跳过坏的关键帧
+            // Skip bad keyframes
             if (kf->is_bad) continue;
             
-            validKFCount++;  // 增加有效关键帧计数
+            validKFCount++;
             
-            // 每10个关键帧打印一次详细信息
+            // Print detailed info every 10 keyframes
             bool printDetailedInfo = (validKFCount % 10 == 0);
             
             if(printDetailedInfo) {
                 std::cout << "Processing KF " << validKFCount << "/" << data_.keyframes.size() 
                           << " (KF" << kf_id << ")";
                 
-                // 显示父关键帧信息
+                // Show parent keyframe info
                 if(kf->parent_id >= 0) {
                     std::cout << " | Parent: KF" << kf->parent_id;
                 } else {
@@ -1187,10 +1170,10 @@ public:
                 std::cout << std::endl;
             }
             
-            // 获取父关键帧ID
+            // Get parent keyframe ID
             int parent_id = kf->parent_id;
             
-            // 如果没有父关键帧，或者父关键帧就是自己，跳过
+            // Skip if no parent, self-loop, or invalid parent
             if (parent_id < 0 || parent_id == kf_id || 
                 data_.keyframes.find(parent_id) == data_.keyframes.end() || 
                 data_.keyframes[parent_id]->is_bad) {
@@ -1205,11 +1188,11 @@ public:
                 continue;
             }
             
-            // 获取当前关键帧的逆变换 Swi
+            // Get inverse transformation for current keyframe Swi
             Eigen::Matrix4d T_iw = Eigen::Matrix4d::Identity();
             bool usingNonCorrected_i = false;
             
-            // 使用NonCorrectedSim3如果存在
+            // Use NonCorrectedSim3 if exists
             if (data_.non_corrected_poses.find(kf_id) != data_.non_corrected_poses.end()) {
                 const auto& non_corrected_i = data_.non_corrected_poses[kf_id];
                 Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
@@ -1219,19 +1202,18 @@ public:
                 usingNonCorrected_i = true;
             } 
             else if (data_.vertex_initial_poses_Twc.find(kf_id) != data_.vertex_initial_poses_Twc.end()) {
-                // 使用保存的初始顶点位姿
                 T_iw = data_.vertex_initial_poses_Twc[kf_id];
             }
             else {
-                // 应该不会到达这里，因为所有有效顶点都应该有保存的位姿
-                std::cerr << "警告：KF" << kf_id << "没有找到保存的初始位姿，使用当前状态" << std::endl;
+                // Should not reach here
+                std::cerr << "Warning: KF" << kf_id << " has no saved initial pose, using current state" << std::endl;
                 Eigen::Matrix4d T_i = Eigen::Matrix4d::Identity();
                 T_i.block<3, 3>(0, 0) = kf->quaternion.toRotationMatrix();
                 T_i.block<3, 1>(0, 3) = kf->translation;
                 T_iw = T_i.inverse();
             }
             
-            // 获取父关键帧的变换 Sjw
+            // Get parent keyframe transformation Sjw
             Eigen::Matrix4d T_j = Eigen::Matrix4d::Identity();
             bool usingNonCorrected_j = false;
             
@@ -1242,38 +1224,37 @@ public:
                 usingNonCorrected_j = true;
             }
             else if (data_.vertex_initial_poses_Tcw.find(parent_id) != data_.vertex_initial_poses_Tcw.end()) {
-                // 使用保存的初始顶点位姿
                 T_j = data_.vertex_initial_poses_Tcw[parent_id];
             }
             else {
-                // 应该不会到达这里
-                std::cerr << "警告：父KF" << parent_id << "没有找到保存的初始位姿，使用当前状态" << std::endl;
+                // Should not reach here
+                std::cerr << "Warning: Parent KF" << parent_id << " has no saved initial pose, using current state" << std::endl;
                 T_j.block<3, 3>(0, 0) = data_.keyframes[parent_id]->quaternion.toRotationMatrix();
                 T_j.block<3, 1>(0, 3) = data_.keyframes[parent_id]->translation;
             }
             
-            // 计算相对变换 Sji = Sjw * Swi
+            // Compute relative transformation Sji = Sjw * Swi
             Eigen::Matrix4d T_ji = T_j * T_iw;
             Eigen::Vector3d translation = T_ji.block<3, 1>(0, 3);
             
             attempted_normal++;
             
-            // 添加约束
+            // Add constraint
             ceres::CostFunction* cost_function = SE3LoopConstraintCost::Create(T_ji, information);
             problem_->AddResidualBlock(cost_function, nullptr, 
-                                      data_.keyframes[kf_id]->se3_state.data(),      // 子节点
-                                      data_.keyframes[parent_id]->se3_state.data()); // 父节点
+                                      data_.keyframes[kf_id]->se3_state.data(),      // Child node
+                                      data_.keyframes[parent_id]->se3_state.data()); // Parent node
             
             normal_edges_added++;
             
             
-            // 打印详细信息
+            // Print detailed info
             if(printDetailedInfo) {
                 std::cout << "  Added Spanning Tree Edge: KF" << kf_id << " -> KF" << parent_id 
                           << " | Translation: [" << translation.transpose() << "]" 
                           << " | Scale: 1" << std::endl;
                 
-                // 额外添加的详细信息
+                // Additional detailed info
                 std::string source_i = usingNonCorrected_i ? "NonCorrectedSim3" : "VertexInitialPose";
                 std::string source_j = usingNonCorrected_j ? "NonCorrectedSim3" : "VertexInitialPose";
                 
@@ -1281,12 +1262,12 @@ public:
                           << " | KF" << parent_id << " using: " << source_j 
                           << std::endl;
                 
-                // 打印相机方向和旋转信息
+                // Print camera direction and rotation info
                 Eigen::Vector3d z_vec(0, 0, 1);
                 Eigen::Vector3d z_dir_i = T_iw.block<3, 3>(0, 0) * z_vec;
                 Eigen::Vector3d z_dir_j = T_j.inverse().block<3, 3>(0, 0) * z_vec;
                 
-                // 计算相对旋转角度
+                // Compute relative rotation angle
                 double angle = acos(z_dir_i.dot(z_dir_j) / (z_dir_i.norm() * z_dir_j.norm())) * 180.0 / M_PI;
                 
                 std::cout << "    Camera Dir KF" << kf_id << ": [" << z_dir_i.transpose() << "]" << std::endl;
@@ -1298,28 +1279,28 @@ public:
         
         std::cout << "\nSpanning Tree Edges Added: " << normal_edges_added << "/" << attempted_normal << std::endl;
         
-        // 第二阶段：添加共视图边
+        // Phase 2: Add covisibility graph edges
          std::cout << "\n=== Adding Covisibility Graph Edges ===" << std::endl;
         
        
         
-        const int minFeat = 100;  // 最小特征点阈值（与ORB-SLAM3一致）
-        int count_covis = 0;      // 添加到图中的共视边计数
-        int count_all_valid_covis = 0;  // 所有合格的共视关系（包括未添加的）
-        std::vector<int> covis_per_kf(data_.max_kf_id + 1, 0);  // 每个关键帧的共视边数量
-        std::map<int, std::vector<std::pair<int, int>>> covis_weights;  // 存储共视关系的权重
+        const int minFeat = 100;  // Minimum feature threshold (consistent with ORB-SLAM3)
+        int count_covis = 0;      // Covisibility edges added to graph
+        int count_all_valid_covis = 0;  // All valid covisibility relationships (including not added)
+        std::vector<int> covis_per_kf(data_.max_kf_id + 1, 0);  // Covisibility edges per keyframe
+        std::map<int, std::vector<std::pair<int, int>>> covis_weights;  // Store covisibility weights
         
         std::cout << "Minimum features for covisibility edge: " << minFeat << std::endl;
         
-        // 遍历所有关键帧
+        // Iterate through all keyframes
         for (const auto& kf_pair : data_.keyframes) {
-            int nIDi = kf_pair.first;  // 当前关键帧ID
+            int nIDi = kf_pair.first;  // Current keyframe ID
             auto& pKF = kf_pair.second;
             
-            // 跳过坏的关键帧
+            // Skip bad keyframes
             if (pKF->is_bad) continue;
             
-            // 获取当前关键帧的逆变换 Swi
+            // Get inverse transformation for current keyframe Swi
             Eigen::Matrix4d Swi = Eigen::Matrix4d::Identity();
             
             if (data_.non_corrected_poses.find(nIDi) != data_.non_corrected_poses.end()) {
@@ -1339,40 +1320,40 @@ public:
                 Swi = T.inverse();
             }
             
-            // 获取父关键帧ID
+            // Get parent keyframe ID
             int pParentKF = pKF->parent_id;
             
-            // 获取与当前关键帧有共视关系且权重>=minFeat的关键帧
-            // 这里模拟ORB-SLAM3的GetCovisiblesByWeight函数
+            // Get keyframes with covisibility weight >= minFeat
+            // This simulates ORB-SLAM3's GetCovisiblesByWeight function
             std::vector<std::pair<int, int>> orderedConnections;
             if (data_.covisibility.find(nIDi) != data_.covisibility.end()) {
-                // 从共视图中获取所有连接的关键帧
+                // Get all connected keyframes from covisibility graph
                 for (const auto& covis_pair : data_.covisibility[nIDi]) {
                     int connected_id = covis_pair.first;
                     int weight = covis_pair.second;
                     
-                    // 只保留权重大于等于minFeat的关键帧
+                    // Keep only keyframes with weight >= minFeat
                     if (weight >= minFeat) {
                         orderedConnections.push_back(std::make_pair(connected_id, weight));
                     }
                 }
                 
-                // 按权重降序排序（重要！与ORB-SLAM3保持一致）
+                // Sort by weight descending (important! consistent with ORB-SLAM3)
                 std::sort(orderedConnections.begin(), orderedConnections.end(), 
                     [](const std::pair<int, int>& a, const std::pair<int, int>& b) {
-                        return a.second > b.second; // 按权重降序
+                        return a.second > b.second; // Sort by weight descending
                     });
             }
             
-            // 提取排序后的关键帧ID
+            // Extract sorted keyframe IDs
             std::vector<int> vpConnectedKFs;
             for (const auto& pair : orderedConnections) {
                 vpConnectedKFs.push_back(pair.first);
             }
             
-            // 遍历共视关键帧
+            // Iterate through covisible keyframes
             for (int nIDj : vpConnectedKFs) {
-                // 检查连接的关键帧是否有效
+                // Check if connected keyframe is valid
                 if (data_.keyframes.find(nIDj) == data_.keyframes.end() || 
                     data_.keyframes[nIDj]->is_bad)
                     continue;
@@ -1381,9 +1362,9 @@ public:
                 
 
                 
-                // 检查是否满足条件：
-                // 1. 不是父关键帧
-                // 2. 不是当前关键帧的子关键帧（这需要从spanning_tree判断）
+                // Check conditions:
+                // 1. Not parent keyframe
+                // 2. Not child of current keyframe (check from spanning_tree)
                 bool isChild = false;
                 if (data_.spanning_tree.find(nIDi) != data_.spanning_tree.end()) {
                     const auto& children = data_.spanning_tree[nIDi];
@@ -1391,9 +1372,9 @@ public:
                 }
                 
 
-                // 在这里添加KF 0的调试代码
+                // Add debug code for KF 0
                 if (nIDi == 0 || nIDj == 0) {
-                    // 获取共视权重
+                    // Get covisibility weight
                     int weight = 0;
                     if (data_.covisibility.find(nIDi) != data_.covisibility.end() &&
                         data_.covisibility[nIDi].find(nIDj) != data_.covisibility[nIDi].end()) {
@@ -1401,11 +1382,11 @@ public:
                     }
                     
                     std::cout << "DEBUG KF0: ";
-                    std::cout << "处理 KF" << nIDi << " - KF" << nIDj 
-                            << ", 权重=" << weight
-                            << ", 父子关系:" << (nIDj == pParentKF || isChild ? "是" : "否")
-                            << ", nIDj < nIDi:" << (nIDj < nIDi ? "是" : "否")
-                            << ", 已在边集合:" << (sInsertedEdges.count(std::make_pair(std::min(nIDi, nIDj), std::max(nIDi, nIDj))) ? "是" : "否")
+                    std::cout << "Processing KF" << nIDi << " - KF" << nIDj 
+                            << ", weight=" << weight
+                            << ", parent-child:" << (nIDj == pParentKF || isChild ? "yes" : "no")
+                            << ", nIDj < nIDi:" << (nIDj < nIDi ? "yes" : "no")
+                            << ", already in edge set:" << (sInsertedEdges.count(std::make_pair(std::min(nIDi, nIDj), std::max(nIDi, nIDj))) ? "yes" : "no")
                             << std::endl;
                 }
                 
@@ -1415,28 +1396,28 @@ public:
 
                 
                 if (nIDj != pParentKF && !isChild) {
-                    // 统计所有合格的共视关系
+                    // Count all valid covisibility relationships
                     count_all_valid_covis++;
                     
-                    // 获取共视权重
+                    // Get covisibility weight
                     int weight = 0;
                     if (data_.covisibility.find(nIDi) != data_.covisibility.end() &&
                         data_.covisibility[nIDi].find(nIDj) != data_.covisibility[nIDi].end()) {
                         weight = data_.covisibility[nIDi][nIDj];
                     }
                     
-                    // 存储共视权重信息
+                    // Store covisibility weight info
                     covis_weights[nIDi].push_back(std::make_pair(nIDj, weight));
                     
-                    // 只处理ID小于当前ID的关键帧（避免重复）
+                    // Only process keyframes with ID less than current (avoid duplicates)
                     if (!pKFn->is_bad && nIDj < nIDi) {
-                        // 检查是否已经添加过这条边
+                        // Check if edge already added
                         if (sInsertedEdges.count(std::make_pair(
                             std::min(nIDi, nIDj),
                             std::max(nIDi, nIDj))))
                             continue;
                         
-                        // 获取连接关键帧的变换 Snw
+                        // Get transformation for connected keyframe Snw
                         Eigen::Matrix4d Snw = Eigen::Matrix4d::Identity();
                         
                         if (data_.non_corrected_poses.find(nIDj) != data_.non_corrected_poses.end()) {
@@ -1452,30 +1433,30 @@ public:
                             Snw.block<3, 1>(0, 3) = pKFn->translation;
                         }
                         
-                        // 计算相对变换 Sni = Snw * Swi
+                        // Compute relative transformation Sni = Snw * Swi
                         Eigen::Matrix4d Sni = Snw * Swi;
                         
-                        // 添加约束
+                        // Add constraint
                         ceres::CostFunction* en = SE3LoopConstraintCost::Create(Sni, information);
                         problem_->AddResidualBlock(en, nullptr, 
                                                  data_.keyframes[nIDi]->se3_state.data(),
                                                  data_.keyframes[nIDj]->se3_state.data());
                         
-                        // 在这里添加KF 0的边添加调试代码
+                        // Add debug for KF 0 edge addition
                         if (nIDi == 0 || nIDj == 0) {
-                            std::cout << "DEBUG KF0: 添加边 KF" << nIDi << " - KF" << nIDj 
-                                    << ", KF" << nIDi << "当前边数:" << covis_per_kf[nIDi] + 1
-                                    << ", KF" << nIDj << "当前边数:" << covis_per_kf[nIDj] + 1
+                            std::cout << "DEBUG KF0: Added edge KF" << nIDi << " - KF" << nIDj 
+                                    << ", KF" << nIDi << " current edges:" << covis_per_kf[nIDi] + 1
+                                    << ", KF" << nIDj << " current edges:" << covis_per_kf[nIDj] + 1
                                     << std::endl;
                         }
                         
-                        // 增加添加到图中的共视边计数
+                        // Increment covisibility edge counts
                         count_covis++;
                         covis_per_kf[nIDi]++;
                         covis_per_kf[nIDj]++;
-                        normal_edges_added++;  // 包含在总的normal边计数中
+                        normal_edges_added++;  // Include in total normal edge count
                         
-                        // 记录已添加的边
+                        // Record added edge
                         sInsertedEdges.insert(std::make_pair(
                             std::min(nIDi, nIDj),
                             std::max(nIDi, nIDj)
@@ -1485,10 +1466,10 @@ public:
             }
         }
 
-        // 按ID间隔统计关键帧共视关系
-        std::cout << "\n按ID分组的关键帧共视关系统计:" << std::endl;
+        // Statistics for keyframe covisibility relationships by ID intervals
+        std::cout << "\nKeyframe covisibility statistics by ID groups:" << std::endl;
         for (int id = 0; id <= data_.max_kf_id; id += 20) {
-            // 检查是否存在该ID的关键帧
+            // Check if keyframe with this ID exists
             bool found = false;
             for (const auto& kf_pair : data_.keyframes) {
                 if (kf_pair.first == id && !kf_pair.second->is_bad) {
@@ -1498,34 +1479,33 @@ public:
             }
             
             if (found) {
-                std::cout << "KF ID " << id << ": 添加到图的共视边数量 = " << covis_per_kf[id] << std::endl;
+                std::cout << "KF ID " << id << ": Covisibility edges added to graph = " << covis_per_kf[id] << std::endl;
                 
-                // 输出该关键帧的所有合格共视关系和权重
+                // Output all valid covisibility relationships and weights
                 if (covis_weights.find(id) != covis_weights.end()) {
-                    std::cout << "  所有合格共视关系 (ID, 权重):" << std::endl;
+                    std::cout << "  All valid covisibility relationships (ID, weight):" << std::endl;
                     for (const auto& pair : covis_weights[id]) {
-                        std::cout << "  -> KF " << pair.first << ", 权重: " << pair.second << std::endl;
+                        std::cout << "  -> KF " << pair.first << ", weight: " << pair.second << std::endl;
                     }
-                    std::cout << "  合格共视关系总数: " << covis_weights[id].size() << std::endl;
+                    std::cout << "  Total valid covisibility relationships: " << covis_weights[id].size() << std::endl;
                 } else {
-                    std::cout << "  没有合格的共视关系" << std::endl;
+                    std::cout << "  No valid covisibility relationships" << std::endl;
                 }
             }
         }
         
-        std::cout << "\n总共添加到图中的共视边数量: " << count_covis << std::endl;
-        std::cout << "所有合格的共视关系总数(包括未添加到图中的): " << count_all_valid_covis << std::endl;
+        std::cout << "\nTotal covisibility edges added to graph: " << count_covis << std::endl;
+        std::cout << "All valid covisibility relationships (including not added to graph): " << count_all_valid_covis << std::endl;
 
         std::cout << "\nSuccessful Normal Edges: " << normal_edges_added << "/" << (attempted_normal + count_all_valid_covis) << std::endl;
         std::cout << "Total KeyFrames Processed: " << validKFCount << "/" << data_.keyframes.size() << std::endl;
     }
-        
     
-    // 输出优化后的姿态
+    // Output optimized poses
     void OutputOptimizedPoses(const std::string& output_file) {
         std::ofstream file(output_file);
         if (!file.is_open()) {
-            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            std::cerr << "Cannot create output file: " << output_file << std::endl;
             return;
         }
         
@@ -1541,16 +1521,16 @@ public:
                  << state[3] << " " << state[4] << " " << state[5] << " " << state[6] << std::endl;
         }
         
-        std::cout << "优化后的姿态已保存到: " << output_file << std::endl;
+        std::cout << "Optimized poses saved to: " << output_file << std::endl;
     }
 
 
 
     void VerifyVertexPosesConsistency() {
-        std::cout << "\n=== 验证顶点位姿一致性 ===" << std::endl;
+        std::cout << "\n=== Verify Vertex Poses Consistency ===" << std::endl;
         
         if (data_.vertex_initial_poses_Tcw.empty()) {
-            std::cout << "没有保存的顶点初始位姿，跳过验证" << std::endl;
+            std::cout << "No saved vertex initial poses, skipping verification" << std::endl;
             return;
         }
         
@@ -1564,24 +1544,24 @@ public:
             
             if (kf->is_bad) continue;
             
-            // 检查是否有保存的初始位姿
+            // Check if saved initial pose exists
             if (data_.vertex_initial_poses_Tcw.find(kf_id) == data_.vertex_initial_poses_Tcw.end()) 
                 continue;
             
-            // 获取保存的初始位姿
+            // Get saved initial pose
             const Eigen::Matrix4d& T_saved = data_.vertex_initial_poses_Tcw[kf_id];
             
-            // 获取当前关键帧位姿
+            // Get current keyframe pose
             Eigen::Matrix4d T_current = Eigen::Matrix4d::Identity();
             T_current.block<3, 3>(0, 0) = kf->quaternion.toRotationMatrix();
             T_current.block<3, 1>(0, 3) = kf->translation;
             
-            // 计算位置差异
+            // Calculate position difference
             Eigen::Vector3d pos_saved = T_saved.block<3, 1>(0, 3);
             Eigen::Vector3d pos_current = T_current.block<3, 1>(0, 3);
             double pos_diff = (pos_saved - pos_current).norm();
             
-            // 检查是否有明显差异
+            // Check for significant differences
             if (pos_diff > 1e-6) {
                 mismatch_count++;
                 
@@ -1590,98 +1570,94 @@ public:
                     max_diff_kf = kf_id;
                 }
                 
-                // 仅打印一些关键帧的差异
+                // Print differences for some keyframes
                 if (kf_id % 100 == 0 || kf_id == data_.init_kf_id || kf_id == data_.loop_kf_id || kf_id == data_.current_kf_id) {
-                    std::cout << "KF" << kf_id << " 位姿差异: " << pos_diff 
-                             << " meters | 保存位置: [" << pos_saved.transpose() 
-                             << "] | 当前位置: [" << pos_current.transpose() << "]" << std::endl;
+                    std::cout << "KF" << kf_id << " pose difference: " << pos_diff 
+                             << " meters | Saved position: [" << pos_saved.transpose() 
+                             << "] | Current position: [" << pos_current.transpose() << "]" << std::endl;
                 }
             }
         }
         
-        std::cout << "总共 " << mismatch_count << " 个关键帧与保存的初始位姿不一致" << std::endl;
+        std::cout << "Total " << mismatch_count << " keyframes differ from saved initial poses" << std::endl;
         if (max_diff_kf >= 0) {
-            std::cout << "最大差异: " << max_diff << " meters, 在KF" << max_diff_kf << std::endl;
+            std::cout << "Maximum difference: " << max_diff << " meters, at KF" << max_diff_kf << std::endl;
         }
     }
 
 
 
 
-    // 获取参数块信息
+    // Get parameter block information
     void PrintProblemInfo() {
-        std::cout << "\n优化问题信息:" << std::endl;
-        std::cout << "参数块数量: " << problem_->NumParameterBlocks() << std::endl;
-        std::cout << "残差块数量: " << problem_->NumResidualBlocks() << std::endl;
-        std::cout << "参数数量: " << problem_->NumParameters() << std::endl;
-        std::cout << "残差数量: " << problem_->NumResiduals() << std::endl;
+        std::cout << "\nOptimization problem info:" << std::endl;
+        std::cout << "Parameter blocks: " << problem_->NumParameterBlocks() << std::endl;
+        std::cout << "Residual blocks: " << problem_->NumResidualBlocks() << std::endl;
+        std::cout << "Parameters: " << problem_->NumParameters() << std::endl;
+        std::cout << "Residuals: " << problem_->NumResiduals() << std::endl;
     }
 
-    // 输出优化后的Twc格式姿态（相机在世界坐标系中的位置）
+    // Output optimized Twc format poses (camera position in world coordinates)
     void OutputOptimizedPosesTwc(const std::string& output_file) {
         std::ofstream file(output_file);
         if (!file.is_open()) {
-            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            std::cerr << "Cannot create output file: " << output_file << std::endl;
             return;
         }
         
-        file << "# KF_ID tx ty tz qx qy qz qw (Twc format - 相机在世界坐标系中的位置)" << std::endl;
+        file << "# KF_ID tx ty tz qx qy qz qw (Twc format - camera position in world coordinates)" << std::endl;
         
         for (const auto& kf_pair : data_.keyframes) {
             const auto& kf = kf_pair.second;
             if (kf->is_bad) continue;
             
-            // 从SE3状态获取Tcw
+            // Get Tcw from SE3 state
             Eigen::Vector3d t_cw(kf->se3_state[0], kf->se3_state[1], kf->se3_state[2]);
             Eigen::Quaterniond q_cw(kf->se3_state[6], kf->se3_state[3], kf->se3_state[4], kf->se3_state[5]);
             
-            // 构建Tcw变换矩阵
+            // Build Tcw transformation matrix
             Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
             T_cw.block<3, 3>(0, 0) = q_cw.toRotationMatrix();
             T_cw.block<3, 1>(0, 3) = t_cw;
             
-            // 计算Twc = Tcw^(-1)
+            // Calculate Twc = Tcw^(-1)
             Eigen::Matrix4d T_wc = T_cw.inverse();
             
-            // 提取Twc的平移和旋转
+            // Extract Twc translation and rotation
             Eigen::Vector3d t_wc = T_wc.block<3, 1>(0, 3);
             Eigen::Matrix3d R_wc = T_wc.block<3, 3>(0, 0);
             Eigen::Quaterniond q_wc(R_wc);
             
-            // 输出Twc格式
+            // Output Twc format
             file << kf->id << " "
                  << t_wc.x() << " " << t_wc.y() << " " << t_wc.z() << " "
                  << q_wc.x() << " " << q_wc.y() << " " << q_wc.z() << " " << q_wc.w() << std::endl;
         }
         
-        std::cout << "优化后的Twc姿态已保存到: " << output_file << std::endl;
+        std::cout << "Optimized Twc poses saved to: " << output_file << std::endl;
     }
     
-    // 同时输出Tcw和Twc格式
+    // Output both Tcw and Twc formats
     void OutputBothFormats(const std::string& output_dir, const std::string& suffix = "") {
         std::string tcw_file = output_dir + "/poses_tcw" + suffix + ".txt";
         std::string twc_file = output_dir + "/poses_twc" + suffix + ".txt";
         
-        // 输出Tcw格式
+        // Output Tcw format
         OutputOptimizedPoses(tcw_file);
         
-        // 输出Twc格式  
+        // Output Twc format  
         OutputOptimizedPosesTwc(twc_file);
     }
 
-    // 输出优化后的Twc格式姿态（TUM格式，按时间戳排序）
+    // Output optimized Twc format poses (TUM format, sorted by timestamp)
     void OutputOptimizedPosesTwcTUM(const std::string& output_file) {
         std::ofstream file(output_file);
         if (!file.is_open()) {
-            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            std::cerr << "Cannot create output file: " << output_file << std::endl;
             return;
         }
         
-        // TUM格式头部
-        // file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
-        // file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
-        
-        // 收集所有关键帧的时间戳和姿态
+        // Collect all keyframe timestamps and poses
         struct KeyFramePose {
             double timestamp;
             int kf_id;
@@ -1695,24 +1671,24 @@ public:
             const auto& kf = kf_pair.second;
             if (kf->is_bad) continue;
             
-            // 从SE3状态获取Tcw
+            // Get Tcw from SE3 state
             Eigen::Vector3d t_cw(kf->se3_state[0], kf->se3_state[1], kf->se3_state[2]);
             Eigen::Quaterniond q_cw(kf->se3_state[6], kf->se3_state[3], kf->se3_state[4], kf->se3_state[5]);
             
-            // 构建Tcw变换矩阵
+            // Build Tcw transformation matrix
             Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
             T_cw.block<3, 3>(0, 0) = q_cw.toRotationMatrix();
             T_cw.block<3, 1>(0, 3) = t_cw;
             
-            // 计算Twc = Tcw^(-1)
+            // Calculate Twc = Tcw^(-1)
             Eigen::Matrix4d T_wc = T_cw.inverse();
             
-            // 提取Twc的平移和旋转
+            // Extract Twc translation and rotation
             Eigen::Vector3d t_wc = T_wc.block<3, 1>(0, 3);
             Eigen::Matrix3d R_wc = T_wc.block<3, 3>(0, 0);
             Eigen::Quaterniond q_wc(R_wc);
             
-            // 创建KeyFramePose对象
+            // Create KeyFramePose object
             KeyFramePose kf_pose;
             kf_pose.timestamp = kf->timestamp;
             kf_pose.kf_id = kf->id;
@@ -1722,15 +1698,15 @@ public:
             kf_poses.push_back(kf_pose);
         }
         
-        // 按时间戳排序
+        // Sort by timestamp
         std::sort(kf_poses.begin(), kf_poses.end(), 
                   [](const KeyFramePose& a, const KeyFramePose& b) {
                       return a.timestamp < b.timestamp;
                   });
         
-        // 输出TUM格式
+        // Output TUM format
         for (const auto& kf_pose : kf_poses) {
-            // TUM格式：timestamp tx ty tz qx qy qz qw
+            // TUM format: timestamp tx ty tz qx qy qz qw
             file << std::fixed << std::setprecision(9) << kf_pose.timestamp << " "
                  << std::setprecision(9)
                  << kf_pose.position_wc.x() << " " 
@@ -1742,23 +1718,19 @@ public:
                  << kf_pose.quaternion_wc.w() << std::endl;
         }
         
-        std::cout << "优化后的TUM格式Twc轨迹已保存到: " << output_file << std::endl;
-        std::cout << "包含 " << kf_poses.size() << " 个关键帧，按时间戳排序" << std::endl;
+        std::cout << "Optimized TUM format Twc trajectory saved to: " << output_file << std::endl;
+        std::cout << "Contains " << kf_poses.size() << " keyframes, sorted by timestamp" << std::endl;
     }
     
-    // 输出优化前的Twc格式姿态（TUM格式，按时间戳排序）
+    // Output initial Twc format poses (TUM format, sorted by timestamp)
     void OutputInitialPosesTwcTUM(const std::string& output_file) {
         std::ofstream file(output_file);
         if (!file.is_open()) {
-            std::cerr << "无法创建输出文件: " << output_file << std::endl;
+            std::cerr << "Cannot create output file: " << output_file << std::endl;
             return;
         }
         
-        // TUM格式头部
-        // file << "# TUM trajectory format (Twc - camera pose in world frame)" << std::endl;
-        // file << "# timestamp tx ty tz qx qy qz qw" << std::endl;
-        
-        // 收集所有关键帧的时间戳和姿态
+        // Collect all keyframe timestamps and poses
         struct KeyFramePose {
             double timestamp;
             int kf_id;
@@ -1772,7 +1744,7 @@ public:
             const auto& kf = kf_pair.second;
             if (kf->is_bad) continue;
             
-            // 检查是否有修正姿态，如果有则使用修正姿态，否则使用当前姿态
+            // Check for corrected pose, use if available, otherwise use current pose
             Eigen::Vector3d t_cw;
             Eigen::Quaterniond q_cw;
             
@@ -1781,25 +1753,25 @@ public:
                 t_cw = corrected.translation;
                 q_cw = corrected.quaternion;
             } else {
-                // 使用当前姿态作为初始姿态
+                // Use current pose as initial pose
                 t_cw = kf->translation;
                 q_cw = kf->quaternion;
             }
             
-            // 构建Tcw变换矩阵
+            // Build Tcw transformation matrix
             Eigen::Matrix4d T_cw = Eigen::Matrix4d::Identity();
             T_cw.block<3, 3>(0, 0) = q_cw.toRotationMatrix();
             T_cw.block<3, 1>(0, 3) = t_cw;
             
-            // 计算Twc = Tcw^(-1)
+            // Calculate Twc = Tcw^(-1)
             Eigen::Matrix4d T_wc = T_cw.inverse();
             
-            // 提取Twc的平移和旋转
+            // Extract Twc translation and rotation
             Eigen::Vector3d t_wc = T_wc.block<3, 1>(0, 3);
             Eigen::Matrix3d R_wc = T_wc.block<3, 3>(0, 0);
             Eigen::Quaterniond q_wc(R_wc);
             
-            // 创建KeyFramePose对象
+            // Create KeyFramePose object
             KeyFramePose kf_pose;
             kf_pose.timestamp = kf->timestamp;
             kf_pose.kf_id = kf->id;
@@ -1809,15 +1781,15 @@ public:
             kf_poses.push_back(kf_pose);
         }
         
-        // 按时间戳排序
+        // Sort by timestamp
         std::sort(kf_poses.begin(), kf_poses.end(), 
                   [](const KeyFramePose& a, const KeyFramePose& b) {
                       return a.timestamp < b.timestamp;
                   });
         
-        // 输出TUM格式
+        // Output TUM format
         for (const auto& kf_pose : kf_poses) {
-            // TUM格式：timestamp tx ty tz qx qy qz qw
+            // TUM format: timestamp tx ty tz qx qy qz qw
             file << std::fixed << std::setprecision(9) << kf_pose.timestamp << " "
                  << std::setprecision(9)
                  << kf_pose.position_wc.x() << " " 
@@ -1829,41 +1801,41 @@ public:
                  << kf_pose.quaternion_wc.w() << std::endl;
         }
         
-        std::cout << "优化前的TUM格式Twc轨迹已保存到: " << output_file << std::endl;
-        std::cout << "包含 " << kf_poses.size() << " 个关键帧，按时间戳排序" << std::endl;
+        std::cout << "Initial TUM format Twc trajectory saved to: " << output_file << std::endl;
+        std::cout << "Contains " << kf_poses.size() << " keyframes, sorted by timestamp" << std::endl;
     }
     
-    // 输出TUM格式的轨迹文件
+    // Output TUM format trajectory files
     void OutputTUMTrajectory(const std::string& output_dir) {
         std::string tum_before_file = output_dir + "/trajectory_before_optimization.txt";
         std::string tum_after_file = output_dir + "/trajectory_after_optimization.txt";
         
-        // 输出优化前的TUM格式轨迹
+        // Output TUM format trajectory before optimization
         OutputInitialPosesTwcTUM(tum_before_file);
         
-        // 输出优化后的TUM格式轨迹
+        // Output TUM format trajectory after optimization
         OutputOptimizedPosesTwcTUM(tum_after_file);
     }
 
-    // 获取关键帧信息用于调试
+    // Get keyframe info for debugging
     void PrintKeyFrameInfo(int id) {
         if (data_.keyframes.find(id) != data_.keyframes.end()) {
             const auto& kf = data_.keyframes[id];
-            std::cout << "关键帧 " << id << ":" << std::endl;
-            std::cout << "  位置: [" << kf->translation.transpose() << "]" << std::endl;
-            std::cout << "  四元数: [" << kf->quaternion.x() << ", " << kf->quaternion.y() 
+            std::cout << "Keyframe " << id << ":" << std::endl;
+            std::cout << "  Position: [" << kf->translation.transpose() << "]" << std::endl;
+            std::cout << "  Quaternion: [" << kf->quaternion.x() << ", " << kf->quaternion.y() 
                       << ", " << kf->quaternion.z() << ", " << kf->quaternion.w() << "]" << std::endl;
-            std::cout << "  固定: " << (kf->is_fixed ? "是" : "否") << std::endl;
-            std::cout << "  坏帧: " << (kf->is_bad ? "是" : "否") << std::endl;
+            std::cout << "  Fixed: " << (kf->is_fixed ? "yes" : "no") << std::endl;
+            std::cout << "  Bad: " << (kf->is_bad ? "yes" : "no") << std::endl;
         }
     }
 
 
-    // 打印优化结果
+    // Print optimization results
     void PrintOptimizationResults() {
-        std::cout << "\n=== 优化结果分析 ===" << std::endl;
+        std::cout << "\n=== Optimization Results Analysis ===" << std::endl;
         
-        // 打印几个关键帧的优化前后对比
+        // Print before/after comparison for key frames
         std::vector<int> key_frames = {0, data_.loop_kf_id, data_.current_kf_id};
         
         for (int kf_id : key_frames) {
@@ -1871,7 +1843,7 @@ public:
             
             auto kf = data_.keyframes[kf_id];
             
-            // 优化前的姿态（从corrected_poses或原始姿态）
+            // Pose before optimization (from corrected_poses or original)
             Eigen::Vector3d pos_before;
             Eigen::Quaterniond quat_before;
             
@@ -1879,7 +1851,7 @@ public:
                 pos_before = data_.corrected_poses[kf_id].translation;
                 quat_before = data_.corrected_poses[kf_id].quaternion;
             } else {
-                // 使用初始姿态
+                // Use initial pose
                 std::ifstream file("/Datasets/CERES_Work/input/optimization_data/keyframe_poses.txt");
                 std::string line;
                 while (std::getline(file, line)) {
@@ -1895,33 +1867,33 @@ public:
                 }
             }
             
-            // 优化后的姿态
+            // Pose after optimization
             Eigen::Vector3d pos_after(kf->se3_state[0], kf->se3_state[1], kf->se3_state[2]);
             Eigen::Quaterniond quat_after(kf->se3_state[6], kf->se3_state[3], kf->se3_state[4], kf->se3_state[5]);
             
-            // 计算位置变化
+            // Calculate position change
             double pos_change = (pos_after - pos_before).norm();
             
-            // 计算旋转变化（角度）
+            // Calculate rotation change (angle)
             Eigen::Quaterniond quat_diff = quat_before.inverse() * quat_after;
             double angle_change = 2.0 * acos(std::abs(quat_diff.w())) * 180.0 / M_PI;
             
-            std::cout << "关键帧 " << kf_id << ":" << std::endl;
-            std::cout << "  位置变化: " << pos_change << " 米" << std::endl;
-            std::cout << "  旋转变化: " << angle_change << " 度" << std::endl;
-            std::cout << "  优化前位置: [" << pos_before.transpose() << "]" << std::endl;
-            std::cout << "  优化后位置: [" << pos_after.transpose() << "]" << std::endl;
+            std::cout << "Keyframe " << kf_id << ":" << std::endl;
+            std::cout << "  Position change: " << pos_change << " meters" << std::endl;
+            std::cout << "  Rotation change: " << angle_change << " degrees" << std::endl;
+            std::cout << "  Position before: [" << pos_before.transpose() << "]" << std::endl;
+            std::cout << "  Position after: [" << pos_after.transpose() << "]" << std::endl;
             std::cout << std::endl;
         }
         
-        // 计算所有关键帧的平均位置变化
+        // Calculate average position change for all keyframes
         double total_pos_change = 0.0;
         int count = 0;
         
         for (const auto& kf_pair : data_.keyframes) {
             if (kf_pair.second->is_bad) continue;
             
-            // 这里简化，假设没有修正姿态的帧位置变化为0
+            // Simplified: assume frames without corrected poses have 0 position change
             if (data_.corrected_poses.find(kf_pair.first) != data_.corrected_poses.end()) {
                 const auto& before = data_.corrected_poses[kf_pair.first];
                 Eigen::Vector3d after(kf_pair.second->se3_state[0], 
@@ -1933,34 +1905,34 @@ public:
         }
         
         if (count > 0) {
-            std::cout << "平均位置变化: " << total_pos_change / count << " 米" << std::endl;
+            std::cout << "Average position change: " << total_pos_change / count << " meters" << std::endl;
         }
         
-        std::cout << "参与优化的关键帧数: " << count << std::endl;
+        std::cout << "Keyframes optimized: " << count << std::endl;
     }
 
 
     bool OptimizeEssentialGraph() {
-        std::cout << "\n开始本质图优化..." << std::endl;
+        std::cout << "\nStarting essential graph optimization..." << std::endl;
         
-        // 配置求解器选项
+        // Configure solver options
         ceres::Solver::Options options;
-        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY; // 可以尝试不同的求解器
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY; // Can try different solvers
         options.minimizer_progress_to_stdout = true;
-        options.max_num_iterations = 100;  // 增加迭代次数
+        options.max_num_iterations = 100;  // Increased iterations
         options.num_threads = 4;
         options.function_tolerance = 1e-6;
         options.gradient_tolerance = 1e-8;
         options.parameter_tolerance = 1e-8;
         
-        // 求解
+        // Solve
         ceres::Solver::Summary summary;
         ceres::Solve(options, problem_.get(), &summary);
         
-        std::cout << "\n=== 优化详细报告 ===" << std::endl;
+        std::cout << "\n=== Optimization Detailed Report ===" << std::endl;
         std::cout << summary.FullReport() << std::endl;
         
-        // 更新所有关键帧的姿态
+        // Update all keyframe poses
         for (auto& kf_pair : data_.keyframes) {
             kf_pair.second->UpdateFromState();
         }
@@ -1972,85 +1944,76 @@ public:
 
 
 int main() {
-    // 数据文件路径
+    // Data file paths
     std::string data_dir = "/Datasets/CERES_Work/input/optimization_data";
     std::string output_dir = "/Datasets/CERES_Work/output";
     
-    // 创建输出目录
+    // Create output directory
     system(("mkdir -p " + output_dir).c_str());
     
-    // 创建优化器
+    // Create optimizer
     ORBSlamLoopOptimizer optimizer;
     
-    // 解析所有数据文件
+    // Parse all data files
     if (!optimizer.ParseAllData(data_dir)) {
-        std::cerr << "数据解析失败" << std::endl;
+        std::cerr << "Data parsing failed" << std::endl;
         return -1;
     }
     
-    // 设置优化问题
+    // Setup optimization problem
     optimizer.SetupOptimizationProblem();
     
-    // 验证位姿一致性
+    // Verify pose consistency
     optimizer.VerifyVertexPosesConsistency();
     
-    // 添加回环约束
+    // Add loop constraints
     optimizer.AddLoopConstraints();
     
 
-    // 添加正常边约束（生成树）
+    // Add normal edge constraints (spanning tree)
     optimizer.AddNormalEdgeConstraints();
 
     
-    // 再次验证所有边添加后的位姿一致性
+    // Verify pose consistency again after adding all edges
     optimizer.VerifyVertexPosesConsistency();
     
-    // 打印问题信息
+    // Print problem info
     optimizer.PrintProblemInfo();
     
-    // 打印一些关键帧信息用于调试
-    optimizer.PrintKeyFrameInfo(0);  // 初始关键帧
+    // Print some keyframe info for debugging
+    optimizer.PrintKeyFrameInfo(0);  // Initial keyframe
     
-    // std::cout << "\n注意：当前版本只添加了关键帧顶点，约束部分将在后续版本中添加" << std::endl;
-    
-    // // 输出初始姿态（用于验证）
-    // optimizer.OutputOptimizedPoses(output_dir + "/initial_poses.txt");
-    
-    // 输出优化前的姿态（两种格式）
-    std::cout << "\n保存优化前姿态..." << std::endl;
+    // Save poses before optimization
+    std::cout << "\nSaving poses before optimization..." << std::endl;
     optimizer.OutputBothFormats(output_dir, "_before_optimization");
     
-    // 执行优化！
-    std::cout << "\n=== 开始执行回环优化 ===" << std::endl;
+    // Execute optimization!
+    std::cout << "\n=== Starting Loop Optimization ===" << std::endl;
     
     bool success = optimizer.OptimizeEssentialGraph();
     
     if (success) {
-        std::cout << "\n=== 优化成功完成 ===" << std::endl;
+        std::cout << "\n=== Optimization Successfully Completed ===" << std::endl;
         
-        // // 输出优化后的姿态
-        // optimizer.OutputOptimizedPoses(output_dir + "/poses_after_optimization.txt");
-
-
-        // 输出TUM格式的轨迹文件（按时间戳排序）
-        std::cout << "\n保存TUM格式轨迹文件..." << std::endl;
+        // Output TUM format trajectory files (sorted by timestamp)
+        std::cout << "\nSaving TUM format trajectory files..." << std::endl;
         optimizer.OutputTUMTrajectory(output_dir);
         
-        // 输出优化后的姿态（两种格式）
-        std::cout << "\n保存优化后姿态..." << std::endl;
+        // Output optimized poses (both formats)
+        std::cout << "\nSaving optimized poses..." << std::endl;
         optimizer.OutputBothFormats(output_dir, "_after_optimization");
         
-        // 打印一些关键帧的优化前后对比
+        // Print before/after comparison for some keyframes
         optimizer.PrintOptimizationResults();
         
-        std::cout << "\n输出文件说明:" << std::endl;
-        std::cout << "- trajectory_before_optimization.txt: 优化前TUM格式轨迹（按时间戳排序）" << std::endl;
-        std::cout << "- trajectory_after_optimization.txt: 优化后TUM格式轨迹（按时间戳排序）" << std::endl;
-        std::cout << "- poses_tcw_*.txt: Tcw格式（世界到相机的变换）" << std::endl;
-        std::cout << "- poses_twc_*.txt: Twc格式（相机在世界坐标系中的位置）" << std::endl;
+        std::cout << "\nOutput files description:" << std::endl;
+        std::cout << "- trajectory_before_optimization.txt: TUM format trajectory before optimization (sorted by timestamp)" << std::endl;
+        std::cout << "- trajectory_after_optimization.txt: TUM format trajectory after optimization (sorted by timestamp)" << std::endl;
+        std::cout << "- poses_tcw_*.txt: Tcw format (world to camera transformation)" << std::endl;
+        std::cout << "- poses_twc_*.txt: Twc format (camera position in world coordinates)" << std::endl;
         
     } else {
-        std::cout << "\n=== 优化失败 ===" << std::endl;
+        std::cout << "\n=== Optimization Failed ===" << std::endl;
         return -1;
     }
     
