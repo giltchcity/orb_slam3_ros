@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Voxblox风格的数据提取器
-结合了严格的Voxblox过滤机制和完整的数据提取
+Voxblox-style Data Extractor
+Combines strict Voxblox filtering mechanisms with complete data extraction
 """
 
 import numpy as np
@@ -34,17 +34,17 @@ except ImportError:
 
 class VoxbloxStyleDataExtractor:
     """
-    基于Voxblox原理的数据提取器
-    核心特性：
-    1. Truncation distance限制（最重要！）
-    2. Anti-grazing过滤
-    3. 连续观测要求
-    4. 深度一致性检查
-    5. 从rosbag提取实际深度
+    Data extractor based on Voxblox principles
+    Core features:
+    1. Truncation distance limit (most important!)
+    2. Anti-grazing filter
+    3. Consecutive observation requirements
+    4. Depth consistency check
+    5. Extract actual depth from rosbag
     """
     
     def __init__(self, camera_params: dict, voxblox_params: dict = None):
-        # 相机参数
+        # Camera parameters
         self.fx = camera_params['fx']
         self.fy = camera_params['fy']
         self.cx = camera_params['cx']
@@ -52,28 +52,28 @@ class VoxbloxStyleDataExtractor:
         self.width = camera_params.get('width', 640)
         self.height = camera_params.get('height', 480)
         
-        # Voxblox参数（关键！）
+        # Voxblox parameters (critical!)
         if voxblox_params is None:
             voxblox_params = {}
         
-        # TSDF核心参数
+        # TSDF core parameters
         self.voxel_size = voxblox_params.get('voxel_size', 0.02)  # 2cm voxel
         self.truncation_distance = voxblox_params.get('truncation_distance', 3.0 * self.voxel_size)  # 6cm
         
-        # 深度范围
+        # Depth range
         self.min_depth = voxblox_params.get('min_depth', 0.3)
         self.max_depth = voxblox_params.get('max_depth', 4.0)
         
-        # Anti-grazing参数（避免掠射角）
+        # Anti-grazing parameters (avoid grazing angles)
         self.max_grazing_angle = voxblox_params.get('max_grazing_angle', 70.0)  # degrees
         self.cos_min_angle = np.cos(np.radians(self.max_grazing_angle))
         
-        # 观测质量参数
+        # Observation quality parameters
         self.min_consecutive_observations = voxblox_params.get('min_consecutive_observations', 3)
-        self.max_frame_gap = voxblox_params.get('max_frame_gap', 2)  # 允许跳过的帧数
+        self.max_frame_gap = voxblox_params.get('max_frame_gap', 2)  # Number of frames allowed to skip
         self.max_observations_per_point = voxblox_params.get('max_observations_per_point', 20)
         
-        # 深度图像存储
+        # Depth image storage
         self.depth_images = {}
         
         if HAS_ROSBAG:
@@ -87,7 +87,7 @@ class VoxbloxStyleDataExtractor:
         print(f"  - Min consecutive obs: {self.min_consecutive_observations}")
     
     def load_trajectory(self, file_path: str) -> Tuple[Dict[int, np.ndarray], List[int], List[float]]:
-        """加载轨迹文件"""
+        """Load trajectory file"""
         poses = {}
         kf_indices = []
         timestamps = []
@@ -104,7 +104,7 @@ class VoxbloxStyleDataExtractor:
                 
                 parts = line.strip().split()
                 
-                # TUM格式
+                # TUM format
                 if len(parts) == 8:
                     try:
                         timestamp = float(parts[0])
@@ -116,7 +116,7 @@ class VoxbloxStyleDataExtractor:
                         T_wc[:3, :3] = rotation.as_matrix()
                         T_wc[:3, 3] = [tx, ty, tz]
                         
-                        # 转换为相机到世界的变换（注意这里！）
+                        # Convert to camera-to-world transformation (note this!)
                         T_cw = np.linalg.inv(T_wc)
                         
                         poses[kf_idx] = T_cw
@@ -131,7 +131,7 @@ class VoxbloxStyleDataExtractor:
     
     def load_depth_from_rosbag(self, bag_file: str, kf_indices: List[int], 
                                timestamps: List[float], depth_topic: str = '/camera/depth/image_raw'):
-        """从rosbag加载深度图像"""
+        """Load depth images from rosbag"""
         if not HAS_ROSBAG:
             print("Rosbag not available, using projected depth only")
             return
@@ -151,7 +151,7 @@ class VoxbloxStyleDataExtractor:
         
         for kf_idx, kf_time in zip(kf_indices, timestamps):
             best_msg = None
-            best_time_diff = 0.05  # 50ms容差
+            best_time_diff = 0.05  # 50ms tolerance
             
             for msg_time, msg in depth_msgs:
                 time_diff = abs(msg_time - kf_time)
@@ -167,7 +167,7 @@ class VoxbloxStyleDataExtractor:
         print(f"Loaded {len(self.depth_images)} depth images")
     
     def get_depth_at_pixel(self, kf_idx: int, u: float, v: float) -> Tuple[float, float]:
-        """获取像素处的深度值"""
+        """Get depth value at pixel"""
         if kf_idx not in self.depth_images:
             return -1.0, 0.0
         
@@ -190,7 +190,7 @@ class VoxbloxStyleDataExtractor:
     
     def check_anti_grazing(self, camera_origin: np.ndarray, point_3d: np.ndarray, 
                           surface_normal: Optional[np.ndarray] = None) -> bool:
-        """检查是否为掠射角（Voxblox的anti-grazing filter）"""
+        """Check for grazing angle (Voxblox's anti-grazing filter)"""
         view_direction = point_3d - camera_origin
         view_distance = np.linalg.norm(view_direction)
         
@@ -202,64 +202,64 @@ class VoxbloxStyleDataExtractor:
         if surface_normal is not None:
             cos_angle = abs(np.dot(view_direction, surface_normal))
             if cos_angle < self.cos_min_angle:
-                return False  # 角度太大，是掠射
+                return False  # Angle too large, it's grazing
         
         return True
     
     def compute_observation_weight(self, depth_diff: float, depth: float, 
                                   grazing_factor: float = 1.0) -> float:
-        """计算观测权重（Voxblox风格）"""
-        # Truncation权重：距离表面越近权重越高
+        """Compute observation weight (Voxblox style)"""
+        # Truncation weight: closer to surface means higher weight
         truncation_weight = np.exp(-abs(depth_diff) / self.truncation_distance)
         
-        # 深度权重：近处观测更可靠
+        # Depth weight: near observations are more reliable
         depth_weight = 1.0 / (1.0 + depth / 5.0)
         
-        # 综合权重
+        # Combined weight
         return truncation_weight * depth_weight * grazing_factor
     
     def process_single_observation(self, point_3d: np.ndarray, kf_idx: int, 
                                   T_cw: np.ndarray, surface_normal: Optional[np.ndarray] = None) -> Optional[Dict]:
         """
-        处理单个观测（核心函数！）
-        实现Voxblox的关键过滤机制
+        Process single observation (core function!)
+        Implements Voxblox's key filtering mechanisms
         """
-        # 获取相机原点
+        # Get camera origin
         T_wc = np.linalg.inv(T_cw)
         camera_origin = T_wc[:3, 3]
         
-        # 计算到相机的距离（用于truncation检查）
+        # Calculate distance to camera (for truncation check)
         distance_to_camera = np.linalg.norm(point_3d - camera_origin)
         
-        # 变换到相机坐标系
+        # Transform to camera coordinate system
         point_homo = np.append(point_3d, 1)
         point_cam = T_cw @ point_homo
         depth_projected = point_cam[2]
         
-        # 深度范围检查
+        # Depth range check
         if depth_projected <= self.min_depth or depth_projected > self.max_depth:
             return None
         
-        # 投影到图像
+        # Project to image
         u = self.fx * point_cam[0] / depth_projected + self.cx
         v = self.fy * point_cam[1] / depth_projected + self.cy
         
-        # 图像边界检查
+        # Image boundary check
         if not (0 <= u < self.width and 0 <= v < self.height):
             return None
         
-        # Anti-grazing检查（重要！）
+        # Anti-grazing check (important!)
         grazing_factor = 1.0
         if surface_normal is not None:
             if not self.check_anti_grazing(camera_origin, point_3d, surface_normal):
                 return None
             
-            # 计算grazing factor用于权重
+            # Calculate grazing factor for weight
             view_dir = (point_3d - camera_origin) / distance_to_camera
             grazing_factor = max(0.1, abs(np.dot(view_dir, surface_normal)))
         
-        # 获取测量深度（如果有）
-        depth_measured = depth_projected  # 默认使用投影深度
+        # Get measured depth (if available)
+        depth_measured = depth_projected  # Default to projected depth
         depth_confidence = 0.5
         
         if kf_idx in self.depth_images:
@@ -268,17 +268,17 @@ class VoxbloxStyleDataExtractor:
                 depth_measured = depth_m
                 depth_confidence = conf
         
-        # 深度差异
+        # Depth difference
         depth_diff = abs(depth_measured - depth_projected)
         
-        # Truncation distance检查（Voxblox最重要的特性！）
+        # Truncation distance check (Voxblox's most important feature!)
         if depth_diff > self.truncation_distance:
-            return None  # 超出truncation范围，不记录这个观测
+            return None  # Beyond truncation range, don't record this observation
         
-        # 计算权重
+        # Calculate weight
         weight = self.compute_observation_weight(depth_diff, depth_projected, grazing_factor)
         
-        # 权重太低的观测也过滤掉
+        # Filter out observations with very low weight
         if weight < 0.1:
             return None
         
@@ -294,44 +294,44 @@ class VoxbloxStyleDataExtractor:
     
     def filter_consecutive_observations(self, observations: List[Dict]) -> List[Dict]:
         """
-        过滤观测，保留连续的观测序列
-        这是Voxblox保证观测质量的重要机制
+        Filter observations, keeping consecutive observation sequences
+        This is an important mechanism for Voxblox to ensure observation quality
         """
         if len(observations) < self.min_consecutive_observations:
             return []
         
-        # 按KF索引排序
+        # Sort by KF index
         observations = sorted(observations, key=lambda x: x['kf_idx'])
         
-        # 找连续序列
+        # Find consecutive sequences
         sequences = []
         current_seq = [observations[0]]
         
         for i in range(1, len(observations)):
-            # 检查是否连续（允许跳过max_frame_gap帧）
+            # Check if consecutive (allow skipping max_frame_gap frames)
             if observations[i]['kf_idx'] - observations[i-1]['kf_idx'] <= self.max_frame_gap:
                 current_seq.append(observations[i])
             else:
-                # 序列中断
+                # Sequence interrupted
                 if len(current_seq) >= self.min_consecutive_observations:
                     sequences.append(current_seq)
                 current_seq = [observations[i]]
         
-        # 检查最后一个序列
+        # Check last sequence
         if len(current_seq) >= self.min_consecutive_observations:
             sequences.append(current_seq)
         
-        # 合并所有有效序列
+        # Merge all valid sequences
         filtered = []
         for seq in sequences:
             filtered.extend(seq)
         
-        # 限制最大观测数
+        # Limit maximum observations
         if len(filtered) > self.max_observations_per_point:
-            # 按权重排序，保留最好的观测
+            # Sort by weight, keep best observations
             filtered = sorted(filtered, key=lambda x: x['weight'], reverse=True)
             filtered = filtered[:self.max_observations_per_point]
-            # 重新按KF索引排序
+            # Re-sort by KF index
             filtered = sorted(filtered, key=lambda x: x['kf_idx'])
         
         return filtered
@@ -339,25 +339,25 @@ class VoxbloxStyleDataExtractor:
     def find_voxblox_correspondences(self, mesh_file: str, poses: Dict[int, np.ndarray], 
                                     timestamps: List[float], sample_size: int = 20000) -> Dict:
         """
-        使用Voxblox风格找对应关系
-        严格的过滤机制确保只有高质量的观测被保留
+        Find correspondences using Voxblox style
+        Strict filtering mechanisms ensure only high-quality observations are retained
         """
         if not os.path.exists(mesh_file):
             print(f"Error: {mesh_file} not found!")
             return {}
         
-        # 加载mesh
+        # Load mesh
         mesh = o3d.io.read_triangle_mesh(mesh_file)
         vertices = np.asarray(mesh.vertices)
         
-        # 计算法线（用于anti-grazing）
+        # Calculate normals (for anti-grazing)
         if not mesh.has_vertex_normals():
             mesh.compute_vertex_normals()
         normals = np.asarray(mesh.vertex_normals)
         
         print(f"Mesh has {len(vertices)} vertices")
         
-        # 采样
+        # Sampling
         if sample_size < len(vertices):
             indices = np.random.choice(len(vertices), sample_size, replace=False)
         else:
@@ -367,7 +367,7 @@ class VoxbloxStyleDataExtractor:
         
         point_observations = {}
         
-        # 统计
+        # Statistics
         total_checks = 0
         truncation_filtered = 0
         grazing_filtered = 0
@@ -380,29 +380,29 @@ class VoxbloxStyleDataExtractor:
             point_3d = vertices[idx]
             normal = normals[idx] if idx < len(normals) else None
             
-            # 收集所有潜在观测
+            # Collect all potential observations
             observations = []
             
             for kf_idx, T_cw in poses.items():
                 total_checks += 1
                 
-                # 处理单个观测（包含所有Voxblox过滤）
+                # Process single observation (includes all Voxblox filtering)
                 obs = self.process_single_observation(point_3d, kf_idx, T_cw, normal)
                 
                 if obs is not None:
                     observations.append(obs)
                 else:
-                    # 统计被过滤的原因（简化）
+                    # Statistics for filtered reasons (simplified)
                     if len(observations) == 0:
                         truncation_filtered += 1
             
-            # 过滤连续观测
+            # Filter consecutive observations
             filtered_obs = self.filter_consecutive_observations(observations)
             
             if len(filtered_obs) < len(observations):
                 consecutive_filtered += len(observations) - len(filtered_obs)
             
-            # 保存有效观测
+            # Save valid observations
             if len(filtered_obs) >= self.min_consecutive_observations:
                 point_observations[idx] = {
                     'point_3d': point_3d.tolist(),
@@ -413,7 +413,7 @@ class VoxbloxStyleDataExtractor:
         print(f"  Total checks: {total_checks}")
         print(f"  Points with valid observations: {len(point_observations)}")
         
-        # 计算观测分布
+        # Calculate observation distribution
         if point_observations:
             obs_counts = [len(data['observations']) for data in point_observations.values()]
             print(f"\nObservation distribution:")
@@ -427,7 +427,7 @@ class VoxbloxStyleDataExtractor:
     def save_detailed_correspondences(self, point_observations: Dict, 
                                      poses_before: Dict, poses_after: Dict,
                                      output_file: str):
-        """保存详细的对应关系数据"""
+        """Save detailed correspondence data"""
         with open(output_file, 'w') as f:
             f.write("# Voxblox-style correspondences with complete data\n")
             f.write("# Format:\n")
@@ -451,14 +451,14 @@ class VoxbloxStyleDataExtractor:
         
         print(f"Saved to {output_file}")
         
-        # 保存位姿
+        # Save poses
         poses_file = output_file.replace('.txt', '_poses.npz')
         np.savez(poses_file,
                  poses_before={str(k): v for k, v in poses_before.items()},
                  poses_after={str(k): v for k, v in poses_after.items()})
         print(f"Saved poses to {poses_file}")
         
-        # 统计信息
+        # Statistics
         total_obs = sum(len(data['observations']) for data in point_observations.values())
         avg_obs = total_obs / len(point_observations) if point_observations else 0
         
@@ -469,9 +469,9 @@ class VoxbloxStyleDataExtractor:
 
 
 def main():
-    # 相机参数
+    # Camera parameters
     camera_params = {
-        'fx': 377.535257164,  # 使用你的实际参数
+        'fx': 377.535257164,  # Use your actual parameters
         'fy': 377.209841379,
         'cx': 328.193371286,
         'cy': 240.426878936,
@@ -479,36 +479,29 @@ def main():
         'height': 480
     }
     
-    # Voxblox参数（调整这些以控制观测数量！）
+    # Voxblox parameters (adjust these to control observation quantity!)
     voxblox_params = {
         'voxel_size': 0.02,                    # 2cm voxel
-        'truncation_distance': 0.06,           # 6cm (3倍voxel size) - 这是关键！
+        'truncation_distance': 0.06,           # 6cm (3x voxel size) - this is key!
         'min_depth': 0.3,
         'max_depth': 4.0,
-        'max_grazing_angle': 70.0,             # 70度最大掠射角
-        'min_consecutive_observations': 3,      # 至少3个连续观测
-        'max_frame_gap': 2,                    # 允许跳过2帧
-        'max_observations_per_point': 15       # 最多15个观测
+        'max_grazing_angle': 70.0,             # 70 degree max grazing angle
+        'min_consecutive_observations': 3,      # At least 3 consecutive observations
+        'max_frame_gap': 2,                    # Allow skipping 2 frames
+        'max_observations_per_point': 15       # Maximum 15 observations
     }
     
-    # 文件路径
-    # 文件路径
-
-    rosbag_file = "/Datasets/Kimera/Kimera_Clipped_bag/12_07_thoth_clipped.bag"  # 你的rosbag文件
-
+    # File paths
+    rosbag_file = "/Datasets/Kimera/Kimera_Clipped_bag/12_07_thoth_clipped.bag"  # Your rosbag file
+    mesh_file = "mesh_output.ply"  # Voxblox output mesh
+    trajectory_before_file = "standard_trajectory_no_loop.txt"  # Trajectory before loop closure
+    trajectory_after_file = "standard_trajectory_with_loop.txt"  # Trajectory after loop closure
+    output_file = "optimization_data.txt"  # Output file
     
-
-    mesh_file = "mesh_output.ply"  # voxblox输出的mesh
-
-    trajectory_before_file = "standard_trajectory_no_loop.txt"  # loop closure前的轨迹
-
-    trajectory_after_file = "standard_trajectory_with_loop.txt"  # loop closure后的轨迹
-
-    output_file = "optimization_data.txt"  # 输出文件
-    # 创建提取器
+    # Create extractor
     extractor = VoxbloxStyleDataExtractor(camera_params, voxblox_params)
     
-    # 1. 加载轨迹
+    # 1. Load trajectories
     print("\n=== Loading trajectories ===")
     poses_before, kf_indices, timestamps = extractor.load_trajectory(trajectory_before_file)
     poses_after, _, _ = extractor.load_trajectory(trajectory_after_file)
@@ -517,14 +510,14 @@ def main():
         print("Error: No poses loaded!")
         return
     
-    # 2. 加载深度图像（如果有rosbag）
+    # 2. Load depth images (if rosbag available)
     print("\n=== Loading depth images ===")
     if os.path.exists(rosbag_file):
         extractor.load_depth_from_rosbag(rosbag_file, kf_indices, timestamps)
     else:
         print(f"Warning: {rosbag_file} not found, using projected depth only")
     
-    # 3. 找对应关系（使用Voxblox风格的严格过滤）
+    # 3. Find correspondences (using Voxblox-style strict filtering)
     print("\n=== Finding Voxblox-style correspondences ===")
     point_observations = extractor.find_voxblox_correspondences(
         mesh_file,
@@ -538,7 +531,7 @@ def main():
         print("Try adjusting voxblox_params (increase truncation_distance or decrease min_consecutive_observations)")
         return
     
-    # 4. 保存结果
+    # 4. Save results
     print("\n=== Saving results ===")
     extractor.save_detailed_correspondences(
         point_observations,
